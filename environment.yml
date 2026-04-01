@@ -1,0 +1,17 @@
+name: opensai-dev
+channels:
+  - conda-forge
+dependencies:
+  - cmake
+  - ninja
+  - pkg-config
+  - git
+  - eigen=3.4
+  - tinyxml2
+  - jsoncpp
+  - gtest
+  - glfw
+  - glew
+  - openal-soft
+  - libhiredis
+  - redis-server

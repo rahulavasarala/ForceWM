@@ -1,0 +1,66 @@
+cmake_minimum_required(VERSION 3.10)
+
+project(SAI-URDF)
+set(PROJECT_VERSION 0.1.0)
+
+option(BUILD_EXAMPLES "Build examples" ON)
+
+set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  message(STATUS "Setting build type to 'Release' as none was specified.")
+  set(CMAKE_BUILD_TYPE
+      Release
+      CACHE STRING "Choose the type of build." FORCE)
+  set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release"
+                                               "MinSizeRel" "RelWithDebInfo")
+endif()
+
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+  add_compile_definitions(ENABLE_DEBUG_PRINTS)
+endif()
+
+set(SAI-URDF_INCLUDE_DIRS
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/src/urdf/urdfdom/urdf_parser/include)
+
+set(URDF_INCLUDE_DIR ${PROJECT_SOURCE_DIR}/src)
+set(URDF_INCLUDE_SUB_DIR ${URDF_INCLUDE_DIR}/urdf)
+set(URDF_SOURCE
+    ${URDF_INCLUDE_SUB_DIR}/urdfdom/urdf_parser/src/pose.cpp
+    ${URDF_INCLUDE_SUB_DIR}/urdfdom/urdf_parser/src/link.cpp
+    ${URDF_INCLUDE_SUB_DIR}/urdfdom/urdf_parser/src/graphics.cpp
+    ${URDF_INCLUDE_SUB_DIR}/urdfdom/urdf_parser/src/world.cpp
+    ${URDF_INCLUDE_SUB_DIR}/urdfdom/urdf_parser/src/model.cpp
+    ${URDF_INCLUDE_SUB_DIR}/urdfdom/urdf_parser/src/joint.cpp
+    ${URDF_INCLUDE_SUB_DIR}/boost_replacement/printf_console.cpp
+    ${URDF_INCLUDE_SUB_DIR}/boost_replacement/string_split.cpp)
+
+find_path(TINYXML_INCLUDE_DIR tinyxml2.h REQUIRED)
+find_library(TINYXML_LIBRARIES tinyxml2 REQUIRED)
+
+include_directories(${URDF_INCLUDE_DIR} ${TINYXML_INCLUDE_DIR})
+
+add_library(sai-urdf STATIC ${URDF_SOURCE})
+target_link_libraries(sai-urdf PUBLIC ${TINYXML_LIBRARIES})
+
+set(SAI-URDF_LIBRARIES sai-urdf ${TINYXML_LIBRARIES})
+
+export(TARGETS sai-urdf FILE ${PROJECT_BINARY_DIR}/SAI-URDFTargets.cmake)
+
+set(CONF_INCLUDE_DIRS ${SAI-URDF_INCLUDE_DIRS} ${TINYXML_INCLUDE_DIR})
+set(CONF_LIBRARIES ${SAI-URDF_LIBRARIES})
+
+configure_file(SAI-URDFConfig.cmake.in
+               "${PROJECT_BINARY_DIR}/SAI-URDFConfig.cmake" @ONLY)
+include(CMakePackageConfigHelpers)
+write_basic_package_version_file(
+  "${CMAKE_CURRENT_BINARY_DIR}/SAI-URDFConfigVersion.cmake"
+  VERSION ${PROJECT_VERSION}
+  COMPATIBILITY SameMajorVersion)
+
+if(BUILD_EXAMPLES)
+  add_subdirectory(${PROJECT_SOURCE_DIR}/examples)
+endif()

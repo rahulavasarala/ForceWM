@@ -8,7 +8,10 @@ Set up all the different insertion tasks that I want to train in SIM.
 
 ## OpenSai Setup
 
-1. Run `bash sai_installation_scripts/install_dependencies.sh` to create or update the Conda environment defined in `environment.yml`.
-2. Run `bash sai_installation_scripts/install_core_libraries.sh` to clone and build the OpenSai core libraries against the active Conda environment.
+1. Run `bash installation_scripts/install_dependencies.sh` to create or update the Conda environment defined in `environment.yml`.
+2. Run `bash installation_scripts/install_core_libraries.sh` to clone and build the OpenSai core libraries against the active Conda environment.
 
 The default environment name is `opensai-dev`. You can override it with `OPENSAI_CONDA_ENV=<name>`.
+The OpenSai repositories are cloned into the repo-root `core/` directory.
+
+Configure the project with an active Conda environment using `cmake -S . -B build`.

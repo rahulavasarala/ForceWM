@@ -15,3 +15,7 @@ dependencies:
   - openal-soft
   - libhiredis
   - redis-server
+  - mujoco
+  - yaml-cpp
+  - zeromq
+  - cppzmq

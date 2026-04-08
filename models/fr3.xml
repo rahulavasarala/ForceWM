@@ -1,7 +1,7 @@
 <mujoco model="fr3">
   <compiler angle="radian" meshdir="assets"/>
 
-  <option integrator="implicitfast"/>
+  <option integrator="implicitfast" timestep="0.001"/>
 
   <default>
     <default class="fr3">
@@ -138,10 +138,11 @@
 
                         <geom name="ee_contact"
                             type="sphere"
-                            size="0.01"
+                            size="0.05"
                             pos="0 0 0"
                             mass="0"
-                            rgba="1 0 0 1"/>
+                            rgba="1 0 0 1"
+                            friction = "0.0 0.0 0.0"/>
                       </body>
                     </body>
                   </body>

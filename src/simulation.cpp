@@ -699,8 +699,8 @@ void data_collection_time_callback(const mjModel* m, mjData* d) {
   send_haptic_commands();
 
   motion_force_task->updateSensedForceAndMoment(
-      get_sensed_force(m, d),
-      get_sensed_moment(m, d));
+     -1 * get_sensed_force(m, d),
+      -1 *get_sensed_moment(m, d));
 
   motion_force_task->setGoalPosition(haptic_output.robot_goal_position);
   motion_force_task->setGoalOrientation(
@@ -713,7 +713,7 @@ void data_collection_time_callback(const mjModel* m, mjData* d) {
       motion_force_task->computeTorques() + joint_task->computeTorques() +
       robot->jointGravityVector();
 
-  Vector3d sensed_force_world_frame = get_sensed_force(m, d, true);
+  Vector3d sensed_force_world_frame = -1 *get_sensed_force(m, d, true);
 
   for (int i = 0; i < 3; ++i) {
     if (fabs(sensed_force_world_frame(i)) >= 0.5 &&
@@ -791,8 +791,8 @@ void update_redis(const mjModel* m, mjData* d) {
 
     redis_client.setEigen(QPOS, qpos);
 
-    Vector3d sensed_force = get_sensed_force(m, d, true);
-    Vector3d sensed_moment = get_sensed_moment(m, d, true);
+    Vector3d sensed_force = -1 * get_sensed_force(m, d, true);
+    Vector3d sensed_moment = -1 *get_sensed_moment(m, d, true);
     redis_client.setEigen(SENSED_FORCE, sensed_force);
     redis_client.setEigen(SENSED_MOMENT, sensed_moment);
 }
@@ -824,8 +824,8 @@ void update_haptic_information(std::shared_ptr<SaiModel::SaiModel> robot) {
   // This example still uses proxy feedback instead of direct wrench feedback.
   // The MuJoCo helpers above can now return either sensor-frame or world-frame
   // wrench depending on the call-site flag.
-  haptic_input.robot_sensed_force = Vector3d::Zero(); // get_sensed_force(m, d, true);
-  haptic_input.robot_sensed_moment = Vector3d::Zero(); // get_sensed_moment(m, d, true);
+  haptic_input.robot_sensed_force = -1 *get_sensed_force(m, d, true);
+  haptic_input.robot_sensed_moment = -1 * get_sensed_moment(m, d, true);
 }
 
 void send_haptic_commands() {
@@ -1001,6 +1001,15 @@ int main(int argc, char** argv) {
           SaiPrimitives::HapticControlType::MOTION_MOTION);
       directions_of_proxy_feedback = Vector3i::Zero();
       prev_sensed_force = Vector3d::Zero();
+
+      haptic_controller->setDeviceControlGains(
+        0.1 * device_limits.max_linear_stiffness,
+        0.3 * device_limits.max_linear_damping,
+        0.1 * device_limits.max_angular_stiffness,
+        0.3 * device_limits.max_angular_damping);
+
+      haptic_controller->setReductionFactorForce(0.2);
+      haptic_controller->setReductionFactorMoment(0.2);
     } catch (const std::exception& exception) {
       std::cerr << exception.what() << "\n";
       mj_deleteData(d);

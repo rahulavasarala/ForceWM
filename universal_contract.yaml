@@ -1,0 +1,32 @@
+#The universal contract is done --- was hard to come up with but we did it --- 
+
+robot:
+  prefix: "sim::franka"
+  type: "sim"
+  xml_path: "models/scene.xml"
+  urdf_path: "models/fr3.urdf"
+  data_sources:
+    lowdim: #This could contain lowdim/force data
+      fps: 30
+      keys: 
+        - eef_pos:
+            obs_window: 10
+            action_window: 5
+            obs_dss : 3
+            dim: [3]
+        - eef_ori:
+            obs_window: 10
+            action_window: 5
+            obs_dss : 3
+            dim: [3]
+    visual: #This could contain rgb and depth data 
+      fps: 30
+      keys:
+        - camera_01:
+            type: "rgb"
+            mujoco_camera_name: "wrist_camera"
+            can: 0
+            serial_number: 123456
+            dim: [640, 480, 3]
+            obs_window: 10
+

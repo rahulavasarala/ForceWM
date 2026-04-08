@@ -15,6 +15,8 @@ include(ForceWMDependencies)
 
 forcewm_configure_runtime_dependencies()
 forcewm_configure_opensai_dependencies()
+find_package(yaml-cpp CONFIG REQUIRED)
+find_package(OpenCV REQUIRED COMPONENTS core imgcodecs imgproc)
 
 set(FORCEWM_SIMULATION_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/simulation.cpp")
 file(SIZE "${FORCEWM_SIMULATION_SOURCE}" FORCEWM_SIMULATION_SOURCE_SIZE)
@@ -24,6 +26,8 @@ if(FORCEWM_SIMULATION_SOURCE_SIZE GREATER 0)
   target_link_libraries(forcewm_simulation PRIVATE
     forcewm::runtime
     forcewm::opensai_model
+    yaml-cpp::yaml-cpp
+    ${OpenCV_LIBS}
   )
 
   set_target_properties(forcewm_simulation PROPERTIES

@@ -66,11 +66,13 @@ sync_conda_cmake_templates() {
     [ -f "${TEMPLATE_DIR}/sai-urdfreader.CMakeLists.txt" ] || die "Missing template for sai-urdfreader."
     [ -f "${TEMPLATE_DIR}/sai-model.CMakeLists.txt" ] || die "Missing template for sai-model."
     [ -f "${TEMPLATE_DIR}/sai-primitives.CMakeLists.txt" ] || die "Missing template for sai-primitives."
+    [ -f "${TEMPLATE_DIR}/chai3d.CMakeLists.txt" ] || die "Missing template for chai3d."
 
     install -m 644 "${TEMPLATE_DIR}/sai-common.CMakeLists.txt" "${CORE_DIR}/sai-common/CMakeLists.txt"
     install -m 644 "${TEMPLATE_DIR}/sai-urdfreader.CMakeLists.txt" "${CORE_DIR}/sai-urdfreader/CMakeLists.txt"
     install -m 644 "${TEMPLATE_DIR}/sai-model.CMakeLists.txt" "${CORE_DIR}/sai-model/CMakeLists.txt"
     install -m 644 "${TEMPLATE_DIR}/sai-primitives.CMakeLists.txt" "${CORE_DIR}/sai-primitives/CMakeLists.txt"
+    install -m 644 "${TEMPLATE_DIR}/chai3d.CMakeLists.txt" "${CORE_DIR}/chai3d/CMakeLists.txt"
 }
 
 cmake_args=(
@@ -130,6 +132,10 @@ if [ ! -d "sai-primitives" ]; then
     git clone https://github.com/manips-sai-org/sai-primitives.git
 fi
 
+if [ ! -d "chai3d" ]; then
+    git clone https://github.com/manips-sai-org/chai3d.git
+fi
+
 # echo "Cloned all repositories."
 echo "${YELLOW}${BOLD}All repositories successfully cloned (or cloning was not needed)${RESET}"
 sleep 0.5
@@ -149,6 +155,10 @@ sleep 0.5
 build_cmake_project "sai-model/rbdl" "-DRBDL_BUILD_TESTS=OFF"
 build_cmake_project "sai-model" "-DSAI-URDF_DIR=${CORE_DIR}/sai-urdfreader/build" "-DBUILD_EXAMPLES=OFF" "-DBUILD_TESTS=OFF"
 echo "${YELLOW}${BOLD}sai-model successfully built${RESET}"
+sleep 0.5
+
+build_cmake_project "chai3d" "-DCHAI3D_BUILD_EXAMPLES=OFF" "-DCHAI3D_BUILD_UTILS=OFF" "-DCHAI3D_EXPORT_PACKAGE_REGISTRY=OFF"
+echo "${YELLOW}${BOLD}chai3d successfully built${RESET}"
 sleep 0.5
 
 build_cmake_project "sai-primitives/ruckig" "-DBUILD_EXAMPLES=OFF" "-DBUILD_TESTS=OFF"

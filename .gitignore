@@ -2,4 +2,8 @@ WireConnectAgent/
 build/
 bin/
 core/
+mujoco_menagerie/
 .DS_Store
+*.cpython*.pyc
+data_storage/
+dump.rdb

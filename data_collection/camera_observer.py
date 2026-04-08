@@ -91,7 +91,7 @@ class CameraObserver:
 
         while not self._stop_event.is_set():
             observation = self._read_observation()
-            observation["timestamp_s"] = time.time()
+            observation.setdefault("timestamp_s", time.time())
             with self._lock:
                 self.buffer.append(observation)
 
@@ -104,6 +104,8 @@ class CameraObserver:
 
     def _read_observation(self) -> dict[str, Any]:
         observation: dict[str, Any] = {}
+        metadata_timestamps: list[float] = []
+        sim_timestamps: list[float] = []
 
         for visual_name, visual_spec in self.camera_specs.items():
             source_type = visual_spec["source_type"]
@@ -113,12 +115,25 @@ class CameraObserver:
                 if frame is None:
                     raise RuntimeError(f"Failed to decode sim camera frame for '{visual_name}'.")
                 observation[visual_name] = frame
+
+                metadata_raw = self.redis_client.get(visual_spec["metadata_redis_key"])
+                if metadata_raw:
+                    metadata = json.loads(metadata_raw)
+                    if "publish_wall_time_s" in metadata:
+                        metadata_timestamps.append(float(metadata["publish_wall_time_s"]))
+                    if "sim_time_s" in metadata:
+                        sim_timestamps.append(float(metadata["sim_time_s"]))
             elif source_type == "realsense":
                 observation[visual_name] = self._read_realsense_frame(visual_name)
             else:
                 observation[visual_name] = np.array(
                     json.loads(self.redis_client.get(visual_spec["redis_key"]))
                 )
+
+        if metadata_timestamps:
+            observation["timestamp_s"] = max(metadata_timestamps)
+        if sim_timestamps:
+            observation["sim_timestamp_s"] = max(sim_timestamps)
 
         return observation
 
@@ -252,6 +267,7 @@ class CameraObserver:
                 "source_type": source_type,
                 "type": visual_type,
                 "redis_key": CameraObserver._make_redis_key(prefix, redis_suffix),
+                "metadata_redis_key": CameraObserver._make_redis_key(prefix, redis_suffix) + "::meta",
                 "dim": visual_cfg.get("dim"),
                 "serial_number": visual_cfg.get("serial_number"),
                 "fps": visual_cfg.get("fps", visual_fps),

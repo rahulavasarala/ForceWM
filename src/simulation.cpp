@@ -5,17 +5,24 @@
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <limits>
+#include <mutex>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "SaiModel.h"
@@ -46,10 +53,10 @@ constexpr const char* kEndEffectorSensorSiteName = "ft_site";
 
 mjModel* m = nullptr;
 mjData* d = nullptr;
+mjData* viewer_data = nullptr;
 mjvCamera cam;
 mjvOption opt;
 mjvScene scn;
-mjvScene camera_scn;
 mjrContext con;
 
 bool button_left = false;
@@ -88,9 +95,12 @@ std::string control_link = "fr3_link8";
 int ee_force_sensor_id = -1;
 int ee_torque_sensor_id = -1;
 int ee_sensor_site_id = -1;
+std::atomic<bool> shutdown_requested = false;
+std::atomic<bool> reset_requested = false;
 
 struct CameraStreamConfig {
   std::string redis_key;
+  std::string metadata_redis_key;
   std::string mujoco_camera_name;
   int model_camera_id = -1;
   int width = 640;
@@ -102,6 +112,13 @@ struct CameraStreamConfig {
   std::vector<unsigned char> flipped_rgb_buffer;
   std::vector<unsigned char> bgr_buffer;
   std::vector<unsigned char> encoded_image_buffer;
+  std::uint64_t publish_count = 0;
+  std::uint64_t dropped_publish_slots = 0;
+  double total_render_seconds = 0.0;
+  double total_readback_seconds = 0.0;
+  double total_jpeg_encode_seconds = 0.0;
+  double total_redis_publish_seconds = 0.0;
+  double total_publish_seconds = 0.0;
 };
 
 struct SimulationContractConfig {
@@ -123,7 +140,122 @@ struct SimulationPerformanceStats {
   double wall_seconds = 0.0;
 };
 
+struct SimulationLoopStats {
+  std::uint64_t physics_step_count = 0;
+  mjtNum sim_start_time = 0.0;
+  mjtNum sim_end_time = 0.0;
+};
+
+struct RenderSnapshot {
+  std::uint64_t seq = 0;
+  std::uint64_t reset_epoch = 0;
+  mjtNum sim_time = 0.0;
+  double publish_wall_time_s = 0.0;
+  std::vector<mjtNum> qpos;
+  std::vector<mjtNum> qvel;
+  std::vector<mjtNum> act;
+  std::vector<mjtNum> mocap_pos;
+  std::vector<mjtNum> mocap_quat;
+  std::vector<mjtNum> userdata;
+};
+
+struct SnapshotBroker {
+  explicit SnapshotBroker(const mjModel* model) {
+    latest_snapshot.qpos.resize(model->nq);
+    latest_snapshot.qvel.resize(model->nv);
+    latest_snapshot.act.resize(model->na);
+    latest_snapshot.mocap_pos.resize(3 * model->nmocap);
+    latest_snapshot.mocap_quat.resize(4 * model->nmocap);
+    latest_snapshot.userdata.resize(model->nuserdata);
+  }
+
+  void publish_from_sim(const mjData* source,
+                        const std::uint64_t reset_epoch,
+                        const double publish_wall_time_s) {
+    std::lock_guard<std::mutex> lock(mutex);
+    ++latest_snapshot.seq;
+    latest_snapshot.reset_epoch = reset_epoch;
+    latest_snapshot.sim_time = source->time;
+    latest_snapshot.publish_wall_time_s = publish_wall_time_s;
+
+    if (m->nq > 0) {
+      std::copy_n(source->qpos, m->nq, latest_snapshot.qpos.data());
+    }
+    if (m->nv > 0) {
+      std::copy_n(source->qvel, m->nv, latest_snapshot.qvel.data());
+    }
+    if (m->na > 0) {
+      std::copy_n(source->act, m->na, latest_snapshot.act.data());
+    }
+    if (m->nmocap > 0) {
+      std::copy_n(source->mocap_pos, 3 * m->nmocap,
+                  latest_snapshot.mocap_pos.data());
+      std::copy_n(source->mocap_quat, 4 * m->nmocap,
+                  latest_snapshot.mocap_quat.data());
+    }
+    if (m->nuserdata > 0) {
+      std::copy_n(source->userdata, m->nuserdata,
+                  latest_snapshot.userdata.data());
+    }
+
+    has_snapshot = true;
+    condition.notify_all();
+  }
+
+  bool copy_latest(RenderSnapshot& out_snapshot) const {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!has_snapshot) {
+      return false;
+    }
+
+    copy_snapshot_locked(latest_snapshot, out_snapshot);
+    return true;
+  }
+
+  bool wait_for_newer(const std::uint64_t last_seq,
+                      RenderSnapshot& out_snapshot,
+                      const std::atomic<bool>& stop_flag) const {
+    std::unique_lock<std::mutex> lock(mutex);
+    condition.wait(lock, [&] {
+      return stop_flag.load() ||
+             (has_snapshot && latest_snapshot.seq > last_seq);
+    });
+
+    if (stop_flag.load()) {
+      return false;
+    }
+
+    copy_snapshot_locked(latest_snapshot, out_snapshot);
+    return true;
+  }
+
+  void notify_all() const {
+    condition.notify_all();
+  }
+
+ private:
+  static void copy_snapshot_locked(const RenderSnapshot& source,
+                                   RenderSnapshot& destination) {
+    destination.seq = source.seq;
+    destination.reset_epoch = source.reset_epoch;
+    destination.sim_time = source.sim_time;
+    destination.publish_wall_time_s = source.publish_wall_time_s;
+    destination.qpos = source.qpos;
+    destination.qvel = source.qvel;
+    destination.act = source.act;
+    destination.mocap_pos = source.mocap_pos;
+    destination.mocap_quat = source.mocap_quat;
+    destination.userdata = source.userdata;
+  }
+
+  mutable std::mutex mutex;
+  mutable std::condition_variable condition;
+  RenderSnapshot latest_snapshot;
+  bool has_snapshot = false;
+};
+
 SimulationContractConfig simulation_contract;
+std::unique_ptr<SnapshotBroker> snapshot_broker;
 
 // Initialization variables for robot control ---------------------
 
@@ -263,6 +395,48 @@ void print_simulation_summary(const SimulationPerformanceStats& stats) {
   std::cout << std::defaultfloat;
 }
 
+void print_camera_publish_summary() {
+  if (simulation_contract.cameras.empty()) {
+    return;
+  }
+
+  std::cout << "\nCamera publish summary\n";
+  std::cout << std::fixed << std::setprecision(3);
+
+  for (const auto& camera : simulation_contract.cameras) {
+    std::cout << "  Camera `" << camera.mujoco_camera_name << "` -> `"
+              << camera.redis_key << "`\n";
+
+    if (camera.publish_count == 0) {
+      std::cout << "    No images published.\n";
+      continue;
+    }
+
+    const double publish_count = static_cast<double>(camera.publish_count);
+    const double avg_render_ms =
+        1000.0 * camera.total_render_seconds / publish_count;
+    const double avg_readback_ms =
+        1000.0 * camera.total_readback_seconds / publish_count;
+    const double avg_jpeg_ms =
+        1000.0 * camera.total_jpeg_encode_seconds / publish_count;
+    const double avg_redis_ms =
+        1000.0 * camera.total_redis_publish_seconds / publish_count;
+    const double avg_total_ms =
+        1000.0 * camera.total_publish_seconds / publish_count;
+
+    std::cout << "    Published frames: " << camera.publish_count << "\n";
+    std::cout << "    Dropped publish slots: " << camera.dropped_publish_slots
+              << "\n";
+    std::cout << "    Avg render time: " << avg_render_ms << " ms\n";
+    std::cout << "    Avg readback time: " << avg_readback_ms << " ms\n";
+    std::cout << "    Avg JPEG encode time: " << avg_jpeg_ms << " ms\n";
+    std::cout << "    Avg Redis publish time: " << avg_redis_ms << " ms\n";
+    std::cout << "    Avg total publish time: " << avg_total_ms << " ms\n";
+  }
+
+  std::cout << std::defaultfloat;
+}
+
 std::optional<StartupOptions> parse_startup_options(int argc, char** argv) {
   if (argc > 3) {
     print_usage(argv[0]);
@@ -325,6 +499,12 @@ std::string make_redis_key(const std::string& prefix,
   return prefix + "::" + suffix;
 }
 
+double wall_time_now_seconds() {
+  return std::chrono::duration<double>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
 void flip_rgb_image_vertically(const std::vector<unsigned char>& source,
                                std::vector<unsigned char>& destination,
                                int width,
@@ -340,6 +520,68 @@ void flip_rgb_image_vertically(const std::vector<unsigned char>& source,
     std::copy_n(source.data() + src_offset, row_stride,
                 destination.data() + dst_offset);
   }
+}
+
+void copy_snapshot_into_data(const RenderSnapshot& snapshot, mjData* target) {
+  target->time = snapshot.sim_time;
+
+  if (m->nq > 0 && !snapshot.qpos.empty()) {
+    std::copy_n(snapshot.qpos.data(), m->nq, target->qpos);
+  }
+  if (m->nv > 0 && !snapshot.qvel.empty()) {
+    std::copy_n(snapshot.qvel.data(), m->nv, target->qvel);
+  }
+  if (m->na > 0 && !snapshot.act.empty()) {
+    std::copy_n(snapshot.act.data(), m->na, target->act);
+  }
+  if (m->nmocap > 0 && !snapshot.mocap_pos.empty() &&
+      !snapshot.mocap_quat.empty()) {
+    std::copy_n(snapshot.mocap_pos.data(), 3 * m->nmocap, target->mocap_pos);
+    std::copy_n(snapshot.mocap_quat.data(), 4 * m->nmocap, target->mocap_quat);
+  }
+  if (m->nuserdata > 0 && !snapshot.userdata.empty()) {
+    std::copy_n(snapshot.userdata.data(), m->nuserdata, target->userdata);
+  }
+}
+
+void rebuild_render_data(const mjModel* model, mjData* target) {
+  mj_fwdPosition(model, target);
+}
+
+void publish_snapshot_from_sim_state(const std::uint64_t reset_epoch) {
+  if (!snapshot_broker) {
+    return;
+  }
+
+  snapshot_broker->publish_from_sim(d, reset_epoch, wall_time_now_seconds());
+}
+
+std::string make_camera_metadata_json(const CameraStreamConfig& camera,
+                                      const RenderSnapshot& snapshot) {
+  std::ostringstream metadata_stream;
+  metadata_stream << std::fixed << std::setprecision(17);
+  metadata_stream << '{';
+  metadata_stream << '"' << "seq" << '"' << ':' << snapshot.seq;
+  metadata_stream << ',' << '"' << "reset_epoch" << '"' << ':'
+                  << snapshot.reset_epoch;
+  metadata_stream << ',' << '"' << "camera_name" << '"' << ':' << '"'
+                  << camera.mujoco_camera_name << '"';
+  metadata_stream << ',' << '"' << "sim_time_s" << '"' << ':'
+                  << snapshot.sim_time;
+  metadata_stream << ',' << '"' << "publish_wall_time_s" << '"' << ':'
+                  << snapshot.publish_wall_time_s;
+  metadata_stream << ',' << '"' << "width" << '"' << ':' << camera.width;
+  metadata_stream << ',' << '"' << "height" << '"' << ':'
+                  << camera.height;
+  metadata_stream << ',' << '"' << "channels" << '"' << ':'
+                  << camera.channels;
+  metadata_stream << ',' << '"' << "encoding" << '"' << ':' << '"'
+                  << "jpeg" << '"';
+  metadata_stream << ',' << '"' << "jpeg_quality" << '"' << ':' << 90;
+  metadata_stream << ',' << '"' << "dropped_slots_total" << '"' << ':'
+                  << camera.dropped_publish_slots;
+  metadata_stream << '}';
+  return metadata_stream.str();
 }
 
 SimulationContractConfig load_simulation_contract(const fs::path& contract_path) {
@@ -405,6 +647,7 @@ SimulationContractConfig load_simulation_contract(const fs::path& contract_path)
     const std::string redis_suffix =
         node_or<std::string>(camera_cfg["redis"], visual_name);
     camera.redis_key = make_redis_key(config.prefix, redis_suffix);
+    camera.metadata_redis_key = camera.redis_key + "::meta";
     camera.mujoco_camera_name =
         require_string(camera_cfg, "mujoco_camera_name", camera_context);
     camera.fps = node_or<double>(camera_cfg["fps"], default_camera_fps);
@@ -466,13 +709,6 @@ void preflight_camera_publishers() {
     required_offscreen_height =
         std::max(required_offscreen_height, camera.height);
 
-    if (camera.fps > (1.0 / kRenderTimestep)) {
-      std::cout << "Camera '" << camera.mujoco_camera_name << "' requests "
-                << camera.fps
-                << " Hz, but render-loop publishing is currently capped by the "
-                   "viewer rate.\n";
-    }
-
     std::cout << "Camera publisher ready: MuJoCo camera '"
               << camera.mujoco_camera_name << "' -> Redis key '"
               << camera.redis_key << "' at " << camera.fps << " Hz ("
@@ -500,8 +736,9 @@ void reset_to_home() {
 
 void keyboard(GLFWwindow* window, int key, int, int act, int) {
   if (act == GLFW_PRESS && key == GLFW_KEY_BACKSPACE) {
-    reset_to_home();
+    reset_requested = true;
   } else if (act == GLFW_PRESS && key == GLFW_KEY_ESCAPE) {
+    shutdown_requested = true;
     glfwSetWindowShouldClose(window, GLFW_TRUE);
   }
 }
@@ -835,63 +1072,182 @@ void send_haptic_commands() {
                         haptic_output.device_command_moment);
 }
 
-void update_camera_redis_keys() {
-  if (simulation_contract.cameras.empty()) {
+void simulation_thread_main(SimulationLoopStats* simulation_loop_stats) {
+  if (!simulation_loop_stats) {
     return;
   }
 
-  bool rendered_any_camera = false;
-  mjvCamera capture_camera;
-  mjv_defaultCamera(&capture_camera);
+  simulation_loop_stats->sim_start_time = d->time;
+  const auto wall_start_time = std::chrono::steady_clock::now();
+  std::uint64_t current_reset_epoch = 0;
 
-  for (auto& camera : simulation_contract.cameras) {
-    if (d->time + 1e-9 < camera.next_publish_sim_time) {
-      continue;
+  while (!shutdown_requested.load()) {
+    if (reset_requested.exchange(false)) {
+      reset_to_home();
+      ++current_reset_epoch;
+      publish_snapshot_from_sim_state(current_reset_epoch);
     }
 
-    if (!rendered_any_camera) {
-      mjr_setBuffer(mjFB_OFFSCREEN, &con);
-      rendered_any_camera = true;
+    mj_step(m, d);
+    ++simulation_loop_stats->physics_step_count;
+    publish_snapshot_from_sim_state(current_reset_epoch);
+
+    const double target_sim_elapsed =
+        static_cast<double>(d->time - simulation_loop_stats->sim_start_time);
+    const double wall_elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - wall_start_time)
+                                    .count();
+    const double ahead_seconds = target_sim_elapsed - wall_elapsed;
+    if (ahead_seconds > 0.0) {
+      std::this_thread::sleep_for(
+          std::chrono::duration<double>(std::min(ahead_seconds, 0.001)));
     }
-
-    capture_camera.type = mjCAMERA_FIXED;
-    capture_camera.fixedcamid = camera.model_camera_id;
-
-    const mjrRect viewport = {0, 0, camera.width, camera.height};
-    mjv_updateScene(m, d, &opt, nullptr, &capture_camera, mjCAT_ALL,
-                    &camera_scn);
-    mjr_render(viewport, &camera_scn, &con);
-    mjr_readPixels(camera.rgb_buffer.data(), nullptr, viewport, &con);
-
-    flip_rgb_image_vertically(camera.rgb_buffer, camera.flipped_rgb_buffer,
-                              camera.width, camera.height, camera.channels);
-    cv::Mat rgb_view(camera.height, camera.width, CV_8UC3,
-                     camera.flipped_rgb_buffer.data());
-    cv::Mat bgr_view(camera.height, camera.width, CV_8UC3,
-                     camera.bgr_buffer.data());
-    cv::cvtColor(rgb_view, bgr_view, cv::COLOR_RGB2BGR);
-
-    if (!cv::imencode(".jpg", bgr_view, camera.encoded_image_buffer,
-                      {cv::IMWRITE_JPEG_QUALITY, 90})) {
-      throw std::runtime_error("Failed to JPEG-encode camera `" +
-                               camera.mujoco_camera_name + "`.");
-    }
-
-    redis_client.set(camera.redis_key,
-                     std::string(
-                         reinterpret_cast<const char*>(
-                             camera.encoded_image_buffer.data()),
-                         camera.encoded_image_buffer.size()));
-
-    const mjtNum publish_period = 1.0 / camera.fps;
-    do {
-      camera.next_publish_sim_time += publish_period;
-    } while (camera.next_publish_sim_time <= d->time);
   }
 
-  if (rendered_any_camera) {
-    mjr_setBuffer(mjFB_WINDOW, &con);
+  simulation_loop_stats->sim_end_time = d->time;
+}
+
+void camera_thread_main(GLFWwindow* hidden_camera_window) {
+  if (!hidden_camera_window || simulation_contract.cameras.empty()) {
+    return;
   }
+
+  mjData* camera_data = nullptr;
+  mjvScene camera_scene;
+  mjv_defaultScene(&camera_scene);
+  mjrContext camera_context;
+  mjr_defaultContext(&camera_context);
+
+  try {
+    glfwMakeContextCurrent(hidden_camera_window);
+    glfwSwapInterval(0);
+
+    camera_data = mj_makeData(m);
+    if (!camera_data) {
+      throw std::runtime_error("Failed to allocate MuJoCo camera data.");
+    }
+
+    mjv_makeScene(m, &camera_scene, kSceneMaxGeometry);
+    mjr_makeContext(m, &camera_context, mjFONTSCALE_150);
+    mjr_resizeOffscreen(m->vis.global.offwidth, m->vis.global.offheight,
+                        &camera_context);
+    mjr_setBuffer(mjFB_OFFSCREEN, &camera_context);
+
+    SaiCommon::RedisClient camera_redis_client("sai");
+    camera_redis_client.connect();
+
+    RenderSnapshot snapshot;
+    std::uint64_t last_snapshot_seq = 0;
+    std::uint64_t last_reset_epoch = std::numeric_limits<std::uint64_t>::max();
+    mjvCamera capture_camera;
+    mjv_defaultCamera(&capture_camera);
+
+    while (snapshot_broker->wait_for_newer(last_snapshot_seq, snapshot,
+                                           shutdown_requested)) {
+      last_snapshot_seq = snapshot.seq;
+      copy_snapshot_into_data(snapshot, camera_data);
+      rebuild_render_data(m, camera_data);
+
+      if (snapshot.reset_epoch != last_reset_epoch) {
+        for (auto& camera : simulation_contract.cameras) {
+          camera.next_publish_sim_time = snapshot.sim_time;
+        }
+        last_reset_epoch = snapshot.reset_epoch;
+      }
+
+      for (auto& camera : simulation_contract.cameras) {
+        if (snapshot.sim_time + 1e-9 < camera.next_publish_sim_time) {
+          continue;
+        }
+
+        const mjtNum publish_period = 1.0 / camera.fps;
+        const mjtNum behind_time =
+            std::max<mjtNum>(0.0, snapshot.sim_time - camera.next_publish_sim_time);
+        const std::uint64_t missed_slots =
+            publish_period > 0.0
+                ? static_cast<std::uint64_t>(std::floor(
+                      static_cast<double>(behind_time / publish_period)))
+                : 0;
+        camera.dropped_publish_slots += missed_slots;
+
+        capture_camera.type = mjCAMERA_FIXED;
+        capture_camera.fixedcamid = camera.model_camera_id;
+
+        const mjrRect viewport = {0, 0, camera.width, camera.height};
+        const auto publish_start_time = std::chrono::steady_clock::now();
+        const auto render_start_time = publish_start_time;
+        mjv_updateScene(m, camera_data, &opt, nullptr, &capture_camera,
+                        mjCAT_ALL, &camera_scene);
+        mjr_render(viewport, &camera_scene, &camera_context);
+        const auto render_end_time = std::chrono::steady_clock::now();
+
+        const auto readback_start_time = render_end_time;
+        mjr_readPixels(camera.rgb_buffer.data(), nullptr, viewport,
+                       &camera_context);
+        const auto readback_end_time = std::chrono::steady_clock::now();
+
+        flip_rgb_image_vertically(camera.rgb_buffer, camera.flipped_rgb_buffer,
+                                  camera.width, camera.height,
+                                  camera.channels);
+        cv::Mat rgb_view(camera.height, camera.width, CV_8UC3,
+                         camera.flipped_rgb_buffer.data());
+        cv::Mat bgr_view(camera.height, camera.width, CV_8UC3,
+                         camera.bgr_buffer.data());
+        cv::cvtColor(rgb_view, bgr_view, cv::COLOR_RGB2BGR);
+
+        const auto jpeg_start_time = std::chrono::steady_clock::now();
+        if (!cv::imencode(".jpg", bgr_view, camera.encoded_image_buffer,
+                          {cv::IMWRITE_JPEG_QUALITY, 90})) {
+          throw std::runtime_error("Failed to JPEG-encode camera `" +
+                                   camera.mujoco_camera_name + "`.");
+        }
+        const auto jpeg_end_time = std::chrono::steady_clock::now();
+
+        const auto redis_start_time = jpeg_end_time;
+        camera_redis_client.set(
+            camera.redis_key,
+            std::string(
+                reinterpret_cast<const char*>(camera.encoded_image_buffer.data()),
+                camera.encoded_image_buffer.size()));
+        camera_redis_client.set(camera.metadata_redis_key,
+                                make_camera_metadata_json(camera, snapshot));
+        const auto publish_end_time = std::chrono::steady_clock::now();
+
+        camera.total_render_seconds +=
+            std::chrono::duration<double>(render_end_time - render_start_time)
+                .count();
+        camera.total_readback_seconds +=
+            std::chrono::duration<double>(readback_end_time - readback_start_time)
+                .count();
+        camera.total_jpeg_encode_seconds +=
+            std::chrono::duration<double>(jpeg_end_time - jpeg_start_time)
+                .count();
+        camera.total_redis_publish_seconds +=
+            std::chrono::duration<double>(publish_end_time - redis_start_time)
+                .count();
+        camera.total_publish_seconds +=
+            std::chrono::duration<double>(publish_end_time - publish_start_time)
+                .count();
+        ++camera.publish_count;
+        camera.next_publish_sim_time +=
+            static_cast<mjtNum>(missed_slots + 1) * publish_period;
+      }
+    }
+  } catch (const std::exception& exception) {
+    std::cerr << "Camera publisher thread failed: " << exception.what()
+              << "\n";
+    shutdown_requested = true;
+    if (snapshot_broker) {
+      snapshot_broker->notify_all();
+    }
+  }
+
+  mjv_freeScene(&camera_scene);
+  mjr_freeContext(&camera_context);
+  if (camera_data) {
+    mj_deleteData(camera_data);
+  }
+  glfwMakeContextCurrent(nullptr);
 }
 
 // -------- Redis Code ---------------------------------
@@ -1023,8 +1379,21 @@ int main(int argc, char** argv) {
 
   mjcb_control = controller_callback;
 
+  snapshot_broker = std::make_unique<SnapshotBroker>(m);
+  viewer_data = mj_makeData(m);
+  if (!viewer_data) {
+    std::cerr << "Failed to create MuJoCo viewer data.\n";
+    mjcb_control = nullptr;
+    mj_deleteData(d);
+    mj_deleteModel(m);
+    return 1;
+  }
+  mj_resetData(m, viewer_data);
+  publish_snapshot_from_sim_state(0);
+
   if (!glfwInit()) {
     std::cerr << "Could not initialize GLFW.\n";
+    mj_deleteData(viewer_data);
     mj_deleteData(d);
     mj_deleteModel(m);
     return 1;
@@ -1035,10 +1404,28 @@ int main(int argc, char** argv) {
                        nullptr, nullptr);
   if (!window) {
     std::cerr << "Could not create GLFW window.\n";
+    mj_deleteData(viewer_data);
     mj_deleteData(d);
     mj_deleteModel(m);
     glfwTerminate();
     return 1;
+  }
+
+  GLFWwindow* hidden_camera_window = nullptr;
+  if (!simulation_contract.cameras.empty()) {
+    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+    hidden_camera_window =
+        glfwCreateWindow(1, 1, "ForceWM Camera Publisher", nullptr, window);
+    glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE);
+    if (!hidden_camera_window) {
+      std::cerr << "Could not create hidden camera publishing window.\n";
+      glfwDestroyWindow(window);
+      mj_deleteData(viewer_data);
+      mj_deleteData(d);
+      mj_deleteModel(m);
+      glfwTerminate();
+      return 1;
+    }
   }
 
   glfwMakeContextCurrent(window);
@@ -1046,17 +1433,18 @@ int main(int argc, char** argv) {
 
   mjv_defaultOption(&opt);
   mjv_defaultScene(&scn);
-  mjv_defaultScene(&camera_scn);
   mjr_defaultContext(&con);
 
   initialize_camera();
   mjv_makeScene(m, &scn, kSceneMaxGeometry);
-  if (!simulation_contract.cameras.empty()) {
-    mjv_makeScene(m, &camera_scn, kSceneMaxGeometry);
-  }
   mjr_makeContext(m, &con, mjFONTSCALE_150);
-  if (!simulation_contract.cameras.empty()) {
-    mjr_resizeOffscreen(m->vis.global.offwidth, m->vis.global.offheight, &con);
+
+  RenderSnapshot viewer_snapshot;
+  std::uint64_t last_viewer_snapshot_seq = 0;
+  if (snapshot_broker->copy_latest(viewer_snapshot)) {
+    copy_snapshot_into_data(viewer_snapshot, viewer_data);
+    rebuild_render_data(m, viewer_data);
+    last_viewer_snapshot_seq = viewer_snapshot.seq;
   }
 
   glfwSetKeyCallback(window, keyboard);
@@ -1068,23 +1456,27 @@ int main(int argc, char** argv) {
                "scroll = zoom, Backspace = reset, Esc = quit.\n";
 
   const auto wall_start_time = std::chrono::steady_clock::now();
-  const mjtNum sim_start_time = d->time;
-  std::uint64_t physics_step_count = 0;
+  SimulationLoopStats simulation_loop_stats;
   std::uint64_t rendered_frame_count = 0;
 
-  while (!glfwWindowShouldClose(window)) {
-    const mjtNum simstart = d->time;
+  std::thread simulation_thread(simulation_thread_main, &simulation_loop_stats);
+  std::thread camera_thread;
+  if (hidden_camera_window) {
+    camera_thread = std::thread(camera_thread_main, hidden_camera_window);
+  }
 
-    while (d->time - simstart < kRenderTimestep) {
-      mj_step(m, d);
-      ++physics_step_count;
+  while (!glfwWindowShouldClose(window) && !shutdown_requested.load()) {
+    if (snapshot_broker->copy_latest(viewer_snapshot) &&
+        viewer_snapshot.seq != last_viewer_snapshot_seq) {
+      copy_snapshot_into_data(viewer_snapshot, viewer_data);
+      rebuild_render_data(m, viewer_data);
+      last_viewer_snapshot_seq = viewer_snapshot.seq;
     }
 
     mjrRect viewport = {0, 0, 0, 0};
     glfwGetFramebufferSize(window, &viewport.width, &viewport.height);
 
-    // update_camera_redis_keys();
-    mjv_updateScene(m, d, &opt, nullptr, &cam, mjCAT_ALL, &scn);
+    mjv_updateScene(m, viewer_data, &opt, nullptr, &cam, mjCAT_ALL, &scn);
     mjr_render(viewport, &scn, &con);
 
     glfwSwapBuffers(window);
@@ -1092,18 +1484,35 @@ int main(int argc, char** argv) {
     ++rendered_frame_count;
   }
 
+  shutdown_requested = true;
+  if (snapshot_broker) {
+    snapshot_broker->notify_all();
+  }
+
+  if (simulation_thread.joinable()) {
+    simulation_thread.join();
+  }
+  if (camera_thread.joinable()) {
+    camera_thread.join();
+  }
+
   const auto wall_end_time = std::chrono::steady_clock::now();
   SimulationPerformanceStats performance_stats;
-  performance_stats.physics_step_count = physics_step_count;
+  performance_stats.physics_step_count = simulation_loop_stats.physics_step_count;
   performance_stats.rendered_frame_count = rendered_frame_count;
-  performance_stats.simulated_seconds = d->time - sim_start_time;
+  performance_stats.simulated_seconds =
+      simulation_loop_stats.sim_end_time - simulation_loop_stats.sim_start_time;
   performance_stats.wall_seconds =
       std::chrono::duration<double>(wall_end_time - wall_start_time).count();
 
   mjv_freeScene(&scn);
-  mjv_freeScene(&camera_scn);
   mjr_freeContext(&con);
+  if (hidden_camera_window) {
+    glfwDestroyWindow(hidden_camera_window);
+  }
+  glfwDestroyWindow(window);
   mjcb_control = nullptr;
+  mj_deleteData(viewer_data);
   mj_deleteData(d);
   mj_deleteModel(m);
 
@@ -1112,6 +1521,7 @@ int main(int argc, char** argv) {
 #endif
 
   print_simulation_summary(performance_stats);
+  print_camera_publish_summary();
 
   return 0;
 }

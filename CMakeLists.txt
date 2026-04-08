@@ -15,6 +15,7 @@ include(ForceWMDependencies)
 
 forcewm_configure_runtime_dependencies()
 forcewm_configure_opensai_dependencies()
+find_package(Threads REQUIRED)
 find_package(yaml-cpp CONFIG REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgcodecs imgproc)
 
@@ -26,6 +27,7 @@ if(FORCEWM_SIMULATION_SOURCE_SIZE GREATER 0)
   target_link_libraries(forcewm_simulation PRIVATE
     forcewm::runtime
     forcewm::opensai_model
+    Threads::Threads
     yaml-cpp::yaml-cpp
     ${OpenCV_LIBS}
   )

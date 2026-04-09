@@ -2,6 +2,15 @@ name: opensai-dev
 channels:
   - conda-forge
 dependencies:
+  - python
+  - numpy
+  - opencv
+  - pyarrow
+  - pytorch
+  - scipy
+  - timm
+  - matplotlib
+  - pyyaml
   - cmake
   - ninja
   - pkg-config

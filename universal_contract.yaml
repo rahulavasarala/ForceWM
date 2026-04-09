@@ -1,6 +1,7 @@
 #The universal contract is done --- was hard to come up with but we did it --- 
 
 robot:
+  redis_namespace: "sai"
   prefix: "sim::franka"
   type: "sim"
   xml_path: "models/scene.xml"
@@ -10,15 +11,15 @@ robot:
       fps: 30
       keys: 
         - eef_pos:
+            redis: "current_cartesian_position"
             obs_window: 10
-            action_window: 5
             obs_dss : 3
             dim: [3]
         - eef_ori:
+            redis: "current_cartesian_orientation"
             obs_window: 10
-            action_window: 5
             obs_dss : 3
-            dim: [3]
+            dim: [3, 3]
     visual: #This could contain rgb and depth data 
       fps: 30
       keys:
@@ -27,6 +28,14 @@ robot:
             mujoco_camera_name: "wrist_camera"
             can: 0
             serial_number: 123456
-            dim: [640, 480, 3]
-            obs_window: 10
-
+            dim: [224, 224, 3]
+            obs_window: 3
+            obs_dss: 3
+  action:
+    dss: 3
+    window: 8
+    keys:
+      robot_pos:
+        source: eef_pos
+      robot_ori:
+        source: eef_ori

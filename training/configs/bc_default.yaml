@@ -1,0 +1,45 @@
+data:
+  parquet_path: data_storage/chicken_extracted/dataset.parquet
+  contract_path: universal_contract.yaml
+  output_dir: training_runs/bc_default
+  batch_size: 8
+  num_workers: 0
+  pin_memory: false
+  val_fraction: 0.5
+  seed: 0
+  max_open_video_chunks: 8
+
+model:
+  backbone_name: resnet18
+  backbone_pretrained: true
+  freeze_backbone: false
+  d_model: 256
+  num_layers: 4
+  num_heads: 8
+  mlp_ratio: 4.0
+  dropout: 0.1
+  lowdim_mlp_hidden_dim: 256
+  action_head_hidden_dim: 256
+
+optimization:
+  epochs: 20
+  lr: 0.0001
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+  grad_clip_norm: 1.0
+  use_amp: true
+  compute_dtype: bfloat16
+  scheduler: cosine
+  warmup_epochs: 1
+
+loss:
+  pos_loss_weight: 1.0
+  ori_loss_weight: 1.0
+
+checkpoint:
+  save_every_epochs: 5
+  save_best: true
+  keep_last: 2
+
+logging:
+  log_every_steps: 10

@@ -87,9 +87,10 @@ class RobotObserver:
 
         while not self._stop_event.is_set():
             observation = self._read_observation_from_redis()
-            observation["timestamp_s"] = time.time()
-            with self._lock:
-                self.buffer.append(observation)
+            if observation is not None:
+                observation["timestamp_s"] = time.time()
+                with self._lock:
+                    self.buffer.append(observation)
 
             next_poll_time += self.obs_period_s
             sleep_duration = next_poll_time - time.perf_counter()
@@ -98,11 +99,15 @@ class RobotObserver:
             else:
                 next_poll_time = time.perf_counter()
 
-    def _read_observation_from_redis(self) -> dict[str, Any]:
+    def _read_observation_from_redis(self) -> dict[str, Any] | None:
         observation: dict[str, Any] = {}
         for lowdim_name, lowdim_spec in self.lowdim_specs.items():
+            redis_value = self.redis_client.get(lowdim_spec["redis_key"])
+            if redis_value is None:
+                return None
+
             observation[lowdim_name] = np.array(
-                json.loads(self.redis_client.get(lowdim_spec["redis_key"]))
+                json.loads(redis_value)
             )
 
         return observation
@@ -148,6 +153,9 @@ class RobotObserver:
         prefix = robot_cfg.get("prefix")
         if prefix is None:
             raise ValueError("The robot is missing a prefix in the universal contract.")
+        redis_namespace = RobotObserver._normalize_redis_namespace(
+            robot_cfg.get("redis_namespace", "sai")
+        )
 
         lowdim_cfg = robot_cfg.get("data_sources", {}).get("lowdim", {})
         lowdim_keys = lowdim_cfg.get("keys", [])
@@ -160,15 +168,26 @@ class RobotObserver:
             lowdim_name, lowdim_spec = next(iter(lowdim_entry.items()))
             redis_suffix = lowdim_spec.get("redis", lowdim_name)
             parsed_lowdim[lowdim_name] = {
-                "redis_key": RobotObserver._make_redis_key(prefix, redis_suffix),
+                "redis_key": RobotObserver._make_redis_key(
+                    redis_namespace, prefix, redis_suffix
+                ),
                 "dim": lowdim_spec.get("dim"),
             }
 
         return parsed_lowdim
 
     @staticmethod
-    def _make_redis_key(prefix: str, suffix: str) -> str:
-        return f"{prefix.rstrip(':')}::{suffix.lstrip(':')}"
+    def _normalize_redis_namespace(redis_namespace: Any) -> str:
+        if redis_namespace is None:
+            return ""
+        return str(redis_namespace).strip(":")
+
+    @staticmethod
+    def _make_redis_key(redis_namespace: str, prefix: str, suffix: str) -> str:
+        redis_key = f"{prefix.rstrip(':')}::{suffix.lstrip(':')}"
+        if not redis_namespace:
+            return redis_key
+        return f"{redis_namespace}::{redis_key}"
 
     @staticmethod
     def _stack_or_list(values: list[Any]) -> Any:

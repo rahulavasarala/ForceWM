@@ -134,7 +134,7 @@
                       <geom name="fr3_link7_collision" class="collision" mesh="link7_coll"/>
                       <body name="fr3_ee" pos="0.0 0 0.107">
                         <site name="ft_site" pos="0 0 0"/>
-                        <camera name="wrist_camera" pos="0 0 0" xyaxes="1 0 0 0 -1 0" fovy="60"/>
+                        <camera name="wrist_camera" pos="0 0 0.1" xyaxes="1 0 0 0 -1 0" fovy="60"/>
 
                         <geom name="ee_contact"
                             type="sphere"

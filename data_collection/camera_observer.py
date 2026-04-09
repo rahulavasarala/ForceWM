@@ -91,9 +91,10 @@ class CameraObserver:
 
         while not self._stop_event.is_set():
             observation = self._read_observation()
-            observation.setdefault("timestamp_s", time.time())
-            with self._lock:
-                self.buffer.append(observation)
+            if observation is not None:
+                observation.setdefault("timestamp_s", time.time())
+                with self._lock:
+                    self.buffer.append(observation)
 
             next_poll_time += self.camera_period_s
             sleep_duration = next_poll_time - time.perf_counter()
@@ -102,7 +103,7 @@ class CameraObserver:
             else:
                 next_poll_time = time.perf_counter()
 
-    def _read_observation(self) -> dict[str, Any]:
+    def _read_observation(self) -> dict[str, Any] | None:
         observation: dict[str, Any] = {}
         metadata_timestamps: list[float] = []
         sim_timestamps: list[float] = []
@@ -111,9 +112,12 @@ class CameraObserver:
             source_type = visual_spec["source_type"]
             if source_type == "sim":
                 redis_bytes = self.redis_client.get(visual_spec["redis_key"])
+                if redis_bytes is None:
+                    return None
+
                 frame = cv2.imdecode(np.frombuffer(redis_bytes, np.uint8), cv2.IMREAD_COLOR)
                 if frame is None:
-                    raise RuntimeError(f"Failed to decode sim camera frame for '{visual_name}'.")
+                    return None
                 observation[visual_name] = frame
 
                 metadata_raw = self.redis_client.get(visual_spec["metadata_redis_key"])
@@ -239,6 +243,9 @@ class CameraObserver:
         prefix = robot_cfg.get("prefix")
         if prefix is None:
             raise ValueError("The robot is missing a prefix in the universal contract.")
+        redis_namespace = CameraObserver._normalize_redis_namespace(
+            robot_cfg.get("redis_namespace", "sai")
+        )
 
         visual_block = robot_cfg.get("data_sources", {}).get("visual", {})
         robot_type = str(robot_cfg.get("type", "")).lower()
@@ -266,8 +273,12 @@ class CameraObserver:
             parsed_visual[visual_name] = {
                 "source_type": source_type,
                 "type": visual_type,
-                "redis_key": CameraObserver._make_redis_key(prefix, redis_suffix),
-                "metadata_redis_key": CameraObserver._make_redis_key(prefix, redis_suffix) + "::meta",
+                "redis_key": CameraObserver._make_redis_key(
+                    redis_namespace, prefix, redis_suffix
+                ),
+                "metadata_redis_key": CameraObserver._make_redis_key(
+                    redis_namespace, prefix, redis_suffix
+                ) + "::meta",
                 "dim": visual_cfg.get("dim"),
                 "serial_number": visual_cfg.get("serial_number"),
                 "fps": visual_cfg.get("fps", visual_fps),
@@ -282,8 +293,17 @@ class CameraObserver:
         return int(dim[0]), int(dim[1])
 
     @staticmethod
-    def _make_redis_key(prefix: str, suffix: str) -> str:
-        return f"{prefix.rstrip(':')}::{suffix.lstrip(':')}"
+    def _normalize_redis_namespace(redis_namespace: Any) -> str:
+        if redis_namespace is None:
+            return ""
+        return str(redis_namespace).strip(":")
+
+    @staticmethod
+    def _make_redis_key(redis_namespace: str, prefix: str, suffix: str) -> str:
+        redis_key = f"{prefix.rstrip(':')}::{suffix.lstrip(':')}"
+        if not redis_namespace:
+            return redis_key
+        return f"{redis_namespace}::{redis_key}"
 
     @staticmethod
     def _stack_or_list(values: list[Any]) -> Any:

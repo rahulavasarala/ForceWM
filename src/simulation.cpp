@@ -45,6 +45,7 @@ constexpr int kWindowHeight = 900;
 constexpr int kSceneMaxGeometry = 2000;
 constexpr mjtNum kRenderTimestep = 1.0 / 60.0;
 constexpr int kRobotDof = 7;
+constexpr double kSensedWrenchLowPassAlpha = 0.2;
 constexpr const char* kDefaultSceneXmlPath = "models/scene.xml";
 constexpr const char* kDefaultRobotUrdfPath = "models/fr3.urdf";
 constexpr const char* kEndEffectorForceSensorName = "ee_force";
@@ -71,7 +72,7 @@ bool is_data_collection = false;
 
 // Initialization variables for robot control ---------------------
 
-Vector3d START_POS = Vector3d(0.4, 0.0, 0.1);
+Vector3d START_POS = Vector3d(0.4, 0.0, 0.4);
 Matrix3d START_ORIENTATION = (Matrix3d() << 
     1,  0,  0,
     0, -1,  0,
@@ -86,6 +87,9 @@ SaiPrimitives::HapticControllerInput haptic_input;
 SaiPrimitives::HapticControllerOutput haptic_output;
 
 Vector3d prev_sensed_force;
+Vector3d filtered_sensed_force_sensor_frame = Vector3d::Zero();
+Vector3d filtered_sensed_moment_sensor_frame = Vector3d::Zero();
+bool sensed_wrench_filter_initialized = false;
 Vector3i directions_of_proxy_feedback;
 
 Vector3d control_point;
@@ -731,6 +735,12 @@ void reset_to_home() {
     std::fill(d->ctrl, d->ctrl + m->nu, 0.0);
   }
 
+  prev_sensed_force = Vector3d::Zero();
+  filtered_sensed_force_sensor_frame = Vector3d::Zero();
+  filtered_sensed_moment_sensor_frame = Vector3d::Zero();
+  sensed_wrench_filter_initialized = false;
+  directions_of_proxy_feedback = Vector3i::Zero();
+
   mj_forward(m, d);
 }
 
@@ -898,12 +908,54 @@ Vector3d get_sensed_moment(const mjModel* m, mjData* d,
   return get_force_sensor_rotation_in_world(d) * sensed_moment_sensor_frame;
 }
 
+void update_filtered_sensed_wrench(const mjModel* m, mjData* d) {
+  const Vector3d raw_force_sensor_frame = get_sensed_force(m, d, false);
+  const Vector3d raw_moment_sensor_frame = get_sensed_moment(m, d, false);
+
+  if (!sensed_wrench_filter_initialized) {
+    filtered_sensed_force_sensor_frame = raw_force_sensor_frame;
+    filtered_sensed_moment_sensor_frame = raw_moment_sensor_frame;
+    sensed_wrench_filter_initialized = true;
+    return;
+  }
+
+  filtered_sensed_force_sensor_frame =
+      (1.0 - kSensedWrenchLowPassAlpha) * filtered_sensed_force_sensor_frame +
+      kSensedWrenchLowPassAlpha * raw_force_sensor_frame;
+  filtered_sensed_moment_sensor_frame =
+      (1.0 - kSensedWrenchLowPassAlpha) * filtered_sensed_moment_sensor_frame +
+      kSensedWrenchLowPassAlpha * raw_moment_sensor_frame;
+}
+
+Vector3d get_filtered_sensed_force(const mjModel* m, mjData* d,
+                                   const bool express_in_world_frame = false) {
+  const Vector3d sensed_force_sensor_frame = sensed_wrench_filter_initialized
+                                                 ? filtered_sensed_force_sensor_frame
+                                                 : get_sensed_force(m, d, false);
+  if (!express_in_world_frame) {
+    return sensed_force_sensor_frame;
+  }
+  return get_force_sensor_rotation_in_world(d) * sensed_force_sensor_frame;
+}
+
+Vector3d get_filtered_sensed_moment(const mjModel* m, mjData* d,
+                                    const bool express_in_world_frame = false) {
+  const Vector3d sensed_moment_sensor_frame = sensed_wrench_filter_initialized
+                                                  ? filtered_sensed_moment_sensor_frame
+                                                  : get_sensed_moment(m, d, false);
+  if (!express_in_world_frame) {
+    return sensed_moment_sensor_frame;
+  }
+  return get_force_sensor_rotation_in_world(d) * sensed_moment_sensor_frame;
+}
+
 void inference_time_callback(const mjModel* m, mjData* d) {
 
   //When the robot is in inference mode, we have things that are ---- 
   // only relevant to inference and not data collection.
 
   update_robot_state(m, d);
+  update_filtered_sensed_wrench(m, d);
   update_redis(m, d);
   query_redis_for_desired_state();
 
@@ -929,6 +981,7 @@ void data_collection_time_callback(const mjModel* m, mjData* d) {
   //If inference mode is false ---- then we are in data collection mo
 
   update_robot_state(m, d);
+  update_filtered_sensed_wrench(m, d);
   update_redis(m, d);
   update_haptic_information(robot);
   haptic_output = haptic_controller->computeHapticControl(haptic_input);
@@ -936,8 +989,8 @@ void data_collection_time_callback(const mjModel* m, mjData* d) {
   send_haptic_commands();
 
   motion_force_task->updateSensedForceAndMoment(
-     -1 * get_sensed_force(m, d),
-      -1 *get_sensed_moment(m, d));
+     -1 * get_filtered_sensed_force(m, d),
+      -1 *get_filtered_sensed_moment(m, d));
 
   motion_force_task->setGoalPosition(haptic_output.robot_goal_position);
   motion_force_task->setGoalOrientation(
@@ -950,7 +1003,7 @@ void data_collection_time_callback(const mjModel* m, mjData* d) {
       motion_force_task->computeTorques() + joint_task->computeTorques() +
       robot->jointGravityVector();
 
-  Vector3d sensed_force_world_frame = -1 *get_sensed_force(m, d, true);
+  Vector3d sensed_force_world_frame = -1 *get_filtered_sensed_force(m, d, true);
 
   for (int i = 0; i < 3; ++i) {
     if (fabs(sensed_force_world_frame(i)) >= 0.5 &&
@@ -1028,8 +1081,8 @@ void update_redis(const mjModel* m, mjData* d) {
 
     redis_client.setEigen(QPOS, qpos);
 
-    Vector3d sensed_force = -1 * get_sensed_force(m, d, true);
-    Vector3d sensed_moment = -1 *get_sensed_moment(m, d, true);
+    Vector3d sensed_force = -1 * get_filtered_sensed_force(m, d, true);
+    Vector3d sensed_moment = -1 *get_filtered_sensed_moment(m, d, true);
     redis_client.setEigen(SENSED_FORCE, sensed_force);
     redis_client.setEigen(SENSED_MOMENT, sensed_moment);
 }
@@ -1061,8 +1114,8 @@ void update_haptic_information(std::shared_ptr<SaiModel::SaiModel> robot) {
   // This example still uses proxy feedback instead of direct wrench feedback.
   // The MuJoCo helpers above can now return either sensor-frame or world-frame
   // wrench depending on the call-site flag.
-  haptic_input.robot_sensed_force = -1 *get_sensed_force(m, d, true);
-  haptic_input.robot_sensed_moment = -1 * get_sensed_moment(m, d, true);
+  haptic_input.robot_sensed_force = -1 *get_filtered_sensed_force(m, d, true);
+  haptic_input.robot_sensed_moment = -1 * get_filtered_sensed_moment(m, d, true);
 }
 
 void send_haptic_commands() {
@@ -1070,6 +1123,10 @@ void send_haptic_commands() {
                         haptic_output.device_command_force);
   redis_client.setEigen(createRedisKey(COMMANDED_TORQUE_KEY_SUFFIX, 0),
                         haptic_output.device_command_moment);
+  redis_client.setEigen(HAPTIC_COMMANDED_POSITION,
+                        haptic_output.robot_goal_position);
+  redis_client.setEigen(HAPTIC_COMMANDED_ORIENTATION,
+                        haptic_output.robot_goal_orientation);
 }
 
 void simulation_thread_main(SimulationLoopStats* simulation_loop_stats) {
@@ -1328,11 +1385,11 @@ int main(int argc, char** argv) {
   robot = std::make_shared<SaiModel::SaiModel>(robot_file, false);
   std::cout << "Robot DOF: " << robot->dof() << "\n";
   std::cout << "MJ DOF: " << m->nq << "\n"; 
-  control_point = Vector3d(0.0, 0.0, 0.0);
+  control_point = Vector3d(0.0, 0.0, 0.05);
   control_frame = Affine3d::Identity();
   control_frame.translation() = control_point;
   motion_force_task = std::make_shared<SaiPrimitives::MotionForceTask>(robot, control_link, control_frame);
-  motion_force_task->setPosControlGains(400.0, 40.0);
+  motion_force_task->setPosControlGains(200, 20);
   
   motion_force_task->disableInternalOtg();
   joint_task = std::make_shared<SaiPrimitives::JointTask>(robot);
@@ -1359,13 +1416,13 @@ int main(int argc, char** argv) {
       prev_sensed_force = Vector3d::Zero();
 
       haptic_controller->setDeviceControlGains(
-        0.1 * device_limits.max_linear_stiffness,
-        0.3 * device_limits.max_linear_damping,
-        0.1 * device_limits.max_angular_stiffness,
-        0.3 * device_limits.max_angular_damping);
+        0.02 * device_limits.max_linear_stiffness,
+        0.02 * device_limits.max_linear_damping,
+        0.02 * device_limits.max_angular_stiffness,
+        0.02 * device_limits.max_angular_damping);
 
-      haptic_controller->setReductionFactorForce(0.2);
-      haptic_controller->setReductionFactorMoment(0.2);
+      haptic_controller->setReductionFactorForce(0.05);
+      haptic_controller->setReductionFactorMoment(0.05);
     } catch (const std::exception& exception) {
       std::cerr << exception.what() << "\n";
       mj_deleteData(d);
@@ -1374,7 +1431,7 @@ int main(int argc, char** argv) {
     }
   }
 
-  //initialize the haptic controller ----- ----------------
+  //initialize the haptic controller ---
   
 
   mjcb_control = controller_callback;

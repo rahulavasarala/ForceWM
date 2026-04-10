@@ -9,6 +9,7 @@ dependencies:
   - pytorch
   - scipy
   - timm
+  - tqdm
   - matplotlib
   - pyyaml
   - cmake

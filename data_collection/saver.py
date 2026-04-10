@@ -70,10 +70,12 @@ class Saver:
         self._last_lowdim_timestamp_s: float | None = None
         self._last_camera_timestamp_s: float | None = None
         self._last_completed_episode_summary: dict[str, Any] | None = None
+        self._last_camera_source_marker: dict[str, int | float | None] = {}
 
         self._lowdim_records: dict[str, list[Any]] = {}
         self._camera_timestamps: dict[str, list[float]] = {}
         self._camera_frame_counts: dict[str, int] = {}
+        self._camera_duplicate_frame_counts: dict[str, int] = {}
         self._video_writers: dict[str, cv2.VideoWriter] = {}
         self._video_paths: dict[str, Path] = {}
 
@@ -244,6 +246,19 @@ class Saver:
                 if camera_name not in sample:
                     raise KeyError(f"Camera observation is missing key '{camera_name}'.")
 
+                source_marker = self._extract_camera_source_marker(sample, camera_name)
+                last_source_marker = self._last_camera_source_marker.get(camera_name)
+                if (
+                    source_marker is not None
+                    and last_source_marker is not None
+                    and source_marker <= last_source_marker
+                ):
+                    self._camera_duplicate_frame_counts[camera_name] += 1
+                if source_marker is not None and (
+                    last_source_marker is None or source_marker > last_source_marker
+                ):
+                    self._last_camera_source_marker[camera_name] = source_marker
+
                 frame = self._prepare_frame_for_video(camera_name, sample[camera_name], camera_spec)
                 self._video_writers[camera_name].write(frame)
                 self._camera_timestamps[camera_name].append(timestamp_s)
@@ -258,6 +273,8 @@ class Saver:
 
         self._camera_timestamps = {camera_name: [] for camera_name in self.camera_specs}
         self._camera_frame_counts = {camera_name: 0 for camera_name in self.camera_specs}
+        self._camera_duplicate_frame_counts = {camera_name: 0 for camera_name in self.camera_specs}
+        self._last_camera_source_marker = {camera_name: None for camera_name in self.camera_specs}
         self._video_writers = {}
         self._video_paths = {}
 
@@ -355,6 +372,7 @@ class Saver:
             "duration_s": stop_timestamp_s - self._start_timestamp_s,
             "num_lowdim_samples": len(self._lowdim_records["timestamp_s"]),
             "camera_frame_counts": dict(self._camera_frame_counts),
+            "camera_duplicate_frame_counts": dict(self._camera_duplicate_frame_counts),
             "lowdim_keys": list(self.lowdim_specs.keys()),
             "camera_keys": list(self.camera_specs.keys()),
             "lowdim_fps": self.lowdim_fps,
@@ -389,6 +407,18 @@ class Saver:
         if "timestamp_s" not in sample:
             raise KeyError("Observation sample is missing `timestamp_s`.")
         return float(sample["timestamp_s"])
+
+    @staticmethod
+    def _extract_camera_source_marker(sample: dict[str, Any], camera_name: str) -> int | float | None:
+        frame_seqs = sample.get("camera_frame_seqs")
+        if isinstance(frame_seqs, dict) and camera_name in frame_seqs:
+            return int(frame_seqs[camera_name])
+
+        source_timestamps = sample.get("camera_source_timestamps")
+        if isinstance(source_timestamps, dict) and camera_name in source_timestamps:
+            return float(source_timestamps[camera_name])
+
+        return None
 
     def _resolve_fps(self, source_name: str, fallback_fps: Any) -> float:
         if fallback_fps is not None:

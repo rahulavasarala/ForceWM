@@ -11,13 +11,13 @@ robot:
       fps: 30
       keys: 
         - eef_pos:
-            redis: "current_cartesian_position"
-            obs_window: 10
+            redis: "haptic_commanded_position"
+            obs_window: 3
             obs_dss : 3
             dim: [3]
         - eef_ori:
-            redis: "current_cartesian_orientation"
-            obs_window: 10
+            redis: "haptic_commanded_orientation"
+            obs_window: 3
             obs_dss : 3
             dim: [3, 3]
     visual: #This could contain rgb and depth data 

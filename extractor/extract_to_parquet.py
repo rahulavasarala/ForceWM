@@ -217,6 +217,16 @@ def _require_pyarrow():
     return pa, pq
 
 
+def _require_tqdm():
+    try:
+        from tqdm.auto import tqdm
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "tqdm is required for extractor progress bars. Install the `tqdm` package in the runtime environment."
+        ) from exc
+    return tqdm
+
+
 def _require_slerp():
     try:
         from scipy.spatial.transform import Rotation, Slerp
@@ -424,6 +434,7 @@ def expand_and_chunk_videos(
     video_codec: str,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, int]]]:
     cv2 = _require_cv2()
+    tqdm = _require_tqdm()
 
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive.")
@@ -433,106 +444,117 @@ def expand_and_chunk_videos(
     fourcc = cv2.VideoWriter_fourcc(*video_codec)
     frame_manifest: list[dict[str, Any]] = []
     actual_frame_counts: dict[str, dict[str, int]] = defaultdict(dict)
+    estimated_total_frames = sum(
+        len(_load_timestamps(camera_spec.timestamp_path))
+        for episode in episodes
+        for camera_spec in episode.camera_specs.values()
+    )
 
-    for episode in sorted(episodes, key=lambda ep: ep.episode_id):
-        episode_output_dir = output_root / episode.episode_name
-        episode_output_dir.mkdir(parents=True, exist_ok=True)
+    with tqdm(total=estimated_total_frames, desc="Chunking frames", unit="frame") as progress_bar:
+        for episode in sorted(episodes, key=lambda ep: ep.episode_id):
+            episode_output_dir = output_root / episode.episode_name
+            episode_output_dir.mkdir(parents=True, exist_ok=True)
 
-        for camera_name, camera_spec in sorted(episode.camera_specs.items()):
-            timestamps = _load_timestamps(camera_spec.timestamp_path)
-            capture = cv2.VideoCapture(str(camera_spec.video_path))
-            if not capture.isOpened():
-                raise RuntimeError(f"Failed to open camera video: {camera_spec.video_path}")
+            for camera_name, camera_spec in sorted(episode.camera_specs.items()):
+                timestamps = _load_timestamps(camera_spec.timestamp_path)
+                capture = cv2.VideoCapture(str(camera_spec.video_path))
+                if not capture.isOpened():
+                    raise RuntimeError(f"Failed to open camera video: {camera_spec.video_path}")
 
-            writer = None
-            chunk_index = -1
-            written_frames = 0
-            decoded_frames = 0
-            expected_frame_count = episode.metadata.get("camera_frame_counts", {}).get(camera_name)
+                writer = None
+                chunk_index = -1
+                written_frames = 0
+                decoded_frames = 0
+                expected_frame_count = episode.metadata.get("camera_frame_counts", {}).get(camera_name)
+                progress_bar.set_postfix_str(f"{episode.episode_name}/{camera_name}", refresh=False)
 
-            try:
-                while True:
-                    ok, frame = capture.read()
-                    if not ok:
-                        break
+                try:
+                    while True:
+                        ok, frame = capture.read()
+                        if not ok:
+                            break
 
-                    if decoded_frames < len(timestamps):
-                        if frame.ndim != 3 or frame.shape[2] != 3:
-                            raise ValueError(
-                                f"Camera frame for `{camera_name}` in `{episode.episode_name}` is not HxWx3."
+                        if decoded_frames < len(timestamps):
+                            if frame.ndim != 3 or frame.shape[2] != 3:
+                                raise ValueError(
+                                    f"Camera frame for `{camera_name}` in `{episode.episode_name}` is not HxWx3."
+                                )
+
+                            height, width = frame.shape[:2]
+                            if camera_spec.dim is not None:
+                                expected_width, expected_height = camera_spec.dim
+                                if (width, height) != (expected_width, expected_height):
+                                    _warning(
+                                        f"Decoded frame size for `{camera_name}` in `{episode.episode_name}` is "
+                                        f"{width}x{height}, which differs from the contract dim {expected_width}x{expected_height}."
+                                    )
+
+                            if written_frames % chunk_size == 0:
+                                if writer is not None:
+                                    writer.release()
+                                chunk_index += 1
+                                chunk_path = episode_output_dir / f"{camera_name}_chunk_{chunk_index:06d}.mp4"
+                                writer = cv2.VideoWriter(
+                                    str(chunk_path),
+                                    fourcc,
+                                    float(camera_spec.fps),
+                                    (width, height),
+                                )
+                                if not writer.isOpened():
+                                    raise RuntimeError(
+                                        f"Failed to open chunk writer for `{chunk_path}` using codec `{video_codec}`."
+                                    )
+
+                            writer.write(frame)
+                            frame_manifest.append(
+                                {
+                                    "episode_id": episode.episode_id,
+                                    "episode_name": episode.episode_name,
+                                    "camera_name": camera_name,
+                                    "episode_frame_index": written_frames,
+                                    "camera_timestamp_s": float(timestamps[written_frames]),
+                                    "video_chunk_index": chunk_index,
+                                    "frame_index_in_chunk": written_frames % chunk_size,
+                                    "video_chunk_path": (
+                                        episode_output_dir
+                                        / f"{camera_name}_chunk_{chunk_index:06d}.mp4"
+                                    )
+                                    .relative_to(output_root)
+                                    .as_posix(),
+                                }
                             )
+                            written_frames += 1
+                            progress_bar.update(1)
 
-                        height, width = frame.shape[:2]
-                        if camera_spec.dim is not None:
-                            expected_width, expected_height = camera_spec.dim
-                            if (width, height) != (expected_width, expected_height):
-                                _warning(
-                                    f"Decoded frame size for `{camera_name}` in `{episode.episode_name}` is "
-                                    f"{width}x{height}, which differs from the contract dim {expected_width}x{expected_height}."
-                                )
+                        decoded_frames += 1
+                finally:
+                    if writer is not None:
+                        writer.release()
+                    capture.release()
 
-                        if written_frames % chunk_size == 0:
-                            if writer is not None:
-                                writer.release()
-                            chunk_index += 1
-                            chunk_path = episode_output_dir / f"{camera_name}_chunk_{chunk_index:06d}.mp4"
-                            writer = cv2.VideoWriter(
-                                str(chunk_path),
-                                fourcc,
-                                float(camera_spec.fps),
-                                (width, height),
-                            )
-                            if not writer.isOpened():
-                                raise RuntimeError(
-                                    f"Failed to open chunk writer for `{chunk_path}` using codec `{video_codec}`."
-                                )
+                actual_frame_count = min(decoded_frames, len(timestamps))
+                actual_frame_counts[episode.episode_name][camera_name] = actual_frame_count
 
-                        writer.write(frame)
-                        frame_manifest.append(
-                            {
-                                "episode_id": episode.episode_id,
-                                "episode_name": episode.episode_name,
-                                "camera_name": camera_name,
-                                "episode_frame_index": written_frames,
-                                "camera_timestamp_s": float(timestamps[written_frames]),
-                                "video_chunk_index": chunk_index,
-                                "frame_index_in_chunk": written_frames % chunk_size,
-                                "video_chunk_path": (
-                                    episode_output_dir
-                                    / f"{camera_name}_chunk_{chunk_index:06d}.mp4"
-                                )
-                                .relative_to(output_root)
-                                .as_posix(),
-                            }
-                        )
-                        written_frames += 1
+                if written_frames < len(timestamps):
+                    progress_bar.update(len(timestamps) - written_frames)
 
-                    decoded_frames += 1
-            finally:
-                if writer is not None:
-                    writer.release()
-                capture.release()
+                if actual_frame_count == 0:
+                    raise ValueError(
+                        f"Camera `{camera_name}` in episode `{episode.episode_name}` produced zero usable frames."
+                    )
 
-            actual_frame_count = min(decoded_frames, len(timestamps))
-            actual_frame_counts[episode.episode_name][camera_name] = actual_frame_count
+                if decoded_frames != len(timestamps):
+                    _warning(
+                        f"Frame count mismatch for `{camera_name}` in `{episode.episode_name}`: "
+                        f"decoded {decoded_frames} frames but found {len(timestamps)} timestamps. "
+                        f"Using the first {actual_frame_count} frames."
+                    )
 
-            if actual_frame_count == 0:
-                raise ValueError(
-                    f"Camera `{camera_name}` in episode `{episode.episode_name}` produced zero usable frames."
-                )
-
-            if decoded_frames != len(timestamps):
-                _warning(
-                    f"Frame count mismatch for `{camera_name}` in `{episode.episode_name}`: "
-                    f"decoded {decoded_frames} frames but found {len(timestamps)} timestamps. "
-                    f"Using the first {actual_frame_count} frames."
-                )
-
-            if expected_frame_count is not None and int(expected_frame_count) != actual_frame_count:
-                _warning(
-                    f"Episode metadata reports {expected_frame_count} frames for `{camera_name}` in "
-                    f"`{episode.episode_name}`, but {actual_frame_count} usable frames were extracted."
-                )
+                if expected_frame_count is not None and int(expected_frame_count) != actual_frame_count:
+                    _warning(
+                        f"Episode metadata reports {expected_frame_count} frames for `{camera_name}` in "
+                        f"`{episode.episode_name}`, but {actual_frame_count} usable frames were extracted."
+                    )
 
     return frame_manifest, {key: dict(value) for key, value in actual_frame_counts.items()}
 
@@ -646,6 +668,7 @@ def create_parquet_file(
     video_codec: str,
 ) -> Path:
     pa, pq = _require_pyarrow()
+    tqdm = _require_tqdm()
 
     if not frame_manifest:
         raise ValueError("No frame records were produced by video expansion and chunking.")
@@ -657,14 +680,19 @@ def create_parquet_file(
     episodes_by_name = {episode.episode_name: episode for episode in episodes}
     lowdim_interpolators = {
         episode.episode_name: build_lowdim_interpolator(_load_lowdim_archive(episode.lowdim_path))
-        for episode in episodes
+        for episode in tqdm(episodes, desc="Loading lowdim", unit="episode")
     }
 
     grouped_rows: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         grouped_rows[(row["episode_name"], row["camera_name"])].append(row)
 
-    for (episode_name, camera_name), grouped in grouped_rows.items():
+    for (episode_name, camera_name), grouped in tqdm(
+        grouped_rows.items(),
+        total=len(grouped_rows),
+        desc="Interpolating lowdim",
+        unit="stream",
+    ):
         episode = episodes_by_name[episode_name]
         interpolator = lowdim_interpolators[episode_name]
         target_timestamps = np.asarray(
@@ -732,7 +760,7 @@ def create_parquet_file(
         episode_start = episode_end + 1
 
     python_rows = []
-    for row in rows:
+    for row in tqdm(rows, desc="Preparing parquet rows", unit="row"):
         python_rows.append(
             {
                 "episode_id": int(row["episode_id"]),
@@ -761,6 +789,7 @@ def create_parquet_file(
     }
 
     schema = _build_schema(rows, dataset_metadata)
+    print(f"Writing parquet table to {parquet_path}", flush=True)
     table = pa.Table.from_pylist(python_rows, schema=schema)
     table = table.replace_schema_metadata(schema.metadata)
     pq.write_table(table, parquet_path, compression=DEFAULT_PARQUET_COMPRESSION)

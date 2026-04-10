@@ -257,10 +257,16 @@ class DataCollection:
         duration_s = float(summary.get("duration_s", 0.0))
         num_lowdim_samples = int(summary.get("num_lowdim_samples", 0))
         camera_frame_counts = summary.get("camera_frame_counts", {})
+        camera_duplicate_frame_counts = summary.get("camera_duplicate_frame_counts", {})
 
         if isinstance(camera_frame_counts, dict) and camera_frame_counts:
             camera_summary = ", ".join(
-                f"{camera_name}: {frame_count} frames"
+                (
+                    f"{camera_name}: {frame_count} frames"
+                    if int(camera_duplicate_frame_counts.get(camera_name, 0)) == 0
+                    else f"{camera_name}: {frame_count} frames "
+                    f"({int(camera_duplicate_frame_counts.get(camera_name, 0))} duplicates)"
+                )
                 for camera_name, frame_count in sorted(camera_frame_counts.items())
             )
         else:

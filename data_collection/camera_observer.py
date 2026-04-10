@@ -105,7 +105,8 @@ class CameraObserver:
 
     def _read_observation(self) -> dict[str, Any] | None:
         observation: dict[str, Any] = {}
-        metadata_timestamps: list[float] = []
+        source_timestamps: dict[str, float] = {}
+        frame_seqs: dict[str, int] = {}
         sim_timestamps: list[float] = []
 
         for visual_name, visual_spec in self.camera_specs.items():
@@ -123,8 +124,10 @@ class CameraObserver:
                 metadata_raw = self.redis_client.get(visual_spec["metadata_redis_key"])
                 if metadata_raw:
                     metadata = json.loads(metadata_raw)
+                    if "seq" in metadata:
+                        frame_seqs[visual_name] = int(metadata["seq"])
                     if "publish_wall_time_s" in metadata:
-                        metadata_timestamps.append(float(metadata["publish_wall_time_s"]))
+                        source_timestamps[visual_name] = float(metadata["publish_wall_time_s"])
                     if "sim_time_s" in metadata:
                         sim_timestamps.append(float(metadata["sim_time_s"]))
             elif source_type == "realsense":
@@ -134,8 +137,12 @@ class CameraObserver:
                     json.loads(self.redis_client.get(visual_spec["redis_key"]))
                 )
 
-        if metadata_timestamps:
-            observation["timestamp_s"] = max(metadata_timestamps)
+        if source_timestamps:
+            observation["source_timestamp_s"] = max(source_timestamps.values())
+            observation["camera_source_timestamps"] = source_timestamps
+        if frame_seqs:
+            observation["camera_frame_seq"] = max(frame_seqs.values())
+            observation["camera_frame_seqs"] = frame_seqs
         if sim_timestamps:
             observation["sim_timestamp_s"] = max(sim_timestamps)
 

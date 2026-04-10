@@ -1,0 +1,75 @@
+<mujoco model="hole">
+    <asset>
+        <mesh name="holesim" file="../peginhole/holesim_small.stl" scale="0.001 0.001 0.001"/>
+        <mesh name="geom0" file="../peginhole/geometry_0.obj"/>
+        <mesh name="geom1" file="../peginhole/geometry_1.obj"/>
+        <mesh name="geom2" file="../peginhole/geometry_2.obj"/>
+        <mesh name="geom3" file="../peginhole/geometry_3.obj"/>
+        <mesh name="geom4" file="../peginhole/geometry_4.obj"/>
+        <mesh name="geom5" file="../peginhole/geometry_5.obj"/>
+        <mesh name="geom6" file="../peginhole/geometry_6.obj"/>
+        <mesh name="geom7" file="../peginhole/geometry_7.obj"/>
+        <mesh name="geom8" file="../peginhole/geometry_8.obj"/>
+        <mesh name="geom9" file="../peginhole/geometry_9.obj"/>
+        <mesh name="geom10" file="../peginhole/geometry_10.obj"/>
+        <mesh name="geom11" file="../peginhole/geometry_11.obj"/>
+        <mesh name="geom12" file="../peginhole/geometry_12.obj"/>
+        <mesh name="geom13" file="../peginhole/geometry_13.obj"/>
+        <mesh name="geom14" file="../peginhole/geometry_14.obj"/>
+        <mesh name="geom15" file="../peginhole/geometry_15.obj"/>
+        <mesh name="geom16" file="../peginhole/geometry_16.obj"/>
+        <mesh name="geom17" file="../peginhole/geometry_17.obj"/>
+        <mesh name="geom18" file="../peginhole/geometry_18.obj"/>
+        <mesh name="geom19" file="../peginhole/geometry_19.obj"/>
+        <mesh name="geom20" file="../peginhole/geometry_20.obj"/>
+        <mesh name="geom21" file="../peginhole/geometry_21.obj"/>
+        <mesh name="geom22" file="../peginhole/geometry_22.obj"/>
+        <mesh name="geom23" file="../peginhole/geometry_23.obj"/>
+        <mesh name="geom24" file="../peginhole/geometry_24.obj"/>
+        <mesh name="geom25" file="../peginhole/geometry_25.obj"/>
+        <mesh name="geom26" file="../peginhole/geometry_26.obj"/>
+        <mesh name="geom27" file="../peginhole/geometry_27.obj"/>
+        <mesh name="geom28" file="../peginhole/geometry_28.obj"/>
+        <mesh name="geom29" file="../peginhole/geometry_29.obj"/>
+        <mesh name="geom30" file="../peginhole/geometry_30.obj"/>
+        <mesh name="geom31" file="../peginhole/geometry_31.obj"/>
+    </asset>
+
+    <worldbody>
+        <body name="task" pos="0.4 0 0.3" quat="1 0 0 0">
+            <geom mesh="holesim" class="visual" rgba="0.55 0.35 0.2 1"/>
+            <geom mesh="geom0"  class="collision" friction="0 0 0"/>
+            <geom mesh="geom1" rgba="0.9716724395095205 0.4155773668635704 0.4891406227984333 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom2" rgba="0.14830229256383265 0.6475927777174105 0.7338673709396254 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom3" rgba="0.9669567561504457 0.1597578128209678 0.014474842421785983 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom4" rgba="0.6799236025959631 0.3699565607110832 0.5072143585472161 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom5" rgba="0.4268029638925618 0.48928493834570574 0.5899333271522715 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom6" rgba="0.8260291399072678 0.4209205902022757 0.8043892236206673 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom7" rgba="0.6130379479462504 0.42045031701196356 0.540917958831619 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom8"  class="collision"/>
+            <geom mesh="geom9"  class="collision"/>
+            <geom mesh="geom10" rgba="0.9716724395095205 0.4155773668635704 0.4891406227984333 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom11" rgba="0.14830229256383265 0.6475927777174105 0.7338673709396254 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom12" rgba="0.9669567561504457 0.1597578128209678 0.014474842421785983 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom13" rgba="0.6799236025959631 0.3699565607110832 0.5072143585472161 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom14" rgba="0.4268029638925618 0.48928493834570574 0.5899333271522715 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom15" rgba="0.8260291399072678 0.4209205902022757 0.8043892236206673 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom16" rgba="0.6130379479462504 0.42045031701196356 0.540917958831619 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom17"  class="collision"/>
+            <geom mesh="geom18"  class="collision"/>
+            <geom mesh="geom19" rgba="0.9716724395095205 0.4155773668635704 0.4891406227984333 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom20" rgba="0.14830229256383265 0.6475927777174105 0.7338673709396254 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom21" rgba="0.9669567561504457 0.1597578128209678 0.014474842421785983 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom22" rgba="0.6799236025959631 0.3699565607110832 0.5072143585472161 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom23" rgba="0.4268029638925618 0.48928493834570574 0.5899333271522715 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom24" rgba="0.8260291399072678 0.4209205902022757 0.8043892236206673 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom25" rgba="0.6130379479462504 0.42045031701196356 0.540917958831619 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom26"  class="collision"/>
+            <geom mesh="geom27"  class="collision"/>
+            <geom mesh="geom28" rgba="0.9716724395095205 0.4155773668635704 0.4891406227984333 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom29" rgba="0.14830229256383265 0.6475927777174105 0.7338673709396254 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom30" rgba="0.9669567561504457 0.1597578128209678 0.014474842421785983 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom31" rgba="0.6799236025959631 0.3699565607110832 0.5072143585472161 1" class="collision" friction="0 0 0"/>
+        </body>
+    </worldbody>
+</mujoco>

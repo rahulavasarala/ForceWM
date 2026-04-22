@@ -1,5 +1,5 @@
 data:
-  parquet_path: data_storage/chicken_extracted/dataset.parquet
+  parquet_path: data_storage/peg_task_v1_extracted/dataset.parquet
   contract_path: universal_contract.yaml
   output_dir: training_runs/bc_default
   batch_size: 8

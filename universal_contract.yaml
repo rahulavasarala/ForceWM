@@ -29,7 +29,7 @@ robot:
             can: 0
             serial_number: 123456
             dim: [224, 224, 3]
-            obs_window: 3
+            obs_window: 2
             obs_dss: 3
   action:
     dss: 3
@@ -39,3 +39,4 @@ robot:
         source: eef_pos
       robot_ori:
         source: eef_ori
+    mode: "relative"

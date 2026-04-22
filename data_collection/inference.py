@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 import redis
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if __package__:
@@ -36,6 +37,7 @@ from training.dataloader import (
     parse_action_specs,
     parse_lowdim_specs,
     parse_visual_specs,
+    rot6d_to_rotation_matrix,
     rotation_matrix_to_rot6d,
 )
 
@@ -43,9 +45,62 @@ from training.dataloader import (
 DEFAULT_INTERPOLATOR_FREQUENCY_HZ = 100.0
 DEFAULT_MAX_CHUNKS = 2
 DEFAULT_FIRST_WAYPOINT_LEAD = 0.0
+CURRENT_POSITION_SUFFIX = "current_cartesian_position"
+CURRENT_ORIENTATION_SUFFIX = "current_cartesian_orientation"
 DESIRED_POSITION_SUFFIX = "desired_cartesian_position"
 DESIRED_ORIENTATION_SUFFIX = "desired_cartesian_orientation"
 WAIT_POLL_PERIOD_S = 0.1
+MODEL_WARMUP_PASSES = 20
+
+
+def _require_torch():
+    try:
+        import torch
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "PyTorch is required for model-backed inference. Install the `pytorch` package in the runtime environment."
+        ) from exc
+    return torch
+
+
+def _require_rotation():
+    try:
+        from scipy.spatial.transform import Rotation
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "SciPy is required for orientation conversion during model-backed inference."
+        ) from exc
+    return Rotation
+
+
+def _require_cv2():
+    try:
+        import cv2
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "OpenCV is required for online image resizing during model-backed inference."
+        ) from exc
+    return cv2
+
+
+def _load_yaml_mapping(path: str | Path) -> dict[str, Any]:
+    resolved_path = Path(path).expanduser().resolve()
+    with resolved_path.open("r", encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected a YAML mapping at {resolved_path}.")
+    return payload
+
+
+def _resolve_torch_device(requested_device: str | None, torch_module) -> Any:
+    if requested_device is not None:
+        return torch_module.device(str(requested_device))
+    if torch_module.cuda.is_available():
+        return torch_module.device("cuda")
+    mps_backend = getattr(torch_module.backends, "mps", None)
+    if mps_backend is not None and mps_backend.is_available():
+        return torch_module.device("mps")
+    return torch_module.device("cpu")
 
 
 class Inference:
@@ -55,6 +110,10 @@ class Inference:
         action_frequency_hz: float,
         num_action_steps: int,
         *,
+        predictor: str = "random",
+        model_config: str | None = None,
+        model_checkpoint: str | None = None,
+        device: str | None = None,
         interpolator_frequency_hz: float = DEFAULT_INTERPOLATOR_FREQUENCY_HZ,
         blend_duration: float = 0.0,
         max_chunks: int = DEFAULT_MAX_CHUNKS,
@@ -85,10 +144,17 @@ class Inference:
 
         self.action_frequency_hz = float(action_frequency_hz)
         self.num_action_steps = int(num_action_steps)
+        self.predictor = str(predictor).strip().lower()
         self.interpolator_frequency_hz = float(interpolator_frequency_hz)
         self.blend_duration = float(blend_duration)
         self.max_chunks = int(max_chunks)
         self.first_waypoint_lead = float(first_waypoint_lead)
+        self.model_config_path = (
+            Path(model_config).expanduser().resolve() if model_config is not None else None
+        )
+        self.model_checkpoint_path = (
+            Path(model_checkpoint).expanduser().resolve() if model_checkpoint is not None else None
+        )
 
         if self.action_frequency_hz <= 0.0:
             raise ValueError("action_frequency_hz must be positive.")
@@ -106,6 +172,8 @@ class Inference:
             raise ValueError("first_waypoint_lead must be non-negative.")
         if self.max_chunks not in (1, 2):
             raise ValueError("max_chunks must be 1 or 2.")
+        if self.predictor not in {"random", "model"}:
+            raise ValueError("predictor must be either `random` or `model`.")
 
         self.action_dt = 1.0 / self.action_frequency_hz
         self.publish_period_s = self.num_action_steps / self.action_frequency_hz
@@ -130,10 +198,9 @@ class Inference:
             raise ValueError("workspace mins must be strictly less than workspace maxes.")
 
         self._lowdim_redis_keys = self._parse_lowdim_redis_keys(self.contract)
-        position_source = self.action_specs["robot_pos"].source_key
-        orientation_source = self.action_specs["robot_ori"].source_key
-        self.current_position_key = self._lowdim_redis_keys[position_source]
-        self.current_orientation_key = self._lowdim_redis_keys[orientation_source]
+        self.current_position_key, self.current_orientation_key = self._make_current_pose_keys(
+            self.contract
+        )
         self.desired_position_key, self.desired_orientation_key = self._make_desired_pose_keys(
             self.contract
         )
@@ -177,6 +244,14 @@ class Inference:
         self._background_error: BaseException | None = None
         self._background_error_lock = threading.Lock()
         self._logged_observation_shapes = False
+        self._logged_model_latency = False
+        self.model_policy = None
+        self.model_normalization_stats: dict[str, Any] | None = None
+        self.model_runtime_config: dict[str, Any] | None = None
+        self.model_device = None
+
+        if self.predictor == "model":
+            self._load_model_predictor(device)
 
     def get_observation_dict_from_buffers(self) -> dict[str, np.ndarray]:
         if self.robot_observer is None or self.camera_observer is None:
@@ -202,7 +277,7 @@ class Inference:
             )
             if key_name == orientation_source_key:
                 sequence = rotation_matrix_to_rot6d(sequence)
-            observation[key_name] = np.asarray(sequence)
+            observation[key_name] = np.asarray(sequence, dtype=np.float32)
 
         for key_name, key_spec in self.visual_specs.items():
             if key_name not in camera_buffer:
@@ -235,7 +310,7 @@ class Inference:
 
         self._inference_thread = threading.Thread(
             target=self._inference_loop,
-            name="dummy-inference-loop",
+            name="policy-inference-loop",
             daemon=True,
         )
         self._inference_thread.start()
@@ -301,6 +376,9 @@ class Inference:
         try:
             self._launch_observers()
             initial_state = self._wait_for_initial_state()
+            if self.predictor == "model":
+                self.warm_up_inference(MODEL_WARMUP_PASSES)
+                initial_state = self.state_source()
             self.interpolator.set_initial_state(initial_state)
 
             self._interpolator_thread = threading.Thread(
@@ -312,10 +390,21 @@ class Inference:
             self.launch_inference_loop()
             self.start_keyboard_listener()
 
+            if self.predictor == "model":
+                self._prepare_observation_for_model(self.get_observation_dict_from_buffers())
+
             print(
                 f"Inference ready with contract {self.contract_path}",
                 flush=True,
             )
+            print(f"Predictor mode: {self.predictor}", flush=True)
+            if self.predictor == "model":
+                print(
+                    f"Model checkpoint: {self.model_checkpoint_path} on device {self.model_device}",
+                    flush=True,
+                )
+                if self.model_config_path is not None:
+                    print(f"Model config: {self.model_config_path}", flush=True)
             print(
                 f"Current pose keys: position=`{self.current_position_key}` orientation=`{self.current_orientation_key}`",
                 flush=True,
@@ -334,7 +423,7 @@ class Inference:
                 f"interpolator_hz={self.interpolator_frequency_hz}",
                 flush=True,
             )
-            print("Press `k` to start dummy inference, `l` to stop it, Ctrl-C to exit.", flush=True)
+            print(f"Press `k` to start {self.predictor} inference, `l` to stop it, Ctrl-C to exit.", flush=True)
 
             while not self._shutdown_event.is_set():
                 error = self._get_background_error()
@@ -362,6 +451,31 @@ class Inference:
             error = self._get_background_error()
             if error is not None:
                 raise error
+
+    def warm_up_inference(self, num_passes: int = MODEL_WARMUP_PASSES) -> None:
+        if self.predictor != "model":
+            return
+        if self.model_policy is None:
+            raise RuntimeError("Warm-up requested, but no model policy is loaded.")
+        if num_passes <= 0:
+            return
+
+        print(f"Warming up model inference with {num_passes} dry runs...", flush=True)
+        warmup_start_time = time.monotonic()
+        for _ in range(int(num_passes)):
+            observation = self.get_observation_dict_from_buffers()
+            current_state = self.state_source()
+            inference_start_time = time.monotonic()
+            _ = self._generate_model_action_chunk(
+                observation,
+                current_state,
+                inference_start_time,
+            )
+        warmup_elapsed_s = time.monotonic() - warmup_start_time
+        print(
+            f"Model warm-up complete in {warmup_elapsed_s:.2f}s.",
+            flush=True,
+        )
 
     def _build_observation_from_source_buffer(
         self,
@@ -440,6 +554,204 @@ class Inference:
         )
         return np.column_stack((positions, rpy, waypoint_times))
 
+    def _load_model_predictor(self, requested_device: str | None) -> None:
+        torch = _require_torch()
+        if self.model_checkpoint_path is None:
+            raise ValueError("`--predictor model` requires `--model-checkpoint` (or `--model-weights`).")
+        if not self.model_checkpoint_path.exists():
+            raise FileNotFoundError(f"Model checkpoint does not exist: {self.model_checkpoint_path}")
+
+        self.model_device = _resolve_torch_device(requested_device, torch)
+
+        if self.model_config_path is None:
+            from training.bc_policy import load_policy_from_checkpoint
+
+            policy, normalization_stats, runtime_config = load_policy_from_checkpoint(
+                self.model_checkpoint_path,
+                device=self.model_device,
+                eval_mode=True,
+            )
+        else:
+            if not self.model_config_path.exists():
+                raise FileNotFoundError(f"Model config does not exist: {self.model_config_path}")
+
+            from training.bc_policy import DatasetSpec, build_policy_from_config
+
+            runtime_config = _load_yaml_mapping(self.model_config_path)
+            checkpoint = torch.load(self.model_checkpoint_path, map_location=self.model_device)
+            if "model_state_dict" not in checkpoint:
+                raise ValueError("Model checkpoint is missing `model_state_dict`.")
+            if "dataset_spec" not in checkpoint:
+                raise ValueError("Model checkpoint is missing `dataset_spec`.")
+            if "normalization_stats" not in checkpoint:
+                raise ValueError("Model checkpoint is missing `normalization_stats`.")
+            if "model" not in runtime_config:
+                raise ValueError(f"Model config at {self.model_config_path} is missing a `model` section.")
+
+            dataset_spec = DatasetSpec.from_dict(checkpoint["dataset_spec"])
+            policy = build_policy_from_config(runtime_config["model"], dataset_spec)
+            policy.load_state_dict(checkpoint["model_state_dict"])
+            policy.to(self.model_device)
+            policy.eval()
+            normalization_stats = checkpoint["normalization_stats"]
+
+        self.model_policy = policy
+        self.model_normalization_stats = normalization_stats
+        self.model_runtime_config = runtime_config
+        self._validate_loaded_policy()
+
+    def _validate_loaded_policy(self) -> None:
+        if self.model_policy is None:
+            raise RuntimeError("Model policy was not loaded.")
+
+        dataset_spec = self.model_policy.dataset_spec
+        if dataset_spec.action_window != self.action_window:
+            raise ValueError(
+                f"Loaded model action window {dataset_spec.action_window} does not match runtime contract action window {self.action_window}."
+            )
+        if dataset_spec.image_key not in self.visual_specs:
+            raise ValueError(
+                f"Loaded model expects visual key `{dataset_spec.image_key}`, which is not present in the runtime contract."
+            )
+        visual_spec = self.visual_specs[dataset_spec.image_key]
+        if visual_spec.obs_window != dataset_spec.image_observation_horizon:
+            raise ValueError(
+                f"Loaded model expects image horizon {dataset_spec.image_observation_horizon} for `{dataset_spec.image_key}`, "
+                f"but the runtime contract uses {visual_spec.obs_window}."
+            )
+        for key_name in dataset_spec.lowdim_keys:
+            key_spec = self.lowdim_specs.get(key_name)
+            if key_spec is None:
+                raise ValueError(
+                    f"Loaded model expects lowdim key `{key_name}`, which is not present in the runtime contract."
+                )
+            if key_spec.obs_window != dataset_spec.lowdim_observation_horizon:
+                raise ValueError(
+                    f"Loaded model expects lowdim horizon {dataset_spec.lowdim_observation_horizon} for `{key_name}`, "
+                    f"but the runtime contract uses {key_spec.obs_window}."
+                )
+            if key_spec.obs_dss != dataset_spec.lowdim_obs_dss:
+                raise ValueError(
+                    f"Loaded model expects lowdim obs_dss {dataset_spec.lowdim_obs_dss} for `{key_name}`, "
+                    f"but the runtime contract uses {key_spec.obs_dss}."
+                )
+
+    def _prepare_observation_for_model(self, observation_dict: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        if self.model_policy is None:
+            raise RuntimeError("Model predictor requested before the policy was loaded.")
+
+        dataset_spec = self.model_policy.dataset_spec
+        prepared = dict(observation_dict)
+        image_key = dataset_spec.image_key
+        image_sequence = np.asarray(prepared[image_key])
+        expected_channels, expected_height, expected_width = dataset_spec.image_shape
+        if image_sequence.ndim != 4:
+            raise ValueError(
+                f"Model visual observation `{image_key}` must have shape [T, C, H, W]. Got {image_sequence.shape}."
+            )
+        if image_sequence.shape[0] != dataset_spec.image_observation_horizon:
+            raise ValueError(
+                f"Model visual observation `{image_key}` must have horizon {dataset_spec.image_observation_horizon}. "
+                f"Got {image_sequence.shape[0]}."
+            )
+        if image_sequence.shape[1] != expected_channels:
+            raise ValueError(
+                f"Model visual observation `{image_key}` must have {expected_channels} channels. Got {image_sequence.shape[1]}."
+            )
+        if tuple(int(value) for value in image_sequence.shape[1:]) != dataset_spec.image_shape:
+            cv2 = _require_cv2()
+            resized_frames = []
+            for frame in image_sequence:
+                frame_hwc = np.transpose(frame, (1, 2, 0))
+                resized_frame = cv2.resize(
+                    frame_hwc,
+                    (expected_width, expected_height),
+                    interpolation=cv2.INTER_AREA,
+                )
+                resized_frames.append(np.transpose(resized_frame, (2, 0, 1)))
+            prepared[image_key] = np.ascontiguousarray(np.stack(resized_frames, axis=0))
+
+        return prepared
+
+    @staticmethod
+    def _to_numpy(value: Any) -> np.ndarray:
+        if hasattr(value, "detach") and hasattr(value, "cpu"):
+            return value.detach().cpu().numpy()
+        return np.asarray(value)
+
+    @staticmethod
+    def _rotation_matrices_to_rpy(rotation_matrices: np.ndarray) -> np.ndarray:
+        Rotation = _require_rotation()
+        return Rotation.from_matrix(rotation_matrices).as_euler("xyz")
+
+    def _generate_model_action_chunk(
+        self,
+        observation_dict: dict[str, np.ndarray],
+        current_state: PoseSample,
+        inference_start_time: float,
+    ) -> np.ndarray:
+        del current_state
+
+        if self.model_policy is None or self.model_normalization_stats is None:
+            raise RuntimeError("Model predictor was requested, but the policy is not loaded.")
+
+        prepared_observation = self._prepare_observation_for_model(observation_dict)
+        position_source_key = self.action_specs["robot_pos"].source_key
+        orientation_source_key = self.action_specs["robot_ori"].source_key
+        reference_position = np.asarray(prepared_observation[position_source_key][-1], dtype=np.float64).reshape(3)
+        reference_rotation = rot6d_to_rotation_matrix(prepared_observation[orientation_source_key][-1])
+
+        torch = _require_torch()
+        with torch.inference_mode():
+            predictions = self.model_policy.predict_actions(
+                prepared_observation,
+                self.model_normalization_stats,
+            )
+
+        inference_latency_s = time.monotonic() - inference_start_time
+        if not self._logged_model_latency:
+            self._logged_model_latency = True
+            print(
+                f"Model inference latency: {1000.0 * inference_latency_s:.1f} ms; waypoint times stay anchored to inference start.",
+                flush=True,
+            )
+
+        relative_positions = np.asarray(self._to_numpy(predictions["robot_pos"]), dtype=np.float64)
+        relative_rot6d = np.asarray(self._to_numpy(predictions["robot_ori"]), dtype=np.float64)
+        if relative_positions.shape != (self.action_window, 3):
+            raise ValueError(
+                f"Model predicted robot_pos with shape {relative_positions.shape}; expected {(self.action_window, 3)}."
+            )
+        if relative_rot6d.shape != (self.action_window, 6):
+            raise ValueError(
+                f"Model predicted robot_ori with shape {relative_rot6d.shape}; expected {(self.action_window, 6)}."
+            )
+
+        relative_rotations = rot6d_to_rotation_matrix(relative_rot6d)
+        world_positions = reference_position[None, :] + (reference_rotation @ relative_positions.T).T
+        world_rotations = np.einsum("ij,tjk->tik", reference_rotation, relative_rotations)
+        world_rpy = self._rotation_matrices_to_rpy(world_rotations)
+        waypoint_times = (
+            float(inference_start_time)
+            + self.first_waypoint_lead
+            + self.action_dt * np.arange(self.action_window, dtype=np.float64)
+        )
+        return np.column_stack((world_positions, world_rpy, waypoint_times))
+
+    def _predict_action_chunk(
+        self,
+        observation_dict: dict[str, np.ndarray],
+        current_state: PoseSample,
+        inference_start_time: float,
+    ) -> np.ndarray:
+        if self.predictor == "model":
+            return self._generate_model_action_chunk(
+                observation_dict,
+                current_state,
+                inference_start_time,
+            )
+        return self._generate_dummy_action_chunk(observation_dict, current_state, inference_start_time)
+
     def _keyboard_listener_loop(self) -> None:
         while not self._shutdown_event.is_set():
             ready, _, _ = select.select([sys.stdin], [], [], 0.1)
@@ -454,11 +766,11 @@ class Inference:
                 if key.lower() == "k":
                     if not self._publishing_event.is_set():
                         self._publishing_event.set()
-                        print("Started dummy inference.", flush=True)
+                        print(f"Started {self.predictor} inference.", flush=True)
                 elif key.lower() == "l":
                     if self._publishing_event.is_set():
                         self._publishing_event.clear()
-                        print("Stopped dummy inference.", flush=True)
+                        print(f"Stopped {self.predictor} inference.", flush=True)
             except Exception as exc:
                 print(f"Keyboard command failed: {exc}", flush=True)
 
@@ -474,9 +786,9 @@ class Inference:
 
             try:
                 observation = self.get_observation_dict_from_buffers()
-                now = time.monotonic()
                 current_state = self.state_source()
-                chunk = self._generate_dummy_action_chunk(observation, current_state, now)
+                inference_start_time = time.monotonic()
+                chunk = self._predict_action_chunk(observation, current_state, inference_start_time)
                 self.interpolator.enqueue_chunk(chunk)
             except InterpolatorFault as exc:
                 print(f"Interpolator fault: {exc}", flush=True)
@@ -531,6 +843,29 @@ class Inference:
             redis_namespace,
             prefix,
             DESIRED_ORIENTATION_SUFFIX,
+        )
+        return position_key, orientation_key
+
+    @staticmethod
+    def _make_current_pose_keys(contract: dict[str, Any]) -> tuple[str, str]:
+        robot_cfg = contract.get("robot")
+        if not isinstance(robot_cfg, dict):
+            raise ValueError("Contract must contain a top-level `robot` mapping.")
+        prefix = str(robot_cfg.get("prefix", "")).strip()
+        if not prefix:
+            raise ValueError("Contract robot prefix must be provided.")
+        redis_namespace = Inference._normalize_redis_namespace(
+            robot_cfg.get("redis_namespace", "sai")
+        )
+        position_key = Inference._make_redis_key(
+            redis_namespace,
+            prefix,
+            CURRENT_POSITION_SUFFIX,
+        )
+        orientation_key = Inference._make_redis_key(
+            redis_namespace,
+            prefix,
+            CURRENT_ORIENTATION_SUFFIX,
         )
         return position_key, orientation_key
 
@@ -656,7 +991,7 @@ class Inference:
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Interactive dummy-policy inference runner for Redis-backed ForceWM control."
+        description="Interactive policy inference runner for Redis-backed ForceWM control."
     )
     parser.add_argument(
         "--universal-contract",
@@ -678,6 +1013,34 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         required=True,
         type=int,
         help="Number of action waypoints to execute before publishing a new chunk.",
+    )
+    parser.add_argument(
+        "--predictor",
+        choices=("random", "model"),
+        default="random",
+        help="Predictor mode. `random` keeps the dummy bounded-random walk; `model` loads a trained policy.",
+    )
+    parser.add_argument(
+        "--model-config",
+        dest="model_config",
+        default=None,
+        type=str,
+        help="Optional path to the model config YAML. If omitted, the config stored in the checkpoint is used.",
+    )
+    parser.add_argument(
+        "--model-checkpoint",
+        "--model-weights",
+        dest="model_checkpoint",
+        default=None,
+        type=str,
+        help="Path to the trained model checkpoint (.pt). Required when --predictor model.",
+    )
+    parser.add_argument(
+        "--device",
+        dest="device",
+        default=None,
+        type=str,
+        help="Optional torch device override for model-backed inference (cpu, cuda, mps).",
     )
     parser.add_argument(
         "--interpolator-frequency-hz",
@@ -732,6 +1095,10 @@ def main(argv: list[str] | None = None) -> int:
             universal_contract=args.universal_contract,
             action_frequency_hz=args.action_frequency_hz,
             num_action_steps=args.num_action_steps,
+            predictor=args.predictor,
+            model_config=args.model_config,
+            model_checkpoint=args.model_checkpoint,
+            device=args.device,
             interpolator_frequency_hz=args.interpolator_frequency_hz,
             blend_duration=args.blend_duration,
             max_chunks=args.max_chunks,

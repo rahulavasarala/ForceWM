@@ -18,6 +18,7 @@ forcewm_configure_opensai_dependencies()
 find_package(Threads REQUIRED)
 find_package(yaml-cpp CONFIG REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgcodecs imgproc)
+find_package(ZeroMQ CONFIG REQUIRED)
 
 set(FORCEWM_SIMULATION_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/simulation.cpp")
 file(SIZE "${FORCEWM_SIMULATION_SOURCE}" FORCEWM_SIMULATION_SOURCE_SIZE)
@@ -38,4 +39,24 @@ if(FORCEWM_SIMULATION_SOURCE_SIZE GREATER 0)
 else()
   add_custom_target(forcewm_simulation SOURCES "${FORCEWM_SIMULATION_SOURCE}")
   message(STATUS "src/simulation.cpp is empty, so no executable is built yet.")
+endif()
+
+set(FORCEWM_IMAGE_BENCHMARK_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/image_benchmark.cpp")
+file(SIZE "${FORCEWM_IMAGE_BENCHMARK_SOURCE}" FORCEWM_IMAGE_BENCHMARK_SOURCE_SIZE)
+
+if(FORCEWM_IMAGE_BENCHMARK_SOURCE_SIZE GREATER 0)
+  add_executable(forcewm_image_benchmark "${FORCEWM_IMAGE_BENCHMARK_SOURCE}")
+  target_link_libraries(forcewm_image_benchmark PRIVATE
+    forcewm::opensai_model
+    Threads::Threads
+    ${OpenCV_LIBS}
+    libzmq
+  )
+
+  set_target_properties(forcewm_image_benchmark PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+  )
+else()
+  add_custom_target(forcewm_image_benchmark SOURCES "${FORCEWM_IMAGE_BENCHMARK_SOURCE}")
+  message(STATUS "src/image_benchmark.cpp is empty, so no benchmark executable is built yet.")
 endif()

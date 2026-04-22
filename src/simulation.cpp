@@ -72,7 +72,7 @@ bool is_data_collection = false;
 
 // Initialization variables for robot control ---------------------
 
-Vector3d START_POS = Vector3d(0.4, 0.0, 0.4);
+Vector3d START_POS = Vector3d(0.4, 0.0, 0.36);
 Matrix3d START_ORIENTATION = (Matrix3d() << 
     1,  0,  0,
     0, -1,  0,
@@ -118,8 +118,12 @@ struct CameraStreamConfig {
   std::vector<unsigned char> encoded_image_buffer;
   std::uint64_t publish_count = 0;
   std::uint64_t dropped_publish_slots = 0;
+  double total_scene_update_seconds = 0.0;
   double total_render_seconds = 0.0;
+  double total_render_draw_seconds = 0.0;
   double total_readback_seconds = 0.0;
+  double total_flip_seconds = 0.0;
+  double total_color_convert_seconds = 0.0;
   double total_jpeg_encode_seconds = 0.0;
   double total_redis_publish_seconds = 0.0;
   double total_publish_seconds = 0.0;
@@ -224,6 +228,19 @@ struct SnapshotBroker {
       return stop_flag.load() ||
              (has_snapshot && latest_snapshot.seq > last_seq);
     });
+
+    if (stop_flag.load()) {
+      return false;
+    }
+
+    copy_snapshot_locked(latest_snapshot, out_snapshot);
+    return true;
+  }
+
+  bool wait_for_first_snapshot(RenderSnapshot& out_snapshot,
+                               const std::atomic<bool>& stop_flag) const {
+    std::unique_lock<std::mutex> lock(mutex);
+    condition.wait(lock, [&] { return stop_flag.load() || has_snapshot; });
 
     if (stop_flag.load()) {
       return false;
@@ -417,10 +434,18 @@ void print_camera_publish_summary() {
     }
 
     const double publish_count = static_cast<double>(camera.publish_count);
+    const double avg_scene_update_ms =
+        1000.0 * camera.total_scene_update_seconds / publish_count;
     const double avg_render_ms =
         1000.0 * camera.total_render_seconds / publish_count;
+    const double avg_render_draw_ms =
+        1000.0 * camera.total_render_draw_seconds / publish_count;
     const double avg_readback_ms =
         1000.0 * camera.total_readback_seconds / publish_count;
+    const double avg_flip_ms =
+        1000.0 * camera.total_flip_seconds / publish_count;
+    const double avg_color_convert_ms =
+        1000.0 * camera.total_color_convert_seconds / publish_count;
     const double avg_jpeg_ms =
         1000.0 * camera.total_jpeg_encode_seconds / publish_count;
     const double avg_redis_ms =
@@ -431,8 +456,14 @@ void print_camera_publish_summary() {
     std::cout << "    Published frames: " << camera.publish_count << "\n";
     std::cout << "    Dropped publish slots: " << camera.dropped_publish_slots
               << "\n";
+    std::cout << "    Avg scene update time: " << avg_scene_update_ms
+              << " ms\n";
     std::cout << "    Avg render time: " << avg_render_ms << " ms\n";
+    std::cout << "    Avg draw time: " << avg_render_draw_ms << " ms\n";
     std::cout << "    Avg readback time: " << avg_readback_ms << " ms\n";
+    std::cout << "    Avg image flip time: " << avg_flip_ms << " ms\n";
+    std::cout << "    Avg color convert time: " << avg_color_convert_ms
+              << " ms\n";
     std::cout << "    Avg JPEG encode time: " << avg_jpeg_ms << " ms\n";
     std::cout << "    Avg Redis publish time: " << avg_redis_ms << " ms\n";
     std::cout << "    Avg total publish time: " << avg_total_ms << " ms\n";
@@ -1194,25 +1225,73 @@ void camera_thread_main(GLFWwindow* hidden_camera_window) {
     camera_redis_client.connect();
 
     RenderSnapshot snapshot;
-    std::uint64_t last_snapshot_seq = 0;
     std::uint64_t last_reset_epoch = std::numeric_limits<std::uint64_t>::max();
     mjvCamera capture_camera;
     mjv_defaultCamera(&capture_camera);
+    std::vector<double> next_camera_publish_wall_times(
+        simulation_contract.cameras.size(), 0.0);
 
-    while (snapshot_broker->wait_for_newer(last_snapshot_seq, snapshot,
-                                           shutdown_requested)) {
-      last_snapshot_seq = snapshot.seq;
+    if (!snapshot_broker->wait_for_first_snapshot(snapshot, shutdown_requested)) {
+      return;
+    }
+
+    copy_snapshot_into_data(snapshot, camera_data);
+    rebuild_render_data(m, camera_data);
+
+    while (!shutdown_requested.load()) {
+      const double now = wall_time_now_seconds();
+      double next_deadline = std::numeric_limits<double>::infinity();
+      bool should_publish_any_camera = false;
+
+      for (size_t camera_index = 0; camera_index < simulation_contract.cameras.size();
+           ++camera_index) {
+        const auto& camera = simulation_contract.cameras[camera_index];
+        if (next_camera_publish_wall_times[camera_index] <= 0.0) {
+          next_camera_publish_wall_times[camera_index] = now;
+        }
+
+        next_deadline =
+            std::min(next_deadline, next_camera_publish_wall_times[camera_index]);
+        if (next_camera_publish_wall_times[camera_index] <= now) {
+          should_publish_any_camera = true;
+        }
+      }
+
+      if (!should_publish_any_camera) {
+        const double sleep_seconds = next_deadline - now;
+        if (sleep_seconds > 0.0) {
+          std::this_thread::sleep_for(std::chrono::duration<double>(
+              std::min(sleep_seconds, 0.001)));
+        }
+        continue;
+      }
+
+      if (!snapshot_broker->copy_latest(snapshot)) {
+        continue;
+      }
+
       copy_snapshot_into_data(snapshot, camera_data);
       rebuild_render_data(m, camera_data);
 
       if (snapshot.reset_epoch != last_reset_epoch) {
-        for (auto& camera : simulation_contract.cameras) {
+        const double reset_wall_time = wall_time_now_seconds();
+        for (size_t camera_index = 0; camera_index < simulation_contract.cameras.size();
+             ++camera_index) {
+          auto& camera = simulation_contract.cameras[camera_index];
           camera.next_publish_sim_time = snapshot.sim_time;
+          next_camera_publish_wall_times[camera_index] = reset_wall_time;
         }
         last_reset_epoch = snapshot.reset_epoch;
       }
 
-      for (auto& camera : simulation_contract.cameras) {
+      const double publish_loop_now = wall_time_now_seconds();
+      for (size_t camera_index = 0; camera_index < simulation_contract.cameras.size();
+           ++camera_index) {
+        auto& camera = simulation_contract.cameras[camera_index];
+        if (next_camera_publish_wall_times[camera_index] > publish_loop_now) {
+          continue;
+        }
+
         if (snapshot.sim_time + 1e-9 < camera.next_publish_sim_time) {
           continue;
         }
@@ -1232,9 +1311,12 @@ void camera_thread_main(GLFWwindow* hidden_camera_window) {
 
         const mjrRect viewport = {0, 0, camera.width, camera.height};
         const auto publish_start_time = std::chrono::steady_clock::now();
-        const auto render_start_time = publish_start_time;
+        const auto scene_update_start_time = publish_start_time;
         mjv_updateScene(m, camera_data, &opt, nullptr, &capture_camera,
                         mjCAT_ALL, &camera_scene);
+        const auto scene_update_end_time = std::chrono::steady_clock::now();
+
+        const auto render_start_time = scene_update_end_time;
         mjr_render(viewport, &camera_scene, &camera_context);
         const auto render_end_time = std::chrono::steady_clock::now();
 
@@ -1243,16 +1325,21 @@ void camera_thread_main(GLFWwindow* hidden_camera_window) {
                        &camera_context);
         const auto readback_end_time = std::chrono::steady_clock::now();
 
+        const auto flip_start_time = readback_end_time;
         flip_rgb_image_vertically(camera.rgb_buffer, camera.flipped_rgb_buffer,
                                   camera.width, camera.height,
                                   camera.channels);
+        const auto flip_end_time = std::chrono::steady_clock::now();
+
         cv::Mat rgb_view(camera.height, camera.width, CV_8UC3,
                          camera.flipped_rgb_buffer.data());
         cv::Mat bgr_view(camera.height, camera.width, CV_8UC3,
                          camera.bgr_buffer.data());
+        const auto color_convert_start_time = flip_end_time;
         cv::cvtColor(rgb_view, bgr_view, cv::COLOR_RGB2BGR);
+        const auto color_convert_end_time = std::chrono::steady_clock::now();
 
-        const auto jpeg_start_time = std::chrono::steady_clock::now();
+        const auto jpeg_start_time = color_convert_end_time;
         if (!cv::imencode(".jpg", bgr_view, camera.encoded_image_buffer,
                           {cv::IMWRITE_JPEG_QUALITY, 90})) {
           throw std::runtime_error("Failed to JPEG-encode camera `" +
@@ -1270,11 +1357,26 @@ void camera_thread_main(GLFWwindow* hidden_camera_window) {
                                 make_camera_metadata_json(camera, snapshot));
         const auto publish_end_time = std::chrono::steady_clock::now();
 
+        camera.total_scene_update_seconds +=
+            std::chrono::duration<double>(scene_update_end_time -
+                                          scene_update_start_time)
+                .count();
         camera.total_render_seconds +=
+            std::chrono::duration<double>(render_end_time -
+                                          scene_update_start_time)
+                .count();
+        camera.total_render_draw_seconds +=
             std::chrono::duration<double>(render_end_time - render_start_time)
                 .count();
         camera.total_readback_seconds +=
             std::chrono::duration<double>(readback_end_time - readback_start_time)
+                .count();
+        camera.total_flip_seconds +=
+            std::chrono::duration<double>(flip_end_time - flip_start_time)
+                .count();
+        camera.total_color_convert_seconds +=
+            std::chrono::duration<double>(color_convert_end_time -
+                                          color_convert_start_time)
                 .count();
         camera.total_jpeg_encode_seconds +=
             std::chrono::duration<double>(jpeg_end_time - jpeg_start_time)
@@ -1286,8 +1388,22 @@ void camera_thread_main(GLFWwindow* hidden_camera_window) {
             std::chrono::duration<double>(publish_end_time - publish_start_time)
                 .count();
         ++camera.publish_count;
+        next_camera_publish_wall_times[camera_index] += publish_period;
         camera.next_publish_sim_time +=
             static_cast<mjtNum>(missed_slots + 1) * publish_period;
+
+        const double publish_end_wall_time = wall_time_now_seconds();
+        if (next_camera_publish_wall_times[camera_index] < publish_end_wall_time) {
+          const double wall_behind_time =
+              publish_end_wall_time - next_camera_publish_wall_times[camera_index];
+          const std::uint64_t extra_missed_wall_slots =
+              publish_period > 0.0
+                  ? static_cast<std::uint64_t>(std::floor(
+                        wall_behind_time / publish_period))
+                  : 0;
+          next_camera_publish_wall_times[camera_index] +=
+              static_cast<double>(extra_missed_wall_slots) * publish_period;
+        }
       }
     }
   } catch (const std::exception& exception) {

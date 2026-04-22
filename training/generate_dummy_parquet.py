@@ -8,40 +8,36 @@ try:
 except ImportError:
     cv2 = None
 
-# data = {
-#     "eef_pos": np.arange(0, 100, 1).tolist(),
-#     "eef_ori": np.arange(0, 100, 1).tolist()
-# }
-
-# # data = {
-# #     "ee_pos": [1,2,3],
-# #     "ee_ori": [1,2,3]
-# # }
-
-# table = pa.table(data)
-
-# print("Writing the table with the specified data above!")
-
-# pq.write_table(table, "dummy.parquet", row_group_size=1000)
-
-# print("Wrote the data in dummy.parquet!")
-
-# pf = pq.ParquetFile("dummy.parquet")
-# print("num row groups:", pf.num_row_groups)
-# print("total rows:", pf.metadata.num_rows)
-
-# print(np.arange(0,4,3))
-
 path = Path("./dummy_dataset/metadata.npz")
 path.parent.mkdir(parents = True, exist_ok = True)
 video_dataset_path = Path("./dummy_dataset/videos")
 
+DATASET_LEN = 650
+
 
 def generate_parquet_data(): 
 
+    eef_pos = np.zeros((DATASET_LEN, 3))
+
+    eef_pos_array = pa.FixedSizeListArray.from_arrays(
+        pa.array(eef_pos.reshape(-1), type=pa.float32()),
+        3
+    )
+
+    eef_ori = np.eye(3)
+
+    eef_ori = np.vstack([eef_ori]* DATASET_LEN)
+    eef_ori = np.reshape(eef_ori, (DATASET_LEN, 9))
+
+    eef_ori_array = pa.FixedSizeListArray.from_arrays(
+        pa.array(eef_ori.reshape(-1), type=pa.float32()),
+        9
+    )
+
+
     data = {
-        "eef_pos": np.arange(0, 100, 1).tolist(),
-        "eef_ori": np.arange(0, 100, 1).tolist()
+        "eef_pos": eef_pos_array,
+        "eef_ori": eef_ori_array
     }
 
     table = pa.table(data)
@@ -51,13 +47,12 @@ def generate_parquet_data():
 
 def generate_metadata(chunk_size: int):
 
-    episode_ends = np.arange(20,  100, 20)
+    episode_ends = np.arange(20,  601, 20)
     metadata = {"episode_ends" : episode_ends, "chunk_size": np.asarray(chunk_size, dtype=np.int64)}
     metadata["chunk_size"] = chunk_size
     np.savez(str(path), **metadata)
 
     return episode_ends
-
 
 def generate_video_data(episode_ends, chunk_size):
 
@@ -98,6 +93,7 @@ episode_ends = generate_metadata(4)
 generate_parquet_data()
 generate_video_data(episode_ends, 4)
 
+#Cool, this should be enough to generate the dummy data -- which is really good ---
 
 
 

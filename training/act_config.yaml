@@ -1,0 +1,14 @@
+dim_model: 128
+n_heads: 4
+dropout: 0.1
+dim_feedforward: 512
+feedforward_activation: "relu"
+n_encoder_layers: 3
+n_decoder_layers: 3
+robot_state_feature: [8]
+action_feature: [7]
+chunk_size: 3
+image_features : True
+latent_dim: 100
+pre_norm: True
+use_vae: False

@@ -8,3 +8,4 @@ mujoco_menagerie/
 data_storage/
 dump.rdb
 training_runs/
+dummy_dataset/

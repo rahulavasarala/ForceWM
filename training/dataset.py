@@ -25,6 +25,8 @@ class MultiModalDataset(Dataset):
         self.episode_ends = metadata["episode_ends"]
 
         parquet_path = dataset_path / "dummy.parquet"
+        if not parquet_path.exists():
+            parquet_path = dataset_path / "dataset.parquet"
         self.parquet_reader = ParquetDatasetReader(parquet_path)
 
         video_path = dataset_path / "videos"
@@ -101,6 +103,8 @@ class MultiModalDataset(Dataset):
 
         if self.action_type == "relative":
             action_dict = self.transform_action_to_relative(action_dict)
+        else:
+            self.convert_ori_to_quat(action_dict)
 
         action_dict = self.convert_to_torch(action_dict)
         obs_dict = self.convert_to_torch(obs_dict)
@@ -221,7 +225,7 @@ class MultiModalDataset(Dataset):
 
 
 if __name__ == "__main__":
-    dataset_path = "/Users/rahulavasarala/Desktop/ForceWM/training/dummy_dataset"
+    dataset_path = "/Users/rahulavasarala/Desktop/ForceWM/data_storage/no_coll_dataset_v1_extracted"
     contract_path = "/Users/rahulavasarala/Desktop/ForceWM/universal_contract.yaml"
     test_dataset = MultiModalDataset(dataset_path, universal_contract= contract_path)
 

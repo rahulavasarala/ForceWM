@@ -1,44 +1,44 @@
 <mujoco model="hole">
     <asset>
         <mesh name="holesim" file="../peginhole/holesim_small.stl" scale="0.001 0.001 0.001"/>
-        <mesh name="geom0" file="../peginhole/geometry_0.obj"/>
-        <mesh name="geom1" file="../peginhole/geometry_1.obj"/>
-        <mesh name="geom2" file="../peginhole/geometry_2.obj"/>
-        <mesh name="geom3" file="../peginhole/geometry_3.obj"/>
-        <mesh name="geom4" file="../peginhole/geometry_4.obj"/>
-        <mesh name="geom5" file="../peginhole/geometry_5.obj"/>
-        <mesh name="geom6" file="../peginhole/geometry_6.obj"/>
-        <mesh name="geom7" file="../peginhole/geometry_7.obj"/>
-        <mesh name="geom8" file="../peginhole/geometry_8.obj"/>
-        <mesh name="geom9" file="../peginhole/geometry_9.obj"/>
-        <mesh name="geom10" file="../peginhole/geometry_10.obj"/>
-        <mesh name="geom11" file="../peginhole/geometry_11.obj"/>
-        <mesh name="geom12" file="../peginhole/geometry_12.obj"/>
-        <mesh name="geom13" file="../peginhole/geometry_13.obj"/>
-        <mesh name="geom14" file="../peginhole/geometry_14.obj"/>
-        <mesh name="geom15" file="../peginhole/geometry_15.obj"/>
-        <mesh name="geom16" file="../peginhole/geometry_16.obj"/>
-        <mesh name="geom17" file="../peginhole/geometry_17.obj"/>
-        <mesh name="geom18" file="../peginhole/geometry_18.obj"/>
-        <mesh name="geom19" file="../peginhole/geometry_19.obj"/>
-        <mesh name="geom20" file="../peginhole/geometry_20.obj"/>
-        <mesh name="geom21" file="../peginhole/geometry_21.obj"/>
-        <mesh name="geom22" file="../peginhole/geometry_22.obj"/>
-        <mesh name="geom23" file="../peginhole/geometry_23.obj"/>
-        <mesh name="geom24" file="../peginhole/geometry_24.obj"/>
-        <mesh name="geom25" file="../peginhole/geometry_25.obj"/>
-        <mesh name="geom26" file="../peginhole/geometry_26.obj"/>
-        <mesh name="geom27" file="../peginhole/geometry_27.obj"/>
-        <mesh name="geom28" file="../peginhole/geometry_28.obj"/>
-        <mesh name="geom29" file="../peginhole/geometry_29.obj"/>
-        <mesh name="geom30" file="../peginhole/geometry_30.obj"/>
-        <mesh name="geom31" file="../peginhole/geometry_31.obj"/>
+        <mesh name="geom0" file="../peginhole/geometry_0.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom1" file="../peginhole/geometry_1.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom2" file="../peginhole/geometry_2.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom3" file="../peginhole/geometry_3.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom4" file="../peginhole/geometry_4.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom5" file="../peginhole/geometry_5.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom6" file="../peginhole/geometry_6.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom7" file="../peginhole/geometry_7.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom8" file="../peginhole/geometry_8.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom9" file="../peginhole/geometry_9.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom10" file="../peginhole/geometry_10.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom11" file="../peginhole/geometry_11.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom12" file="../peginhole/geometry_12.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom13" file="../peginhole/geometry_13.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom14" file="../peginhole/geometry_14.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom15" file="../peginhole/geometry_15.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom16" file="../peginhole/geometry_16.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom17" file="../peginhole/geometry_17.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom18" file="../peginhole/geometry_18.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom19" file="../peginhole/geometry_19.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom20" file="../peginhole/geometry_20.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom21" file="../peginhole/geometry_21.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom22" file="../peginhole/geometry_22.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom23" file="../peginhole/geometry_23.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom24" file="../peginhole/geometry_24.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom25" file="../peginhole/geometry_25.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom26" file="../peginhole/geometry_26.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom27" file="../peginhole/geometry_27.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom28" file="../peginhole/geometry_28.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom29" file="../peginhole/geometry_29.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom30" file="../peginhole/geometry_30.obj"  scale="0.0015 0.0015 0.0015"/>
+        <mesh name="geom31" file="../peginhole/geometry_31.obj"  scale="0.0015 0.0015 0.0015"/>
     </asset>
 
     <worldbody>
         <body name="task" pos="0.4 0 0.3" quat="1 0 0 0">
             <geom mesh="holesim" class="visual" rgba="0.55 0.35 0.2 1"/>
-            <geom mesh="geom0"  class="collision" friction="0 0 0"/>
+            <!-- <geom mesh="geom0"  class="collision" friction="0 0 0"/>
             <geom mesh="geom1" rgba="0.9716724395095205 0.4155773668635704 0.4891406227984333 1" class="collision" friction="0 0 0"/>
             <geom mesh="geom2" rgba="0.14830229256383265 0.6475927777174105 0.7338673709396254 1" class="collision" friction="0 0 0"/>
             <geom mesh="geom3" rgba="0.9669567561504457 0.1597578128209678 0.014474842421785983 1" class="collision" friction="0 0 0"/>
@@ -69,7 +69,7 @@
             <geom mesh="geom28" rgba="0.9716724395095205 0.4155773668635704 0.4891406227984333 1" class="collision" friction="0 0 0"/>
             <geom mesh="geom29" rgba="0.14830229256383265 0.6475927777174105 0.7338673709396254 1" class="collision" friction="0 0 0"/>
             <geom mesh="geom30" rgba="0.9669567561504457 0.1597578128209678 0.014474842421785983 1" class="collision" friction="0 0 0"/>
-            <geom mesh="geom31" rgba="0.6799236025959631 0.3699565607110832 0.5072143585472161 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom31" rgba="0.6799236025959631 0.3699565607110832 0.5072143585472161 1" class="collision" friction="0 0 0"/> -->
         </body>
     </worldbody>
 </mujoco>

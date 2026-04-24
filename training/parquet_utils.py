@@ -169,7 +169,13 @@ class VideoDatasetReader:
 
         episode_path = self.video_dataset_path / f"episode_{episode_idx}"
         if not episode_path.exists():
-            raise FileNotFoundError(f"Missing episode directory: {episode_path}")
+            padded_episode_path = self.video_dataset_path / f"episode_{episode_idx + 1:04d}"
+            if padded_episode_path.exists():
+                episode_path = padded_episode_path
+            else:
+                raise FileNotFoundError(
+                    f"Missing episode directory: {episode_path} or {padded_episode_path}"
+                )
 
         chunk_files = sorted(episode_path.glob("chunk_*.mp4"))
         if not chunk_files:

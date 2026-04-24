@@ -38,22 +38,31 @@ def schedule_action_chunks(action_chunks):
 
     action_chunk_index = -1
     inference_sent = False
-    interpolator = TrajectoryInterpolator(redis_client, desired_position_key=DESIRED_CARTESIAN_POSITION, desired_orientation_key= DESIRED_CARTESIAN_ORIENTATION)
+    interpolator = TrajectoryInterpolator(
+        redis_client,
+        desired_position_key=DESIRED_CARTESIAN_POSITION,
+        desired_orientation_key=DESIRED_CARTESIAN_ORIENTATION,
+    )
     interpolator.start()
 
-
-    while action_chunk_index < len(action_chunks):
+    while action_chunk_index + 1 < len(action_chunks) or inference_sent:
         if not inference_sent:
             action_chunk_index += 1
-            inference_sent_time = time.time()
-            interpolator.enqueue_chunk(action_chunks[action_chunk_index], ts = np.arange(inference_sent_time, inference_sent_time + action_chunks[action_chunk_index].shape[0] *(1/action_hz), 1/action_hz))
+            inference_sent_time = time.monotonic()
+            ts = inference_sent_time + np.arange(
+                action_chunks[action_chunk_index].shape[0],
+                dtype=float,
+            ) * (1 / action_hz)
+            interpolator.enqueue_chunk(action_chunks[action_chunk_index], ts)
             inference_sent = True
             
 
-        if inference_sent and time.time() > inference_sent_time + n_actions * (1/action_hz):
+        if inference_sent and time.monotonic() > inference_sent_time + n_actions * (1 / action_hz):
             inference_sent = False
 
         time.sleep(0.001)
+
+    interpolator.stop()
 
 print("Starting to run the action chunks: ")
 
@@ -62,8 +71,6 @@ time.sleep(5)
 schedule_action_chunks(chunk_list)
 
 #The mid level interpolator is moving correctly --- which is really good --
-
-
 
 
 

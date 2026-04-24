@@ -590,58 +590,6 @@ def get_activation_fn(activation: str) -> Callable:
 
 if __name__ == "__main__":
 
-    def make_synthetic_batch(
-        batch_size: int,
-        t_obs: int,
-        t_act: int,
-        image_shape: tuple[int, int, int],
-        lowdim_dims: tuple[int, int],
-        action_dims: tuple[int, int],
-        target_device: torch.device,
-    ) -> dict[str, dict[str, Tensor]]:
-        channels, height, width = image_shape
-        obs_pos_dim, obs_ori_dim = lowdim_dims
-        action_pos_dim, action_ori_dim = action_dims
-        return {
-            "obs": {
-                "eef_pos": torch.randn(batch_size, t_obs, obs_pos_dim, device=target_device),
-                "eef_ori": torch.randn(batch_size, t_obs, obs_ori_dim, device=target_device),
-                "images": torch.randn(batch_size, t_obs, channels, height, width, device=target_device),
-            },
-            "actions": {
-                "eef_pos": torch.randn(batch_size, t_act, action_pos_dim, device=target_device),
-                "eef_ori": torch.randn(batch_size, t_act, action_ori_dim, device=target_device),
-            },
-        }
+    # basically get random data and see if we can feed it into the act model --- 
 
-    config_path = Path("/Users/rahulavasarala/Desktop/ForceWM/training/act_config.yaml")
-    with config_path.open("r", encoding="utf-8") as f:
-        config_dict = yaml.safe_load(f)
-
-    config = SimpleNamespace(**config_dict)
-    model = ACT(config).to(device)
-
-    synthetic_batch = make_synthetic_batch(
-        batch_size=2,
-        t_obs=3,
-        t_act=config.chunk_size,
-        image_shape=(3, 224, 224),
-        lowdim_dims=(3, 7),
-        action_dims=(3, 7),
-        target_device=device,
-    )
-
-    debug_shapes = model.debug_forward_shapes(synthetic_batch)
-    print("Expected encoder input shape:", debug_shapes["encoder_in"])
-    print("Expected decoder output shape:", debug_shapes["decoder_out"])
-    print("Expected actions shape:", debug_shapes["actions"])
-
-    model.eval()
-
-    with torch.no_grad():
-        output, (mu, log_sigma_x2) = model(synthetic_batch)
-
-    print("Output shape: ", output.shape)
-    if mu is not None and log_sigma_x2 is not None:
-        print("Latent mean shape: ", mu.shape)
-        print("Latent log variance shape: ", log_sigma_x2.shape)
+    # build the mid level interpolator and test it out

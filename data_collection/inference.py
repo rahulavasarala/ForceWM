@@ -25,10 +25,7 @@ else:
 
 from high_level_controller.interpolator import (
     InterpolatorFault,
-    PoseSample,
     TrajectoryInterpolator,
-    make_redis_command_sink,
-    make_redis_state_source,
 )
 from training.dataloader import (
     ObservationKeySpec,
@@ -103,6 +100,14 @@ def _resolve_torch_device(requested_device: str | None, torch_module) -> Any:
     return torch_module.device("cpu")
 
 
+def _redis_text(value: Any) -> str:
+    if value is None:
+        raise RuntimeError("Expected Redis key to be populated before reading it.")
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
 class Inference:
     def __init__(
         self,
@@ -147,7 +152,6 @@ class Inference:
         self.predictor = str(predictor).strip().lower()
         self.interpolator_frequency_hz = float(interpolator_frequency_hz)
         self.blend_duration = float(blend_duration)
-        self.max_chunks = int(max_chunks)
         self.first_waypoint_lead = float(first_waypoint_lead)
         self.model_config_path = (
             Path(model_config).expanduser().resolve() if model_config is not None else None
@@ -170,8 +174,6 @@ class Inference:
             raise ValueError("blend_duration must be non-negative.")
         if self.first_waypoint_lead < 0.0:
             raise ValueError("first_waypoint_lead must be non-negative.")
-        if self.max_chunks not in (1, 2):
-            raise ValueError("max_chunks must be 1 or 2.")
         if self.predictor not in {"random", "model"}:
             raise ValueError("predictor must be either `random` or `model`.")
 
@@ -214,29 +216,18 @@ class Inference:
             db=0,
             decode_responses=False,
         )
-        self.state_source = make_redis_state_source(
-            self.redis_client,
-            self.current_position_key,
-            self.current_orientation_key,
-        )
-        self.command_sink = make_redis_command_sink(
+        self.interpolator = TrajectoryInterpolator(
             self.redis_client,
             self.desired_position_key,
             self.desired_orientation_key,
-        )
-        self.interpolator = TrajectoryInterpolator(
-            command_sink=self.command_sink,
-            state_source=self.state_source,
-            send_rate_hz=self.interpolator_frequency_hz,
+            publish_rate_hz=self.interpolator_frequency_hz,
             blend_duration=self.blend_duration,
-            max_chunks=self.max_chunks,
         )
 
         self.rng = np.random.default_rng(seed)
 
         self._shutdown_event = threading.Event()
         self._publishing_event = threading.Event()
-        self._interpolator_thread: threading.Thread | None = None
         self._inference_thread: threading.Thread | None = None
         self._keyboard_thread: threading.Thread | None = None
         self._terminal_settings: Any = None
@@ -375,18 +366,10 @@ class Inference:
     def _run(self) -> None:
         try:
             self._launch_observers()
-            initial_state = self._wait_for_initial_state()
+            self._wait_for_initial_state()
             if self.predictor == "model":
                 self.warm_up_inference(MODEL_WARMUP_PASSES)
-                initial_state = self.state_source()
-            self.interpolator.set_initial_state(initial_state)
-
-            self._interpolator_thread = threading.Thread(
-                target=self._run_interpolator,
-                name="trajectory-interpolator",
-                daemon=True,
-            )
-            self._interpolator_thread.start()
+            self.interpolator.start()
             self.launch_inference_loop()
             self.start_keyboard_listener()
 
@@ -441,10 +424,6 @@ class Inference:
                 self._inference_thread.join(timeout=1.0)
                 self._inference_thread = None
 
-            if self._interpolator_thread is not None:
-                self._interpolator_thread.join(timeout=1.0)
-                self._interpolator_thread = None
-
             self._stop_observers()
             self.stop_keyboard_listener()
 
@@ -464,11 +443,12 @@ class Inference:
         warmup_start_time = time.monotonic()
         for _ in range(int(num_passes)):
             observation = self.get_observation_dict_from_buffers()
-            current_state = self.state_source()
+            current_position, current_rotation = self._read_current_pose()
             inference_start_time = time.monotonic()
             _ = self._generate_model_action_chunk(
                 observation,
-                current_state,
+                current_position,
+                current_rotation,
                 inference_start_time,
             )
         warmup_elapsed_s = time.monotonic() - warmup_start_time
@@ -500,13 +480,15 @@ class Inference:
     def _generate_dummy_action_chunk(
         self,
         observation_dict: dict[str, np.ndarray],
-        current_state: PoseSample,
+        current_position: np.ndarray,
+        current_rotation: np.ndarray,
         now: float,
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, np.ndarray]:
         del observation_dict
 
-        current_position = np.asarray(current_state.position, dtype=np.float64).reshape(3)
-        current_rpy = np.asarray(current_state.rpy(), dtype=np.float64).reshape(3)
+        Rotation = _require_rotation()
+        current_position = np.asarray(current_position, dtype=np.float64).reshape(3)
+        current_rpy = Rotation.from_matrix(current_rotation).as_euler("xyz")
 
         target_delta = self.rng.uniform(
             low=-self.position_delta_limits,
@@ -546,13 +528,14 @@ class Inference:
             )
         )
         rpy[0] = current_rpy
+        quats = Rotation.from_euler("xyz", rpy).as_quat()
 
         waypoint_times = (
             float(now)
             + self.first_waypoint_lead
             + self.action_dt * np.arange(self.action_window, dtype=np.float64)
         )
-        return np.column_stack((positions, rpy, waypoint_times))
+        return np.hstack((positions, quats)), waypoint_times
 
     def _load_model_predictor(self, requested_device: str | None) -> None:
         torch = _require_torch()
@@ -687,10 +670,11 @@ class Inference:
     def _generate_model_action_chunk(
         self,
         observation_dict: dict[str, np.ndarray],
-        current_state: PoseSample,
+        current_position: np.ndarray,
+        current_rotation: np.ndarray,
         inference_start_time: float,
-    ) -> np.ndarray:
-        del current_state
+    ) -> tuple[np.ndarray, np.ndarray]:
+        del current_position, current_rotation
 
         if self.model_policy is None or self.model_normalization_stats is None:
             raise RuntimeError("Model predictor was requested, but the policy is not loaded.")
@@ -730,27 +714,35 @@ class Inference:
         relative_rotations = rot6d_to_rotation_matrix(relative_rot6d)
         world_positions = reference_position[None, :] + (reference_rotation @ relative_positions.T).T
         world_rotations = np.einsum("ij,tjk->tik", reference_rotation, relative_rotations)
-        world_rpy = self._rotation_matrices_to_rpy(world_rotations)
+        Rotation = _require_rotation()
+        world_quats = Rotation.from_matrix(world_rotations).as_quat()
         waypoint_times = (
             float(inference_start_time)
             + self.first_waypoint_lead
             + self.action_dt * np.arange(self.action_window, dtype=np.float64)
         )
-        return np.column_stack((world_positions, world_rpy, waypoint_times))
+        return np.hstack((world_positions, world_quats)), waypoint_times
 
     def _predict_action_chunk(
         self,
         observation_dict: dict[str, np.ndarray],
-        current_state: PoseSample,
+        current_position: np.ndarray,
+        current_rotation: np.ndarray,
         inference_start_time: float,
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, np.ndarray]:
         if self.predictor == "model":
             return self._generate_model_action_chunk(
                 observation_dict,
-                current_state,
+                current_position,
+                current_rotation,
                 inference_start_time,
             )
-        return self._generate_dummy_action_chunk(observation_dict, current_state, inference_start_time)
+        return self._generate_dummy_action_chunk(
+            observation_dict,
+            current_position,
+            current_rotation,
+            inference_start_time,
+        )
 
     def _keyboard_listener_loop(self) -> None:
         while not self._shutdown_event.is_set():
@@ -786,10 +778,15 @@ class Inference:
 
             try:
                 observation = self.get_observation_dict_from_buffers()
-                current_state = self.state_source()
+                current_position, current_rotation = self._read_current_pose()
                 inference_start_time = time.monotonic()
-                chunk = self._predict_action_chunk(observation, current_state, inference_start_time)
-                self.interpolator.enqueue_chunk(chunk)
+                chunk, ts = self._predict_action_chunk(
+                    observation,
+                    current_position,
+                    current_rotation,
+                    inference_start_time,
+                )
+                self.interpolator.enqueue_chunk(chunk, ts)
             except InterpolatorFault as exc:
                 print(f"Interpolator fault: {exc}", flush=True)
                 self._record_background_error(exc)
@@ -806,16 +803,6 @@ class Inference:
                     return
             else:
                 next_publish_time = time.monotonic()
-
-    def _run_interpolator(self) -> None:
-        try:
-            self.interpolator.run()
-        except InterpolatorFault as exc:
-            print(f"Interpolator fault: {exc}", flush=True)
-            self._record_background_error(exc)
-        except Exception as exc:
-            print(f"Interpolator runner failed: {exc}", flush=True)
-            self._record_background_error(exc)
 
     @staticmethod
     def _compute_buffer_size(specs: dict[str, ObservationKeySpec | VisualKeySpec]) -> int:
@@ -869,14 +856,14 @@ class Inference:
         )
         return position_key, orientation_key
 
-    def _wait_for_initial_state(self) -> PoseSample:
+    def _wait_for_initial_state(self) -> tuple[np.ndarray, np.ndarray]:
         print("Waiting for current pose and observer buffers...", flush=True)
         last_log_time = 0.0
 
         while not self._shutdown_event.is_set():
             robot_ready = False
             camera_ready = False
-            state_sample: PoseSample | None = None
+            state_sample: tuple[np.ndarray, np.ndarray] | None = None
 
             if self.robot_observer is not None:
                 robot_ready = bool(self.robot_observer.get_last_k_obs(1))
@@ -884,7 +871,7 @@ class Inference:
                 camera_ready = bool(self.camera_observer.get_last_k_obs(1))
 
             try:
-                state_sample = self.state_source()
+                state_sample = self._read_current_pose()
             except Exception:
                 state_sample = None
 
@@ -906,6 +893,17 @@ class Inference:
             time.sleep(WAIT_POLL_PERIOD_S)
 
         raise RuntimeError("Shutdown requested before the initial state became available.")
+
+    def _read_current_pose(self) -> tuple[np.ndarray, np.ndarray]:
+        position = np.asarray(
+            json.loads(_redis_text(self.redis_client.get(self.current_position_key))),
+            dtype=float,
+        ).reshape(3)
+        rotation_matrix = np.asarray(
+            json.loads(_redis_text(self.redis_client.get(self.current_orientation_key))),
+            dtype=float,
+        ).reshape(3, 3)
+        return position, rotation_matrix
 
     @staticmethod
     def _normalize_redis_namespace(redis_namespace: Any) -> str:

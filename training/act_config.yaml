@@ -5,7 +5,7 @@ dim_feedforward: 512
 feedforward_activation: "relu"
 n_encoder_layers: 3
 n_decoder_layers: 3
-robot_state_feature: [8]
+robot_state_feature: [7]
 action_feature: [7]
 chunk_size: 3
 image_features : True

@@ -21,7 +21,7 @@ def get_device():
 model_device = get_device()
 #This is the training loop --- it should include a function that can be used to compute a loss
 
-dataset_path = "/Users/rahulavasarala/Desktop/ForceWM/training/dummy_dataset"
+dataset_path = "/Users/rahulavasarala/Desktop/ForceWM/data_storage/no_coll_dataset_v1_extracted"
 contract_path = "/Users/rahulavasarala/Desktop/ForceWM/universal_contract.yaml"
 checkpoint_dir = Path("/Users/rahulavasarala/Desktop/ForceWM/training/checkpoints")
 

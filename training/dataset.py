@@ -19,6 +19,7 @@ class MultiModalDataset(Dataset):
 
         self.lowdim_keys = {}
         dataset_path = Path(dataset_path)
+        self.dataset_path = dataset_path
 
         metadata_path = dataset_path / "metadata.npz"
         metadata = np.load(metadata_path)
@@ -38,6 +39,10 @@ class MultiModalDataset(Dataset):
             contract = yaml.safe_load(f)
 
         self.action_type = contract.get("robot", {}).get("action", {}).get("mode", "relative")
+        normalizer_path = dataset_path / "normalizer.npy"
+        if not normalizer_path.exists():
+            raise FileNotFoundError(f"Missing dataset normalizer: {normalizer_path}")
+        self.normalizer = np.load(normalizer_path, allow_pickle=True).item()
         self.device = self.get_device()
         self.crop_size = None
         self.angle = None
@@ -59,6 +64,31 @@ class MultiModalDataset(Dataset):
     
     def image_transforms(self, image_transforms):
         self.image_transforms = image_transforms
+
+    def apply_normalization(self, data_dict):
+        normalized_dict = {}
+        lowdim_stats = self.normalizer.get("lowdim", {})
+        image_stats = self.normalizer.get("images", {})
+
+        for key, value in data_dict.items():
+            if key == "images":
+                image_tensor = value if isinstance(value, torch.Tensor) else self.convert_to_torch(value)
+                mean = self.convert_to_torch(image_stats["mean"]).view(1, -1, 1, 1)
+                std = self.convert_to_torch(image_stats["std"]).view(1, -1, 1, 1)
+                normalized_dict[key] = (image_tensor - mean) / std
+                continue
+
+            if key in lowdim_stats:
+                mean = np.asarray(lowdim_stats[key]["mean"], dtype=np.float32)
+                std = np.asarray(lowdim_stats[key]["std"], dtype=np.float32)
+                normalized_dict[key] = (
+                    np.asarray(value, dtype=np.float32) - mean
+                ) / std
+            else:
+                normalized_dict[key] = value
+
+        return normalized_dict
+
 
     def __getitem__(self, idx):
 
@@ -100,11 +130,11 @@ class MultiModalDataset(Dataset):
         if self.crop_size is not None or self.angle is not None:
             obs_dict["images"] = self.perform_visual_transformations(obs_dict["images"])
 
+        self.convert_ori_to_quat(action_dict)
 
-        if self.action_type == "relative":
-            action_dict = self.transform_action_to_relative(action_dict)
-        else:
-            self.convert_ori_to_quat(action_dict)
+        obs_dict = self.apply_normalization(obs_dict)
+        action_dict = self.apply_normalization(action_dict)
+            
 
         action_dict = self.convert_to_torch(action_dict)
         obs_dict = self.convert_to_torch(obs_dict)

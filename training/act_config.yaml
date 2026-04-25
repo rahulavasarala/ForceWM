@@ -7,7 +7,7 @@ n_encoder_layers: 3
 n_decoder_layers: 3
 robot_state_feature: [7]
 action_feature: [7]
-chunk_size: 3
+chunk_size: 8
 image_features : True
 latent_dim: 100
 pre_norm: True

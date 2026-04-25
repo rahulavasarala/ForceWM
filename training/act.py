@@ -158,21 +158,29 @@ class ACT(nn.Module):
         model_device = next(self.parameters()).device
         new_batch = {}
 
+        obs_eef_pos = torch.as_tensor(batch["obs"]["eef_pos"])
+        obs_eef_ori = torch.as_tensor(batch["obs"]["eef_ori"])
+        obs_images = torch.as_tensor(batch["obs"]["images"])
+
         new_batch["lowdim"] = _to_batched_time_major(
             torch.concat(
-            (batch["obs"]["eef_pos"], batch["obs"]["eef_ori"]),
-            dim=-1,
-        ),
-            "lowdim",
-        ).to(device=model_device)
-        new_batch["image"] = _to_batched_image_sequence(batch["obs"]["images"]).to(device=model_device)
-        new_batch["action"] = _to_batched_time_major(
-            torch.concat(
-                (batch["actions"]["eef_pos"], batch["actions"]["eef_ori"]),
+                (obs_eef_pos, obs_eef_ori),
                 dim=-1,
             ),
-            "action",
+            "lowdim",
         ).to(device=model_device)
+        new_batch["image"] = _to_batched_image_sequence(obs_images).to(device=model_device)
+
+        if "actions" in batch:
+            action_eef_pos = torch.as_tensor(batch["actions"]["eef_pos"])
+            action_eef_ori = torch.as_tensor(batch["actions"]["eef_ori"])
+            new_batch["action"] = _to_batched_time_major(
+                torch.concat(
+                    (action_eef_pos, action_eef_ori),
+                    dim=-1,
+                ),
+                "action",
+            ).to(device=model_device)
 
         if new_batch["image"].shape[1] != new_batch["lowdim"].shape[1]:
             raise ValueError(
@@ -180,7 +188,7 @@ class ACT(nn.Module):
                 f"Got image T={new_batch['image'].shape[1]} and lowdim T={new_batch['lowdim'].shape[1]}."
             )
 
-        if new_batch["action"].shape[1] != self.config.chunk_size:
+        if "action" in new_batch and new_batch["action"].shape[1] != self.config.chunk_size:
             raise ValueError(
                 f"Action horizon T_act={new_batch['action'].shape[1]} must match config.chunk_size={self.config.chunk_size}."
             )
@@ -273,7 +281,7 @@ class ACT(nn.Module):
 
         # Prepare transformer encoder inputs.
         batch_size, t_obs, _, _, _ = batch["image"].shape
-        t_act = batch["action"].shape[1]
+        t_act = batch["action"].shape[1] if "action" in batch else self.config.chunk_size
         if t_obs > self.config.chunk_size:
             raise ValueError(
                 f"Observation horizon T_obs={t_obs} exceeds positional capacity config.chunk_size={self.config.chunk_size}."

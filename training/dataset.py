@@ -47,6 +47,17 @@ class MultiModalDataset(Dataset):
         self.crop_size = None
         self.angle = None
 
+        self.preflight_check()
+
+    def preflight_check(self):
+
+        print("Summary of all the settings of the Dataset -----------------------------")
+        print(f"Action Type: {self.action_type}")
+        print(f"normalizer: {self.normalizer.shape}")
+        print(f"device: ", self.device.shape)
+        print(f"episode ends: {self.episode_ends}")
+        print("Summary of all the settings of the Dataset -----------------------------")
+
 
     def __create_key_information(self):
 

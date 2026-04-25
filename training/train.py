@@ -23,7 +23,7 @@ model_device = get_device()
 
 dataset_path = "/Users/rahulavasarala/Desktop/ForceWM/data_storage/no_coll_dataset_v1_extracted"
 contract_path = "/Users/rahulavasarala/Desktop/ForceWM/universal_contract.yaml"
-checkpoint_dir = Path("/Users/rahulavasarala/Desktop/ForceWM/training/checkpoints")
+checkpoint_dir = Path("/Users/rahulavasarala/Desktop/ForceWM/training/no_coll_v1/checkpoints")
 
 # ---------------- Training Hyperparameters ---------------------
 
@@ -84,16 +84,17 @@ def act_train_loop():
         average_loss = running_loss / max(len(train_loader), 1)
         epoch_bar.set_postfix(loss=f"{average_loss:.4f}")
 
-        checkpoint_path = checkpoint_dir / f"act_epoch_{epoch + 1:04d}.pt"
-        torch.save(
-            {
-                "epoch": epoch + 1,
-                "model_state_dict": act.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "loss": average_loss,
-            },
-            checkpoint_path,
-        )
+        if epoch % 10 == 0:
+            checkpoint_path = checkpoint_dir / f"act_epoch_{epoch + 1:04d}.pt"
+            torch.save(
+                {
+                    "epoch": epoch + 1,
+                    "model_state_dict": act.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "loss": average_loss,
+                },
+                checkpoint_path,
+            )
 
         
 

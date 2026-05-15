@@ -116,7 +116,7 @@ class CameraObserver:
                 if redis_bytes is None:
                     return None
 
-                frame = cv2.imdecode(np.frombuffer(redis_bytes, np.uint8), cv2.IMREAD_COLOR)
+                frame = self._decode_sim_frame(redis_bytes, visual_name, visual_spec)
                 if frame is None:
                     return None
                 observation[visual_name] = frame
@@ -147,6 +147,37 @@ class CameraObserver:
             observation["sim_timestamp_s"] = max(sim_timestamps)
 
         return observation
+
+    @staticmethod
+    def _decode_sim_frame(redis_bytes: bytes, visual_name: str, visual_spec: dict[str, Any]) -> np.ndarray | None:
+        visual_type = str(visual_spec.get("type", "rgb")).lower()
+        encoding = str(visual_spec.get("encoding", "jpeg")).lower()
+        decode_buffer = np.frombuffer(redis_bytes, np.uint8)
+
+        if visual_type == "depth":
+            if encoding != "png16":
+                raise ValueError(
+                    f"Sim depth stream '{visual_name}' must use png16 encoding, got '{encoding}'."
+                )
+
+            frame = cv2.imdecode(decode_buffer, cv2.IMREAD_UNCHANGED)
+            if frame is None:
+                return None
+            if frame.ndim != 2 or frame.dtype != np.uint16:
+                raise ValueError(
+                    f"Depth stream '{visual_name}' must decode to HxW uint16, got shape={frame.shape} "
+                    f"dtype={frame.dtype}."
+                )
+            return frame
+
+        frame = cv2.imdecode(decode_buffer, cv2.IMREAD_COLOR)
+        if frame is None:
+            return None
+        if frame.ndim != 3 or frame.shape[2] != 3:
+            raise ValueError(
+                f"RGB stream '{visual_name}' must decode to HxWx3, got shape={frame.shape}."
+            )
+        return frame
 
     def _start_realsense_streams(self) -> None:
         realsense_specs = [
@@ -287,6 +318,12 @@ class CameraObserver:
                     redis_namespace, prefix, redis_suffix
                 ) + "::meta",
                 "dim": visual_cfg.get("dim"),
+                "encoding": visual_cfg.get(
+                    "encoding",
+                    "png16" if visual_type == "depth" else "jpeg",
+                ),
+                "unit": visual_cfg.get("unit"),
+                "align_to": visual_cfg.get("align_to"),
                 "serial_number": visual_cfg.get("serial_number"),
                 "fps": visual_cfg.get("fps", visual_fps),
             }

@@ -47,6 +47,30 @@ class Saver:
         self.camera_specs = getattr(self.camera_observer, "camera_specs", None)
         if not isinstance(self.camera_specs, dict) or not self.camera_specs:
             raise ValueError("camera_observer must expose non-empty `camera_specs`.")
+        self.rgb_camera_specs = {
+            camera_name: camera_spec
+            for camera_name, camera_spec in self.camera_specs.items()
+            if not self._is_depth_camera(camera_spec)
+        }
+        self.depth_camera_specs = {
+            camera_name: camera_spec
+            for camera_name, camera_spec in self.camera_specs.items()
+            if self._is_depth_camera(camera_spec)
+        }
+        if len(self.depth_camera_specs) > 1:
+            raise ValueError("Saver currently supports at most one depth camera.")
+
+        for depth_camera_name, depth_camera_spec in self.depth_camera_specs.items():
+            align_to = depth_camera_spec.get("align_to")
+            if not isinstance(align_to, str) or not align_to:
+                raise ValueError(
+                    f"Depth camera '{depth_camera_name}' must declare a non-empty `align_to` key."
+                )
+            if align_to not in self.rgb_camera_specs:
+                raise ValueError(
+                    f"Depth camera '{depth_camera_name}' aligns to '{align_to}', but no RGB camera with "
+                    "that key was found."
+                )
 
         self.lowdim_fps = self._resolve_fps("lowdim", getattr(self.robot_observer, "obs_freq", None))
         self.camera_fps = self._resolve_fps("visual", getattr(self.camera_observer, "camera_freq", None))
@@ -65,6 +89,7 @@ class Saver:
         self._episode_id: int | None = None
         self._episode_dir: Path | None = None
         self._visual_dir: Path | None = None
+        self._depth_frames_dir: Path | None = None
         self._start_timestamp_s: float | None = None
         self._stop_timestamp_s: float | None = None
         self._last_lowdim_timestamp_s: float | None = None
@@ -78,6 +103,7 @@ class Saver:
         self._camera_duplicate_frame_counts: dict[str, int] = {}
         self._video_writers: dict[str, cv2.VideoWriter] = {}
         self._video_paths: dict[str, Path] = {}
+        self._depth_frame_indices: dict[str, int] = {}
 
     def start(self) -> float:
         with self._state_lock:
@@ -97,6 +123,10 @@ class Saver:
             self._visual_dir = self._episode_dir / "visual"
             self._episode_dir.mkdir(parents=True, exist_ok=False)
             self._visual_dir.mkdir(parents=True, exist_ok=False)
+            self._depth_frames_dir = None
+            if self.depth_camera_specs:
+                self._depth_frames_dir = self._visual_dir / "depth" / "depth_frames"
+                self._depth_frames_dir.mkdir(parents=True, exist_ok=False)
 
             self._initialize_episode_storage()
             self._write_contract_snapshot()
@@ -259,8 +289,11 @@ class Saver:
                 ):
                     self._last_camera_source_marker[camera_name] = source_marker
 
-                frame = self._prepare_frame_for_video(camera_name, sample[camera_name], camera_spec)
-                self._video_writers[camera_name].write(frame)
+                if self._is_depth_camera(camera_spec):
+                    self._write_depth_frame(camera_name, sample[camera_name], camera_spec)
+                else:
+                    frame = self._prepare_frame_for_video(camera_name, sample[camera_name], camera_spec)
+                    self._video_writers[camera_name].write(frame)
                 self._camera_timestamps[camera_name].append(timestamp_s)
                 self._camera_frame_counts[camera_name] += 1
 
@@ -277,6 +310,7 @@ class Saver:
         self._last_camera_source_marker = {camera_name: None for camera_name in self.camera_specs}
         self._video_writers = {}
         self._video_paths = {}
+        self._depth_frame_indices = {camera_name: 0 for camera_name in self.depth_camera_specs}
 
     def _write_contract_snapshot(self) -> None:
         if self._episode_dir is None:
@@ -295,7 +329,7 @@ class Saver:
             raise RuntimeError("Visual directory is not initialized.")
 
         fourcc = cv2.VideoWriter_fourcc(*self.video_codec)
-        for camera_name, camera_spec in self.camera_specs.items():
+        for camera_name, camera_spec in self.rgb_camera_specs.items():
             width, height = self._resolve_image_size(camera_spec.get("dim"))
             fps = float(camera_spec.get("fps") or self.camera_fps)
             if fps <= 0.0:
@@ -356,6 +390,9 @@ class Saver:
             raise RuntimeError("Visual directory is not initialized.")
 
         for camera_name, timestamps in self._camera_timestamps.items():
+            camera_spec = self.camera_specs.get(camera_name, {})
+            if self._is_depth_camera(camera_spec):
+                continue
             timestamp_path = self._visual_dir / f"{camera_name}_timestamps.npy"
             np.save(timestamp_path, np.asarray(timestamps, dtype=np.float64))
 
@@ -470,6 +507,42 @@ class Saver:
             frame_array = cv2.resize(frame_array, (expected_width, expected_height))
 
         return np.ascontiguousarray(frame_array)
+
+    def _write_depth_frame(self, camera_name: str, frame: Any, camera_spec: dict[str, Any]) -> None:
+        if self._depth_frames_dir is None:
+            raise RuntimeError("Depth frame directory is not initialized.")
+
+        frame_array = self._prepare_depth_frame_for_png(camera_name, frame, camera_spec)
+        frame_index = self._depth_frame_indices[camera_name]
+        output_path = self._depth_frames_dir / f"frame_{frame_index:06d}.png"
+        if not cv2.imwrite(str(output_path), frame_array):
+            raise RuntimeError(f"Failed to write depth frame for '{camera_name}' to {output_path}.")
+        self._depth_frame_indices[camera_name] = frame_index + 1
+
+    @staticmethod
+    def _prepare_depth_frame_for_png(camera_name: str, frame: Any, camera_spec: dict[str, Any]) -> np.ndarray:
+        frame_array = np.asarray(frame)
+        if frame_array.ndim != 2:
+            raise ValueError(
+                f"Depth frame for '{camera_name}' must be HxW, got shape {frame_array.shape}."
+            )
+
+        if frame_array.dtype != np.uint16:
+            frame_array = np.clip(np.rint(frame_array), 0, np.iinfo(np.uint16).max).astype(np.uint16)
+
+        expected_width, expected_height = Saver._resolve_image_size(camera_spec.get("dim"))
+        if frame_array.shape[1] != expected_width or frame_array.shape[0] != expected_height:
+            frame_array = cv2.resize(
+                frame_array,
+                (expected_width, expected_height),
+                interpolation=cv2.INTER_NEAREST,
+            )
+
+        return np.ascontiguousarray(frame_array)
+
+    @staticmethod
+    def _is_depth_camera(camera_spec: dict[str, Any]) -> bool:
+        return str(camera_spec.get("type", "rgb")).lower() == "depth"
 
     @staticmethod
     def _to_numpy_array(values: list[Any], dim: Any) -> np.ndarray:

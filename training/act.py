@@ -16,7 +16,6 @@ import einops
 import timm
 import yaml
 from types import SimpleNamespace
-from dataset import MultiModalDataset
 
 def get_device():
     if torch.backends.mps.is_available():

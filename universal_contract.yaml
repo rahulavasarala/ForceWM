@@ -31,6 +31,13 @@ robot:
             dim: [224, 224, 3]
             obs_window: 2
             obs_dss: 3
+        - camera_01_depth:
+            type: "depth"
+            source: "sim"
+            encoding: "png16"
+            unit: "mm"
+            dim: [224, 224, 1]
+            align_to: "camera_01"
   action:
     dss: 3
     window: 8

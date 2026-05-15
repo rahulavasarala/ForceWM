@@ -318,16 +318,68 @@ class DataCollection:
                     f"`robot.data_sources.{source_name}.keys.{key_name}` must map to a dictionary."
                 )
 
-            obs_window = key_cfg.get("obs_window")
-            if obs_window is None:
-                raise ValueError(
-                    f"`robot.data_sources.{source_name}.keys.{key_name}.obs_window` is required "
-                    "to size the observer buffer."
-                )
-
-            max_obs_window = max(max_obs_window, int(obs_window))
+            obs_window = self._resolve_source_key_int_field(
+                source_cfg,
+                source_name,
+                key_name,
+                key_cfg,
+                "obs_window",
+            )
+            max_obs_window = max(max_obs_window, obs_window)
 
         return max(1, 3 * max_obs_window)
+
+    @staticmethod
+    def _resolve_source_key_int_field(
+        source_cfg: dict[str, Any],
+        source_name: str,
+        key_name: str,
+        key_cfg: dict[str, Any],
+        field_name: str,
+    ) -> int:
+        field_value = key_cfg.get(field_name)
+        if field_value is not None:
+            return int(field_value)
+
+        align_to = key_cfg.get("align_to")
+        if align_to is None:
+            raise ValueError(
+                f"`robot.data_sources.{source_name}.keys.{key_name}.{field_name}` is required "
+                "to size the observer buffer."
+            )
+
+        aligned_key_cfg = DataCollection._lookup_source_key_cfg(source_cfg, source_name, str(align_to))
+        aligned_field_value = aligned_key_cfg.get(field_name)
+        if aligned_field_value is None:
+            raise ValueError(
+                f"`robot.data_sources.{source_name}.keys.{key_name}` aligns to '{align_to}', "
+                f"but `{field_name}` is missing there as well."
+            )
+
+        return int(aligned_field_value)
+
+    @staticmethod
+    def _lookup_source_key_cfg(
+        source_cfg: dict[str, Any],
+        source_name: str,
+        key_name: str,
+    ) -> dict[str, Any]:
+        for key_entry in source_cfg["keys"]:
+            if not isinstance(key_entry, dict) or len(key_entry) != 1:
+                continue
+
+            candidate_key_name, candidate_key_cfg = next(iter(key_entry.items()))
+            if candidate_key_name != key_name:
+                continue
+            if not isinstance(candidate_key_cfg, dict):
+                raise ValueError(
+                    f"`robot.data_sources.{source_name}.keys.{candidate_key_name}` must map to a dictionary."
+                )
+            return candidate_key_cfg
+
+        raise ValueError(
+            f"`robot.data_sources.{source_name}.keys.{key_name}` was not found in the universal contract."
+        )
 
     @staticmethod
     def _load_contract(contract_path: Path) -> dict[str, Any]:

@@ -20,12 +20,25 @@ find_package(yaml-cpp CONFIG REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgcodecs imgproc)
 find_package(ZeroMQ CONFIG REQUIRED)
 
+add_library(forcewm_particle_filter
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/particle_filter/ForceSpaceParticleFilter.cpp"
+)
+target_include_directories(forcewm_particle_filter PUBLIC
+  "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/particle_filter"
+)
+target_link_libraries(forcewm_particle_filter PUBLIC
+  Eigen3::Eigen
+  yaml-cpp::yaml-cpp
+)
+
 set(FORCEWM_SIMULATION_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/simulation.cpp")
 file(SIZE "${FORCEWM_SIMULATION_SOURCE}" FORCEWM_SIMULATION_SOURCE_SIZE)
 
 if(FORCEWM_SIMULATION_SOURCE_SIZE GREATER 0)
   add_executable(forcewm_simulation "${FORCEWM_SIMULATION_SOURCE}")
   target_link_libraries(forcewm_simulation PRIVATE
+    forcewm_particle_filter
     forcewm::runtime
     forcewm::opensai_model
     Threads::Threads
@@ -35,6 +48,14 @@ if(FORCEWM_SIMULATION_SOURCE_SIZE GREATER 0)
 
   set_target_properties(forcewm_simulation PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+  )
+
+  add_custom_command(TARGET forcewm_simulation POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+            "$<TARGET_FILE_DIR:forcewm_simulation>/particle_filter"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/particle_filter/pfilter_settings.yaml"
+            "$<TARGET_FILE_DIR:forcewm_simulation>/particle_filter/pfilter_settings.yaml"
   )
 else()
   add_custom_target(forcewm_simulation SOURCES "${FORCEWM_SIMULATION_SOURCE}")

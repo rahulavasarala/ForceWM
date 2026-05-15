@@ -11,6 +11,8 @@ const std::string SENSED_FORCE = "sim::franka::sensed_force";
 const std::string SENSED_MOMENT = "sim::franka::sensed_moment";
 const std::string HAPTIC_COMMANDED_POSITION = "sim::franka::haptic_commanded_position";
 const std::string HAPTIC_COMMANDED_ORIENTATION = "sim::franka::haptic_commanded_orientation";
+const std::string FORCE_DIMENSION = "sim::franka::force_dimension";
+const std::string FORCE_OR_MOTION_AXIS = "sim::franka::force_or_motion_axis";
 
 const std::string QPOS = "sim::franka::qpos";
 const std::string RESET = "sim::franka::reset";

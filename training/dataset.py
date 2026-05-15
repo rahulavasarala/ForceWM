@@ -21,6 +21,9 @@ class MultiModalDataset(Dataset):
         dataset_path = Path(dataset_path)
         self.dataset_path = dataset_path
 
+        with open(universal_contract, "r") as f:
+            self.contract = yaml.safe_load(f)
+
         metadata_path = dataset_path / "metadata.npz"
         metadata = np.load(metadata_path)
         self.episode_ends = metadata["episode_ends"]
@@ -34,11 +37,7 @@ class MultiModalDataset(Dataset):
         self.video_reader = VideoDatasetReader(video_path, metadata, cache_size = 4)
 
         self.__create_key_information()
-
-        with open(universal_contract, "r") as f:
-            contract = yaml.safe_load(f)
-
-        self.action_type = contract.get("robot", {}).get("action", {}).get("mode", "relative")
+        self.action_type = self.contract.get("robot", {}).get("action", {}).get("mode", "relative")
         normalizer_path = dataset_path / "normalizer.npy"
         if not normalizer_path.exists():
             raise FileNotFoundError(f"Missing dataset normalizer: {normalizer_path}")
@@ -46,6 +45,7 @@ class MultiModalDataset(Dataset):
         self.device = self.get_device()
         self.crop_size = None
         self.angle = None
+        self.apply_normalizer = True
 
         self.preflight_check()
 
@@ -53,19 +53,37 @@ class MultiModalDataset(Dataset):
 
         print("Summary of all the settings of the Dataset -----------------------------")
         print(f"Action Type: {self.action_type}")
-        print(f"normalizer: {self.normalizer.shape}")
-        print(f"device: ", self.device.shape)
-        print(f"episode ends: {self.episode_ends}")
+        print(f"normalizer: {self.normalizer}")
+        print(f"device: ", self.device)
+        print(f"episode ends: {self.episode_ends.shape}")
         print("Summary of all the settings of the Dataset -----------------------------")
 
 
     def __create_key_information(self):
 
         # creates the key information --- downsampling steps --- etc ---
+        robot_cfg = self.contract.get("robot", {})
+        lowdim_cfg = robot_cfg.get("data_sources", {}).get("lowdim", {})
+        lowdim_entries = lowdim_cfg.get("keys", [])
 
-        self.lowdim_keys["eef_pos"] = {"dss": 3, "obs_horizon": 3}
-        self.lowdim_keys["eef_ori"] = {"dss" : 3, "obs_horizon": 3}
-        self.action_info = {"dss": 3, "obs_horizon": 3}
+        for entry in lowdim_entries:
+            if not isinstance(entry, dict) or len(entry) != 1:
+                continue
+
+            key_name, key_cfg = next(iter(entry.items()))
+            if not isinstance(key_cfg, dict):
+                continue
+
+            self.lowdim_keys[key_name] = {
+                "dss": int(key_cfg.get("obs_dss", 1)),
+                "obs_horizon": int(key_cfg.get("obs_window", 1)),
+            }
+
+        action_cfg = robot_cfg.get("action", {})
+        self.action_info = {
+            "dss": int(action_cfg.get("dss", 1)),
+            "obs_horizon": int(action_cfg.get("window", 1)),
+        }
 
     def get_episode(self,idx):
         return bisect.bisect_left(self.episode_ends, idx)
@@ -143,8 +161,9 @@ class MultiModalDataset(Dataset):
 
         self.convert_ori_to_quat(action_dict)
 
-        obs_dict = self.apply_normalization(obs_dict)
-        action_dict = self.apply_normalization(action_dict)
+        if self.apply_normalizer:
+            obs_dict = self.apply_normalization(obs_dict)
+            action_dict = self.apply_normalization(action_dict)
             
 
         action_dict = self.convert_to_torch(action_dict)

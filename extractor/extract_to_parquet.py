@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import math
 import warnings
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -9,11 +11,16 @@ import numpy as np
 
 
 DEFAULT_CHUNK_SIZE = 128
-DEFAULT_VEL_THRESH = 1e-3
-DEFAULT_STATIONARY_WINDOW = 10
+DEFAULT_VEL_THRESH = -1
+DEFAULT_STATIONARY_WINDOW = 1
 DEFAULT_VIDEO_CODEC = "mp4v"
 DEFAULT_PARQUET_NAME = "dataset.parquet"
 DEFAULT_CAMERA_KEY = "camera_01"
+DEFAULT_WRIST_CAMERA_NAME = "wrist_camera"
+DEFAULT_POINTCLOUD_SAMPLES = 128
+DEFAULT_POINTCLOUD_ROI_FRACTION = 0.6
+DEFAULT_POINTCLOUD_SEED = 0
+DEFAULT_FR3_XML_PATH = Path(__file__).resolve().parents[1] / "models" / "fr3.xml"
 
 
 @dataclass(frozen=True)
@@ -21,6 +28,7 @@ class EpisodeData:
     source_dir: Path
     source_name: str
     timestamps: np.ndarray
+    lowdim_timestamps: np.ndarray
     positions: np.ndarray
     orientations: np.ndarray
     frames: np.ndarray
@@ -28,12 +36,47 @@ class EpisodeData:
 
 
 @dataclass(frozen=True)
-class ProcessedEpisode:
+class AlignedEpisode:
+    source_dir: Path
     source_name: str
+    timestamps: np.ndarray
     positions: np.ndarray
     orientations: np.ndarray
     frames: np.ndarray
+    source_frame_indices: np.ndarray
     video_fps: float
+
+
+@dataclass(frozen=True)
+class ProcessedEpisode:
+    source_dir: Path
+    source_name: str
+    timestamps: np.ndarray
+    positions: np.ndarray
+    orientations: np.ndarray
+    frames: np.ndarray
+    source_frame_indices: np.ndarray
+    video_fps: float
+
+
+@dataclass(frozen=True)
+class EpisodeProcessingResult:
+    aligned_episode: AlignedEpisode
+    prune_keep_mask: np.ndarray
+    processed_episode: ProcessedEpisode
+
+
+@dataclass(frozen=True)
+class CameraCalibration:
+    fovy_degrees: float
+    camera_offset_m: np.ndarray
+
+
+@dataclass(frozen=True)
+class CoTrackerContext:
+    torch_module: object
+    device: object
+    model: object
 
 
 def _require_cv2():
@@ -65,6 +108,16 @@ def _require_scipy_rotation():
             "SciPy is required for orientation interpolation. Install `scipy` in the active environment."
         ) from exc
     return Rotation, Slerp
+
+
+def _require_torch():
+    try:
+        import torch
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "PyTorch is required for CoTracker-based point cloud extraction. Install `torch` in the active environment."
+        ) from exc
+    return torch
 
 
 def _warn(message: str) -> None:
@@ -176,6 +229,35 @@ def read_video_frames(video_path: Path) -> tuple[np.ndarray, float]:
     return np.stack(frames, axis=0), fps
 
 
+def read_depth_frame(frame_path: Path) -> np.ndarray:
+    cv2 = _require_cv2()
+    frame = cv2.imread(str(frame_path), cv2.IMREAD_UNCHANGED)
+    if frame is None:
+        raise RuntimeError(f"Failed to read depth frame: {frame_path}")
+    if frame.ndim != 2 or frame.dtype != np.uint16:
+        raise ValueError(
+            f"Depth frame `{frame_path}` must decode as HxW uint16, got shape={frame.shape} dtype={frame.dtype}."
+        )
+    return frame
+
+
+def discover_depth_frame_paths(episode_dir: Path) -> list[Path] | None:
+    depth_frames_dir = episode_dir / "visual" / "depth" / "depth_frames"
+    if not depth_frames_dir.exists():
+        return None
+    if not depth_frames_dir.is_dir():
+        raise NotADirectoryError(f"Depth frame path is not a directory: {depth_frames_dir}")
+
+    depth_paths = sorted(
+        path
+        for path in depth_frames_dir.iterdir()
+        if path.is_file() and path.suffix.lower() == ".png"
+    )
+    if not depth_paths:
+        raise FileNotFoundError(f"No depth PNG frames were found in {depth_frames_dir}")
+    return depth_paths
+
+
 def load_episode_data(episode_dir: Path) -> EpisodeData:
     timestamps = load_camera_timestamps(episode_dir)
     lowdim_timestamps, positions, orientations = load_lowdim_arrays(episode_dir)
@@ -197,6 +279,7 @@ def load_episode_data(episode_dir: Path) -> EpisodeData:
         source_dir=episode_dir,
         source_name=episode_dir.name,
         timestamps=timestamps,
+        lowdim_timestamps=lowdim_timestamps,
         positions=positions,
         orientations=orientations,
         frames=frames,
@@ -267,6 +350,62 @@ def interpolate_orientations(
     return target_rotations.as_matrix().astype(np.float32)
 
 
+def align_episode_to_lowdim(episode: EpisodeData) -> AlignedEpisode | None:
+    lowdim_timestamps, lowdim_positions, lowdim_orientations = crop_lowdim_to_camera_range(
+        episode.lowdim_timestamps,
+        episode.positions,
+        episode.orientations,
+        episode.timestamps,
+    )
+    lowdim_timestamps, lowdim_positions, lowdim_orientations = sanitize_interpolation_inputs(
+        lowdim_timestamps,
+        lowdim_positions,
+        lowdim_orientations,
+    )
+
+    if len(lowdim_timestamps) < 2:
+        _warn(
+            f"{episode.source_name}: fewer than 2 lowdim samples remain after camera-range cropping; skipping episode."
+        )
+        return None
+
+    valid_camera_mask = (
+        (episode.timestamps >= lowdim_timestamps[0]) &
+        (episode.timestamps <= lowdim_timestamps[-1])
+    )
+    if not np.any(valid_camera_mask):
+        _warn(
+            f"{episode.source_name}: no camera timestamps fall within the lowdim interpolation range; skipping episode."
+        )
+        return None
+
+    aligned_timestamps = episode.timestamps[valid_camera_mask]
+    aligned_frames = episode.frames[valid_camera_mask]
+    source_frame_indices = np.flatnonzero(valid_camera_mask).astype(np.int64)
+
+    aligned_positions = interpolate_positions(
+        lowdim_timestamps,
+        lowdim_positions,
+        aligned_timestamps,
+    )
+    aligned_orientations = interpolate_orientations(
+        lowdim_timestamps,
+        lowdim_orientations,
+        aligned_timestamps,
+    )
+
+    return AlignedEpisode(
+        source_dir=episode.source_dir,
+        source_name=episode.source_name,
+        timestamps=aligned_timestamps,
+        positions=aligned_positions,
+        orientations=aligned_orientations,
+        frames=aligned_frames,
+        source_frame_indices=source_frame_indices,
+        video_fps=float(episode.video_fps),
+    )
+
+
 def apply_edge_trim(length: int, trim_start: int, trim_end: int) -> np.ndarray:
     keep_mask = np.ones(length, dtype=bool)
     trim_start = max(0, int(trim_start))
@@ -306,48 +445,39 @@ def build_stationary_mask(
     return stationary_mask
 
 
-def prune_episode(
+def build_prune_keep_mask(
     timestamps: np.ndarray,
     positions: np.ndarray,
-    orientations: np.ndarray,
-    frames: np.ndarray,
     trim_start: int,
     trim_end: int,
     vel_thresh: float,
     stationary_window: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    keep_mask = apply_edge_trim(len(timestamps), trim_start=trim_start, trim_end=trim_end)
-    if not np.any(keep_mask):
-        return (
-            positions[:0],
-            orientations[:0],
-            frames[:0],
-        )
+) -> np.ndarray:
+    trimmed_keep_mask = apply_edge_trim(len(timestamps), trim_start=trim_start, trim_end=trim_end)
+    if not np.any(trimmed_keep_mask):
+        return trimmed_keep_mask
 
-    timestamps = timestamps[keep_mask]
-    positions = positions[keep_mask]
-    orientations = orientations[keep_mask]
-    frames = frames[keep_mask]
+    trimmed_timestamps = timestamps[trimmed_keep_mask]
+    trimmed_positions = positions[trimmed_keep_mask]
+    if len(trimmed_timestamps) <= 1:
+        return trimmed_keep_mask
 
-    if len(timestamps) <= 1:
-        return positions, orientations, frames
-
-    dt_values = np.diff(timestamps)
+    dt_values = np.diff(trimmed_timestamps)
     positive_dt_values = dt_values[dt_values > 0.0]
     dt = float(np.median(positive_dt_values)) if len(positive_dt_values) else 1.0
 
     stationary_mask = build_stationary_mask(
-        positions,
+        trimmed_positions,
         dt=dt,
         vel_thresh=vel_thresh,
         stationary_window=stationary_window,
     )
     keep_after_stationary = ~stationary_mask
-    return (
-        positions[keep_after_stationary],
-        orientations[keep_after_stationary],
-        frames[keep_after_stationary],
-    )
+
+    keep_mask = np.zeros(len(timestamps), dtype=bool)
+    trimmed_indices = np.flatnonzero(trimmed_keep_mask)
+    keep_mask[trimmed_indices[keep_after_stationary]] = True
+    return keep_mask
 
 
 def process_episode(
@@ -356,67 +486,40 @@ def process_episode(
     trim_end: int,
     vel_thresh: float,
     stationary_window: int,
-) -> ProcessedEpisode | None:
+) -> EpisodeProcessingResult | None:
     episode = load_episode_data(episode_dir)
-    lowdim_timestamps, lowdim_positions, lowdim_orientations = crop_lowdim_to_camera_range(
-        *load_lowdim_arrays(episode_dir),
-        episode.timestamps,
-    )
-    lowdim_timestamps, lowdim_positions, lowdim_orientations = sanitize_interpolation_inputs(
-        lowdim_timestamps,
-        lowdim_positions,
-        lowdim_orientations,
-    )
-
-    if len(lowdim_timestamps) < 2:
-        _warn(
-            f"{episode.source_name}: fewer than 2 lowdim samples remain after camera-range cropping; skipping episode."
-        )
+    aligned_episode = align_episode_to_lowdim(episode)
+    if aligned_episode is None:
         return None
 
-    valid_camera_mask = (
-        (episode.timestamps >= lowdim_timestamps[0]) &
-        (episode.timestamps <= lowdim_timestamps[-1])
-    )
-    if not np.any(valid_camera_mask):
-        _warn(f"{episode.source_name}: no camera timestamps fall within the lowdim interpolation range; skipping episode.")
-        return None
-
-    aligned_timestamps = episode.timestamps[valid_camera_mask]
-    aligned_frames = episode.frames[valid_camera_mask]
-
-    aligned_positions = interpolate_positions(
-        lowdim_timestamps,
-        lowdim_positions,
-        aligned_timestamps,
-    )
-    aligned_orientations = interpolate_orientations(
-        lowdim_timestamps,
-        lowdim_orientations,
-        aligned_timestamps,
-    )
-
-    pruned_positions, pruned_orientations, pruned_frames = prune_episode(
-        timestamps=aligned_timestamps,
-        positions=aligned_positions,
-        orientations=aligned_orientations,
-        frames=aligned_frames,
+    prune_keep_mask = build_prune_keep_mask(
+        timestamps=aligned_episode.timestamps,
+        positions=aligned_episode.positions,
         trim_start=trim_start,
         trim_end=trim_end,
         vel_thresh=vel_thresh,
         stationary_window=stationary_window,
     )
 
-    if len(pruned_positions) == 0:
-        _warn(f"{episode.source_name}: pruning removed every frame; skipping episode.")
+    if not np.any(prune_keep_mask):
+        _warn(f"{aligned_episode.source_name}: pruning removed every frame; skipping episode.")
         return None
 
-    return ProcessedEpisode(
-        source_name=episode.source_name,
-        positions=pruned_positions.astype(np.float32),
-        orientations=pruned_orientations.astype(np.float32),
-        frames=pruned_frames,
-        video_fps=float(episode.video_fps),
+    processed_episode = ProcessedEpisode(
+        source_dir=aligned_episode.source_dir,
+        source_name=aligned_episode.source_name,
+        timestamps=aligned_episode.timestamps[prune_keep_mask].astype(np.float64),
+        positions=aligned_episode.positions[prune_keep_mask].astype(np.float32),
+        orientations=aligned_episode.orientations[prune_keep_mask].astype(np.float32),
+        frames=aligned_episode.frames[prune_keep_mask],
+        source_frame_indices=aligned_episode.source_frame_indices[prune_keep_mask].astype(np.int64),
+        video_fps=float(aligned_episode.video_fps),
+    )
+
+    return EpisodeProcessingResult(
+        aligned_episode=aligned_episode,
+        prune_keep_mask=prune_keep_mask,
+        processed_episode=processed_episode,
     )
 
 
@@ -494,6 +597,361 @@ def write_chunked_videos(output_dir: Path, episodes: list[ProcessedEpisode], chu
             writer.release()
 
 
+def parse_mujoco_float_vector(raw_value: str, expected_length: int, field_name: str) -> np.ndarray:
+    values = np.fromstring(raw_value, sep=" ", dtype=np.float64)
+    if len(values) != expected_length:
+        raise ValueError(f"Expected {expected_length} values for `{field_name}`, got {len(values)} from `{raw_value}`.")
+    return values
+
+
+def load_camera_calibration(
+    camera_name: str = DEFAULT_WRIST_CAMERA_NAME,
+    model_xml_path: Path = DEFAULT_FR3_XML_PATH,
+) -> CameraCalibration:
+    if not model_xml_path.exists():
+        raise FileNotFoundError(f"Camera model XML does not exist: {model_xml_path}")
+
+    model_root = ET.parse(model_xml_path).getroot()
+    for body_element in model_root.iter("body"):
+        if body_element.attrib.get("name") != "fr3_ee":
+            continue
+        for camera_element in body_element.findall("camera"):
+            if camera_element.attrib.get("name") != camera_name:
+                continue
+
+            if "pos" not in camera_element.attrib or "fovy" not in camera_element.attrib:
+                raise ValueError(f"Camera `{camera_name}` in {model_xml_path} is missing `pos` or `fovy`.")
+            camera_offset_m = parse_mujoco_float_vector(
+                camera_element.attrib["pos"],
+                expected_length=3,
+                field_name="camera pos",
+            ).astype(np.float32)
+            fovy_degrees = float(camera_element.attrib["fovy"])
+            return CameraCalibration(
+                fovy_degrees=fovy_degrees,
+                camera_offset_m=camera_offset_m,
+            )
+
+    raise ValueError(f"Could not find camera `{camera_name}` under body `fr3_ee` in {model_xml_path}.")
+
+
+def resolve_torch_device(torch_module) -> object:
+    if torch_module.cuda.is_available():
+        return torch_module.device("cuda")
+    mps_backend = getattr(torch_module.backends, "mps", None)
+    if mps_backend is not None and mps_backend.is_available():
+        return torch_module.device("mps")
+    return torch_module.device("cpu")
+
+
+def load_cotracker_context() -> CoTrackerContext:
+    torch = _require_torch()
+    device = resolve_torch_device(torch)
+    try:
+        model = torch.hub.load("facebookresearch/co-tracker", "cotracker3_online").to(device)
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to load `facebookresearch/co-tracker:cotracker3_online`. "
+            "Ensure the model is cached locally or that the runtime can access torch hub."
+        ) from exc
+    model.eval()
+    return CoTrackerContext(torch_module=torch, device=device, model=model)
+
+
+def compute_camera_intrinsics(
+    frame_height: int,
+    frame_width: int,
+    fovy_degrees: float,
+) -> tuple[float, float, float, float]:
+    fovy_radians = math.radians(float(fovy_degrees))
+    fy = float(frame_height) / (2.0 * math.tan(fovy_radians / 2.0))
+    fx = fy
+    cx = (float(frame_width) - 1.0) / 2.0
+    cy = (float(frame_height) - 1.0) / 2.0
+    return fx, fy, cx, cy
+
+
+def build_center_roi_bounds(frame_height: int, frame_width: int, roi_fraction: float) -> tuple[int, int, int, int]:
+    roi_side = max(1, int(round(min(frame_height, frame_width) * float(roi_fraction))))
+    roi_side = min(roi_side, frame_height, frame_width)
+    x0 = max(0, (frame_width - roi_side) // 2)
+    y0 = max(0, (frame_height - roi_side) // 2)
+    x1 = x0 + roi_side
+    y1 = y0 + roi_side
+    return x0, y0, x1, y1
+
+
+def sample_query_pixels(
+    depth_frame_mm: np.ndarray,
+    sample_count: int,
+    roi_fraction: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    frame_height, frame_width = depth_frame_mm.shape
+    x0, y0, x1, y1 = build_center_roi_bounds(frame_height, frame_width, roi_fraction=roi_fraction)
+
+    roi_mask = np.zeros_like(depth_frame_mm, dtype=bool)
+    roi_mask[y0:y1, x0:x1] = True
+    valid_pixels = np.argwhere((depth_frame_mm > 0) & roi_mask)
+    if len(valid_pixels) < sample_count:
+        raise ValueError(
+            f"Requested {sample_count} point-cloud samples, but only {len(valid_pixels)} valid depth pixels were found in the ROI."
+        )
+
+    selected_indices = rng.choice(len(valid_pixels), size=sample_count, replace=False)
+    selected_yx = valid_pixels[selected_indices]
+    sampled_pixels = np.stack([selected_yx[:, 1], selected_yx[:, 0]], axis=1).astype(np.int32)
+    return sampled_pixels
+
+
+def frames_to_cotracker_tensor(torch_module, device, frames: np.ndarray):
+    rgb_frames = np.ascontiguousarray(frames[..., ::-1])
+    return (
+        torch_module.from_numpy(rgb_frames)
+        .to(device=device, dtype=torch_module.float32)
+        .permute(0, 3, 1, 2)[None]
+    )
+
+
+def track_sampled_pixels(
+    cotracker_context: CoTrackerContext,
+    frames: np.ndarray,
+    sampled_pixels: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    torch = cotracker_context.torch_module
+    cotracker = cotracker_context.model
+    device = cotracker_context.device
+
+    queries = np.concatenate(
+        [
+            np.zeros((len(sampled_pixels), 1), dtype=np.float32),
+            sampled_pixels.astype(np.float32),
+        ],
+        axis=1,
+    )[None]
+    query_tensor = torch.from_numpy(queries).to(device=device, dtype=torch.float32)
+
+    step = int(getattr(cotracker, "step", 8))
+    if len(frames) <= step:
+        init_chunk = frames_to_cotracker_tensor(torch, device, frames)
+        cotracker(
+            video_chunk=init_chunk,
+            is_first_step=True,
+            queries=query_tensor,
+            grid_size=0,
+        )
+        pred_tracks, pred_visibility = cotracker(video_chunk=init_chunk)
+    else:
+        window_frames: list[np.ndarray] = []
+        is_first_step = True
+        pred_tracks = None
+        pred_visibility = None
+
+        for frame_index, frame in enumerate(frames):
+            if frame_index % step == 0 and frame_index != 0:
+                chunk_frames = np.stack(window_frames[-step * 2 :], axis=0)
+                video_chunk = frames_to_cotracker_tensor(torch, device, chunk_frames)
+                pred_tracks, pred_visibility = cotracker(
+                    video_chunk=video_chunk,
+                    is_first_step=is_first_step,
+                    queries=query_tensor if is_first_step else None,
+                    grid_size=0,
+                )
+                is_first_step = False
+            window_frames.append(frame)
+
+        if window_frames:
+            remainder = (len(window_frames) - 1) % step
+            tail_length = remainder + step + 1
+            chunk_frames = np.stack(window_frames[-tail_length:], axis=0)
+            video_chunk = frames_to_cotracker_tensor(torch, device, chunk_frames)
+            pred_tracks, pred_visibility = cotracker(
+                video_chunk=video_chunk,
+                is_first_step=is_first_step,
+                queries=query_tensor if is_first_step else None,
+                grid_size=0,
+            )
+            if pred_tracks is None or pred_visibility is None:
+                pred_tracks, pred_visibility = cotracker(video_chunk=video_chunk)
+
+    if pred_tracks is None or pred_visibility is None:
+        raise RuntimeError("CoTracker did not produce any tracks for the sampled pixels.")
+
+    tracks = pred_tracks[0].detach().cpu().numpy().astype(np.float32)
+    visibility = pred_visibility[0].detach().cpu().numpy().astype(bool)
+    if tracks.shape[0] != len(frames):
+        raise ValueError(
+            f"Expected CoTracker to return {len(frames)} frames of tracks, but received {tracks.shape[0]}."
+        )
+    if tracks.shape[1] != len(sampled_pixels):
+        raise ValueError(
+            f"Expected {len(sampled_pixels)} sampled tracks, but received {tracks.shape[1]}."
+        )
+    return tracks, visibility
+
+
+def project_tracks_to_world_points(
+    tracks: np.ndarray,
+    visibility: np.ndarray,
+    depth_frame_paths: list[Path],
+    source_frame_indices: np.ndarray,
+    positions: np.ndarray,
+    orientations: np.ndarray,
+    camera_calibration: CameraCalibration,
+    expected_frame_shape: tuple[int, int],
+) -> np.ndarray:
+    frame_height, frame_width = expected_frame_shape
+    fx, fy, cx, cy = compute_camera_intrinsics(
+        frame_height=frame_height,
+        frame_width=frame_width,
+        fovy_degrees=camera_calibration.fovy_degrees,
+    )
+    world_points = np.full((len(tracks), tracks.shape[1], 3), np.nan, dtype=np.float32)
+
+    for frame_index in range(len(tracks)):
+        source_frame_index = int(source_frame_indices[frame_index])
+        if source_frame_index < 0 or source_frame_index >= len(depth_frame_paths):
+            raise IndexError(
+                f"Source frame index {source_frame_index} is out of range for {len(depth_frame_paths)} depth frames."
+            )
+
+        depth_frame_mm = read_depth_frame(depth_frame_paths[source_frame_index])
+        if depth_frame_mm.shape != expected_frame_shape:
+            raise ValueError(
+                f"Depth frame shape mismatch for {depth_frame_paths[source_frame_index]}: "
+                f"expected {expected_frame_shape}, got {depth_frame_mm.shape}."
+            )
+
+        rounded_xy = np.rint(tracks[frame_index]).astype(np.int64)
+        x_coords = rounded_xy[:, 0]
+        y_coords = rounded_xy[:, 1]
+        valid_mask = visibility[frame_index].astype(bool)
+        valid_mask &= x_coords >= 0
+        valid_mask &= x_coords < frame_width
+        valid_mask &= y_coords >= 0
+        valid_mask &= y_coords < frame_height
+
+        if not np.any(valid_mask):
+            continue
+
+        valid_x = x_coords[valid_mask]
+        valid_y = y_coords[valid_mask]
+        depth_values_mm = depth_frame_mm[valid_y, valid_x]
+        valid_depth_mask = depth_values_mm > 0
+        if not np.any(valid_depth_mask):
+            continue
+
+        valid_indices = np.flatnonzero(valid_mask)[valid_depth_mask]
+        depth_m = depth_values_mm[valid_depth_mask].astype(np.float32) / 1000.0
+        pixel_x = valid_x[valid_depth_mask].astype(np.float32)
+        pixel_y = valid_y[valid_depth_mask].astype(np.float32)
+
+        camera_points = np.empty((len(valid_indices), 3), dtype=np.float32)
+        camera_points[:, 0] = (pixel_x - cx) * depth_m / fx
+        camera_points[:, 1] = (pixel_y - cy) * depth_m / fy
+        camera_points[:, 2] = depth_m
+
+        orientation = np.asarray(orientations[frame_index], dtype=np.float32)
+        position = np.asarray(positions[frame_index], dtype=np.float32)
+
+        camera_world_position = position + camera_calibration.camera_offset_m @ orientation.T
+        world_points[frame_index, valid_indices] = camera_points @ orientation.T + camera_world_position
+
+    return world_points
+
+
+def write_chunked_point_clouds(
+    output_dir: Path,
+    output_episode_index: int,
+    sampled_pixels: np.ndarray,
+    point_clouds: np.ndarray,
+    chunk_size: int,
+) -> None:
+    point_clouds_dir = output_dir / "point_clouds"
+    point_clouds_dir.mkdir(parents=True, exist_ok=True)
+
+    episode_dir = point_clouds_dir / f"episode_{output_episode_index:04d}"
+    episode_dir.mkdir(parents=True, exist_ok=False)
+    np.save(episode_dir / "sampled_pixels.npy", sampled_pixels.astype(np.int32))
+
+    num_chunks = (len(point_clouds) + chunk_size - 1) // chunk_size
+    for chunk_index in range(num_chunks):
+        chunk_start = chunk_index * chunk_size
+        chunk_end = min(chunk_start + chunk_size, len(point_clouds))
+        chunk_path = episode_dir / f"chunk_{chunk_index + 1:04d}.npy"
+        np.save(chunk_path, point_clouds[chunk_start:chunk_end].astype(np.float32))
+
+
+def create_depth_point_clouds(
+    output_dir: Path,
+    output_episode_index: int,
+    processing_result: EpisodeProcessingResult,
+    chunk_size: int,
+    pointcloud_samples: int,
+    pointcloud_roi_fraction: float,
+    pointcloud_seed: int,
+    cotracker_context: CoTrackerContext,
+    camera_calibration: CameraCalibration,
+) -> bool:
+    depth_frame_paths = discover_depth_frame_paths(processing_result.aligned_episode.source_dir)
+    if depth_frame_paths is None:
+        return False
+
+    aligned_episode = processing_result.aligned_episode
+    processed_episode = processing_result.processed_episode
+    if len(aligned_episode.frames) == 0:
+        return False
+
+    first_source_frame_index = int(aligned_episode.source_frame_indices[0])
+    if first_source_frame_index >= len(depth_frame_paths):
+        raise IndexError(
+            f"First aligned frame index {first_source_frame_index} exceeds the available depth frames ({len(depth_frame_paths)})."
+        )
+
+    first_depth_frame = read_depth_frame(depth_frame_paths[first_source_frame_index])
+    rgb_frame_shape = tuple(aligned_episode.frames[0].shape[:2])
+    if first_depth_frame.shape != rgb_frame_shape:
+        raise ValueError(
+            f"Aligned RGB frame shape {rgb_frame_shape} does not match depth frame shape {first_depth_frame.shape}."
+        )
+
+    rng = np.random.default_rng(int(pointcloud_seed) + int(output_episode_index))
+    sampled_pixels = sample_query_pixels(
+        first_depth_frame,
+        sample_count=pointcloud_samples,
+        roi_fraction=pointcloud_roi_fraction,
+        rng=rng,
+    )
+
+    tracks, visibility = track_sampled_pixels(
+        cotracker_context=cotracker_context,
+        frames=aligned_episode.frames,
+        sampled_pixels=sampled_pixels,
+    )
+    pruned_tracks = tracks[processing_result.prune_keep_mask]
+    pruned_visibility = visibility[processing_result.prune_keep_mask]
+
+    point_clouds = project_tracks_to_world_points(
+        tracks=pruned_tracks,
+        visibility=pruned_visibility,
+        depth_frame_paths=depth_frame_paths,
+        source_frame_indices=processed_episode.source_frame_indices,
+        positions=processed_episode.positions,
+        orientations=processed_episode.orientations,
+        camera_calibration=camera_calibration,
+        expected_frame_shape=rgb_frame_shape,
+    )
+
+    write_chunked_point_clouds(
+        output_dir=output_dir,
+        output_episode_index=output_episode_index,
+        sampled_pixels=sampled_pixels,
+        point_clouds=point_clouds,
+        chunk_size=chunk_size,
+    )
+    return True
+
+
 def extract_dataset(
     input_dir: Path,
     output_dir: Path,
@@ -502,21 +960,49 @@ def extract_dataset(
     trim_end: int,
     vel_thresh: float,
     stationary_window: int,
+    pointcloud_samples: int,
+    pointcloud_roi_fraction: float,
+    pointcloud_seed: int,
 ) -> None:
     episode_dirs = discover_episode_dirs(input_dir)
     prepare_output_dir(output_dir)
 
-    processed_episodes = []
+    processed_episodes: list[ProcessedEpisode] = []
+    cotracker_context: CoTrackerContext | None = None
+    camera_calibration: CameraCalibration | None = None
+    pointcloud_episode_count = 0
+
     for episode_dir in episode_dirs:
-        processed_episode = process_episode(
+        processing_result = process_episode(
             episode_dir,
             trim_start=trim_start,
             trim_end=trim_end,
             vel_thresh=vel_thresh,
             stationary_window=stationary_window,
         )
-        if processed_episode is not None:
-            processed_episodes.append(processed_episode)
+        if processing_result is None:
+            continue
+
+        output_episode_index = len(processed_episodes) + 1
+        if discover_depth_frame_paths(processing_result.aligned_episode.source_dir) is not None:
+            if cotracker_context is None:
+                cotracker_context = load_cotracker_context()
+            if camera_calibration is None:
+                camera_calibration = load_camera_calibration()
+            if create_depth_point_clouds(
+                output_dir=output_dir,
+                output_episode_index=output_episode_index,
+                processing_result=processing_result,
+                chunk_size=chunk_size,
+                pointcloud_samples=pointcloud_samples,
+                pointcloud_roi_fraction=pointcloud_roi_fraction,
+                pointcloud_seed=pointcloud_seed,
+                cotracker_context=cotracker_context,
+                camera_calibration=camera_calibration,
+            ):
+                pointcloud_episode_count += 1
+
+        processed_episodes.append(processing_result.processed_episode)
 
     if not processed_episodes:
         raise RuntimeError("No episodes survived extraction. Nothing was written.")
@@ -527,6 +1013,8 @@ def extract_dataset(
 
     print(f"Wrote {len(processed_episodes)} episodes and {total_rows} rows to {output_dir}")
     print(f"episode_ends={episode_ends.tolist()}")
+    if pointcloud_episode_count:
+        print(f"Wrote chunked point clouds for {pointcloud_episode_count} depth-enabled episodes.")
 
 
 def parse_args() -> argparse.Namespace:
@@ -573,6 +1061,24 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Trailing window size used to classify stationary frames.",
     )
+    parser.add_argument(
+        "--pointcloud-samples",
+        default=DEFAULT_POINTCLOUD_SAMPLES,
+        type=int,
+        help="Number of sparse RGB pixels to sample and track for point-cloud extraction.",
+    )
+    parser.add_argument(
+        "--pointcloud-roi-fraction",
+        default=DEFAULT_POINTCLOUD_ROI_FRACTION,
+        type=float,
+        help="Side-length fraction of the centered square ROI used for sparse point-cloud sampling.",
+    )
+    parser.add_argument(
+        "--pointcloud-seed",
+        default=DEFAULT_POINTCLOUD_SEED,
+        type=int,
+        help="Base seed used to deterministically sample sparse point-cloud pixels per episode.",
+    )
     return parser.parse_args()
 
 
@@ -585,6 +1091,10 @@ def main() -> None:
         raise ValueError("--chunk-size must be positive")
     if args.stationary_window <= 0:
         raise ValueError("--stationary-window must be positive")
+    if args.pointcloud_samples <= 0:
+        raise ValueError("--pointcloud-samples must be positive")
+    if not (0.0 < float(args.pointcloud_roi_fraction) <= 1.0):
+        raise ValueError("--pointcloud-roi-fraction must be in the interval (0, 1].")
 
     extract_dataset(
         input_dir=input_dir,
@@ -594,6 +1104,9 @@ def main() -> None:
         trim_end=int(args.trim_end),
         vel_thresh=float(args.vel_thresh),
         stationary_window=int(args.stationary_window),
+        pointcloud_samples=int(args.pointcloud_samples),
+        pointcloud_roi_fraction=float(args.pointcloud_roi_fraction),
+        pointcloud_seed=int(args.pointcloud_seed),
     )
 
 

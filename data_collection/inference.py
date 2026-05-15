@@ -66,8 +66,8 @@ class Inference:
         self.lowdim_buffer_size = self._resolve_buffer_size(self.lowdim_cfg, "lowdim")
         self.camera_buffer_size = self._resolve_buffer_size(self.visual_cfg, "visual")
 
-        self.lowdim_specs = self._parse_source_specs(self.lowdim_cfg)
-        self.visual_specs = self._parse_source_specs(self.visual_cfg)
+        self.lowdim_specs = self._parse_source_specs(self.lowdim_cfg, "lowdim")
+        self.visual_specs = self._parse_source_specs(self.visual_cfg, "visual")
         self.primary_camera_key = next(iter(self.visual_specs))
 
         self.obs_window = int(self.lowdim_specs["eef_pos"]["obs_window"])
@@ -85,8 +85,6 @@ class Inference:
             raise ValueError("action_frequency_hz must be positive.")
         if self.num_action_steps <= 0:
             raise ValueError("num_action_steps must be positive.")
-        if self.num_action_steps > self.chunk_size:
-            raise ValueError("num_action_steps must be <= robot.action.window.")
         if self.interpolator_frequency_hz <= 0.0:
             raise ValueError("interpolator_frequency_hz must be positive.")
         if self.blend_duration < 0.0:
@@ -99,6 +97,10 @@ class Inference:
 
         self.model = self._load_model()
         self.chunk_size = int(self.model.config.chunk_size)
+
+        if self.num_action_steps > self.chunk_size:
+            raise ValueError("num_action_steps must be <= robot.action.window.")
+        
         self.desired_position_key, self.desired_orientation_key = self._make_desired_pose_keys(self.contract)
 
         self.robot_observer: RobotObserver | None = None
@@ -122,12 +124,26 @@ class Inference:
         self._background_error: BaseException | None = None
         self._background_error_lock = threading.Lock()
 
+    def warm_up_model(self, num_calls: int = 20) -> None:
+        if num_calls <= 0:
+            return
+
+        last_k = max(self.lowdim_history_len, self.visual_history_len)
+        for _ in range(int(num_calls)):
+            obs_dict = self.get_obs(last_k=last_k)
+            start_time = time.monotonic()
+            with torch.inference_mode():
+                self.model(obs_dict)
+            inference_time = time.monotonic() - start_time
+            print(f"Called model : {inference_time:.6f}", flush=True)
+
     def run(self) -> None:
         try:
             self._launch_observers()
             self._wait_for_observers()
             self.interpolator.start()
             self._start_keyboard_listener()
+            self.warm_up_model()
             self._start_inference_thread()
 
             print(f"Inference ready with contract {self.contract_path}", flush=True)
@@ -431,24 +447,92 @@ class Inference:
                 raise ValueError(
                     f"`robot.data_sources.{source_name}.keys.{key_name}` must map to a dictionary."
                 )
-            obs_window = key_cfg.get("obs_window")
-            if obs_window is None:
-                raise ValueError(
-                    f"`robot.data_sources.{source_name}.keys.{key_name}.obs_window` is required."
-                )
-            max_obs_window = max(max_obs_window, int(obs_window))
+            obs_window = self._resolve_source_key_int_field(
+                source_cfg,
+                source_name,
+                key_name,
+                key_cfg,
+                "obs_window",
+            )
+            max_obs_window = max(max_obs_window, obs_window)
         return max(1, 3 * max_obs_window)
 
     @staticmethod
-    def _parse_source_specs(source_cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    def _parse_source_specs(
+        source_cfg: dict[str, Any],
+        source_name: str,
+    ) -> dict[str, dict[str, Any]]:
         parsed = {}
         for entry in source_cfg["keys"]:
             key_name, key_cfg = next(iter(entry.items()))
             parsed[key_name] = {
-                "obs_window": int(key_cfg["obs_window"]),
-                "obs_dss": int(key_cfg["obs_dss"]),
+                "obs_window": Inference._resolve_source_key_int_field(
+                    source_cfg,
+                    source_name,
+                    key_name,
+                    key_cfg,
+                    "obs_window",
+                ),
+                "obs_dss": Inference._resolve_source_key_int_field(
+                    source_cfg,
+                    source_name,
+                    key_name,
+                    key_cfg,
+                    "obs_dss",
+                ),
             }
         return parsed
+
+    @staticmethod
+    def _resolve_source_key_int_field(
+        source_cfg: dict[str, Any],
+        source_name: str,
+        key_name: str,
+        key_cfg: dict[str, Any],
+        field_name: str,
+    ) -> int:
+        field_value = key_cfg.get(field_name)
+        if field_value is not None:
+            return int(field_value)
+
+        align_to = key_cfg.get("align_to")
+        if align_to is None:
+            raise ValueError(
+                f"`robot.data_sources.{source_name}.keys.{key_name}.{field_name}` is required."
+            )
+
+        aligned_key_cfg = Inference._lookup_source_key_cfg(source_cfg, source_name, str(align_to))
+        aligned_field_value = aligned_key_cfg.get(field_name)
+        if aligned_field_value is None:
+            raise ValueError(
+                f"`robot.data_sources.{source_name}.keys.{key_name}` aligns to '{align_to}', "
+                f"but `{field_name}` is missing there as well."
+            )
+
+        return int(aligned_field_value)
+
+    @staticmethod
+    def _lookup_source_key_cfg(
+        source_cfg: dict[str, Any],
+        source_name: str,
+        key_name: str,
+    ) -> dict[str, Any]:
+        for key_entry in source_cfg["keys"]:
+            if not isinstance(key_entry, dict) or len(key_entry) != 1:
+                continue
+
+            candidate_key_name, candidate_key_cfg = next(iter(key_entry.items()))
+            if candidate_key_name != key_name:
+                continue
+            if not isinstance(candidate_key_cfg, dict):
+                raise ValueError(
+                    f"`robot.data_sources.{source_name}.keys.{candidate_key_name}` must map to a dictionary."
+                )
+            return candidate_key_cfg
+
+        raise ValueError(
+            f"`robot.data_sources.{source_name}.keys.{key_name}` was not found in the universal contract."
+        )
 
     @staticmethod
     def _resolve_history_length(source_specs: dict[str, dict[str, Any]]) -> int:
@@ -490,12 +574,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-path", required=True, type=str)
     parser.add_argument("--checkpoint-path", required=True, type=str)
     parser.add_argument("--act-config", required=True, type=str)
-    parser.add_argument("--action-frequency-hz", required=True, type=float)
-    parser.add_argument("--num-action-steps", required=True, type=int)
+    parser.add_argument("--action-frequency-hz", required=False, type=float, default = 10)
+    parser.add_argument("--num-action-steps", required=False, type=int, default=4)
     parser.add_argument("--interpolator-frequency-hz", default=DEFAULT_INTERPOLATOR_FREQUENCY_HZ, type=float)
     parser.add_argument("--blend-duration", default=DEFAULT_BLEND_DURATION, type=float)
-    parser.add_argument("--device", default=None, type=str)
+    parser.add_argument("--device", default=get_device(), type=str)
     return parser.parse_args()
+
+def get_device():
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    elif torch.cuda.is_available():
+        return torch.device("cuda")
+    else:
+        return torch.device("cpu")
 
 
 def main() -> None:

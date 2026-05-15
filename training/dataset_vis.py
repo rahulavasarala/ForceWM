@@ -239,6 +239,7 @@ if __name__ == "__main__":
         args.dataset_path,
         universal_contract=args.universal_contract,
     )
+    dataset.apply_normalizer = False
     dataset.action_type = "absolute"
     visualize_dataset(dataset, args.num_samples)
 

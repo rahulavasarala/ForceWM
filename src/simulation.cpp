@@ -23,10 +23,12 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "SaiModel.h"
 #include "SaiPrimitives.h"
+#include "particle_filter/ForceSpaceParticleFilter.h"
 
 #include "redis/RedisClient.h"
 #include "redis_keys.h"
@@ -72,7 +74,7 @@ bool is_data_collection = false;
 
 // Initialization variables for robot control ---------------------
 
-Vector3d START_POS = Vector3d(0.4, 0.0, 0.36);
+Vector3d START_POS = Vector3d(0.4, 0.0, 0.39);
 Matrix3d START_ORIENTATION = (Matrix3d() << 
     1,  0,  0,
     0, -1,  0,
@@ -81,6 +83,13 @@ Matrix3d START_ORIENTATION = (Matrix3d() <<
 std::shared_ptr<SaiModel::SaiModel> robot;
 std::shared_ptr<SaiPrimitives::MotionForceTask> motion_force_task;
 std::shared_ptr<SaiPrimitives::JointTask> joint_task;
+
+// Init the force space particle filter ---- 
+std::shared_ptr<ForceWM::ForceSpaceParticleFilter> force_space_particle_filter;
+std::queue<int> force_dimension_queue;
+int QUEUE_SIZE = 10;
+Matrix3d sigma_force = Matrix3d::Zero();
+Matrix3d sigma_motion = Matrix3d::Identity();
 
 std::shared_ptr<SaiPrimitives::HapticDeviceController> haptic_controller;
 SaiPrimitives::HapticControllerInput haptic_input;
@@ -102,10 +111,34 @@ int ee_sensor_site_id = -1;
 std::atomic<bool> shutdown_requested = false;
 std::atomic<bool> reset_requested = false;
 
+enum class VisualStreamType {
+  kRgb,
+  kDepth,
+};
+
+struct DepthStreamConfig {
+  std::string visual_name;
+  std::string redis_key;
+  std::string metadata_redis_key;
+  std::string encoding = "png16";
+  std::string unit = "mm";
+  std::string align_to_visual_name;
+  int width = 640;
+  int height = 480;
+  int channels = 1;
+  std::vector<float> raw_depth_buffer;
+  std::vector<float> flipped_depth_buffer;
+  std::vector<std::uint16_t> depth_mm_buffer;
+  std::vector<unsigned char> encoded_depth_buffer;
+};
+
 struct CameraStreamConfig {
+  std::string visual_name;
   std::string redis_key;
   std::string metadata_redis_key;
   std::string mujoco_camera_name;
+  std::string encoding = "jpeg";
+  VisualStreamType type = VisualStreamType::kRgb;
   int model_camera_id = -1;
   int width = 640;
   int height = 480;
@@ -116,6 +149,7 @@ struct CameraStreamConfig {
   std::vector<unsigned char> flipped_rgb_buffer;
   std::vector<unsigned char> bgr_buffer;
   std::vector<unsigned char> encoded_image_buffer;
+  std::optional<DepthStreamConfig> aligned_depth;
   std::uint64_t publish_count = 0;
   std::uint64_t dropped_publish_slots = 0;
   double total_scene_update_seconds = 0.0;
@@ -124,9 +158,28 @@ struct CameraStreamConfig {
   double total_readback_seconds = 0.0;
   double total_flip_seconds = 0.0;
   double total_color_convert_seconds = 0.0;
-  double total_jpeg_encode_seconds = 0.0;
+  double total_frame_encode_seconds = 0.0;
   double total_redis_publish_seconds = 0.0;
   double total_publish_seconds = 0.0;
+};
+
+struct VisualContractEntry {
+  std::string visual_name;
+  VisualStreamType type = VisualStreamType::kRgb;
+  std::string source = "sim";
+  std::string redis_key;
+  std::string metadata_redis_key;
+  std::string mujoco_camera_name;
+  std::string encoding = "jpeg";
+  std::string unit;
+  std::string align_to_visual_name;
+  int width = 640;
+  int height = 480;
+  int channels = 3;
+  double fps = 0.0;
+  bool has_explicit_dimensions = false;
+  bool has_explicit_channels = false;
+  bool has_explicit_fps = false;
 };
 
 struct SimulationContractConfig {
@@ -427,6 +480,10 @@ void print_camera_publish_summary() {
   for (const auto& camera : simulation_contract.cameras) {
     std::cout << "  Camera `" << camera.mujoco_camera_name << "` -> `"
               << camera.redis_key << "`\n";
+    if (camera.aligned_depth) {
+      std::cout << "    Aligned depth -> `" << camera.aligned_depth->redis_key
+                << "`\n";
+    }
 
     if (camera.publish_count == 0) {
       std::cout << "    No images published.\n";
@@ -446,8 +503,8 @@ void print_camera_publish_summary() {
         1000.0 * camera.total_flip_seconds / publish_count;
     const double avg_color_convert_ms =
         1000.0 * camera.total_color_convert_seconds / publish_count;
-    const double avg_jpeg_ms =
-        1000.0 * camera.total_jpeg_encode_seconds / publish_count;
+    const double avg_frame_encode_ms =
+        1000.0 * camera.total_frame_encode_seconds / publish_count;
     const double avg_redis_ms =
         1000.0 * camera.total_redis_publish_seconds / publish_count;
     const double avg_total_ms =
@@ -464,7 +521,8 @@ void print_camera_publish_summary() {
     std::cout << "    Avg image flip time: " << avg_flip_ms << " ms\n";
     std::cout << "    Avg color convert time: " << avg_color_convert_ms
               << " ms\n";
-    std::cout << "    Avg JPEG encode time: " << avg_jpeg_ms << " ms\n";
+    std::cout << "    Avg frame encode time: " << avg_frame_encode_ms
+              << " ms\n";
     std::cout << "    Avg Redis publish time: " << avg_redis_ms << " ms\n";
     std::cout << "    Avg total publish time: " << avg_total_ms << " ms\n";
   }
@@ -534,17 +592,52 @@ std::string make_redis_key(const std::string& prefix,
   return prefix + "::" + suffix;
 }
 
+std::string lowercase_copy(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(),
+                 [](unsigned char character) {
+                   return static_cast<char>(std::tolower(character));
+                 });
+  return value;
+}
+
+VisualStreamType parse_visual_stream_type(const std::string& visual_type,
+                                          const std::string& context) {
+  const std::string normalized_type = lowercase_copy(visual_type);
+  if (normalized_type == "rgb") {
+    return VisualStreamType::kRgb;
+  }
+  if (normalized_type == "depth") {
+    return VisualStreamType::kDepth;
+  }
+
+  throw std::runtime_error(
+      "Unsupported visual `type: " + visual_type + "` in " + context +
+      ". simulation.cpp only supports `rgb` and `depth` visual streams.");
+}
+
+const char* visual_stream_type_name(const VisualStreamType type) {
+  switch (type) {
+    case VisualStreamType::kRgb:
+      return "rgb";
+    case VisualStreamType::kDepth:
+      return "depth";
+  }
+
+  return "unknown";
+}
+
 double wall_time_now_seconds() {
   return std::chrono::duration<double>(
              std::chrono::system_clock::now().time_since_epoch())
       .count();
 }
 
-void flip_rgb_image_vertically(const std::vector<unsigned char>& source,
-                               std::vector<unsigned char>& destination,
-                               int width,
-                               int height,
-                               int channels) {
+template <typename T>
+void flip_image_vertically(const std::vector<T>& source,
+                           std::vector<T>& destination,
+                           int width,
+                           int height,
+                           int channels) {
   const size_t row_stride = static_cast<size_t>(width) * channels;
   destination.resize(source.size());
 
@@ -591,14 +684,50 @@ void publish_snapshot_from_sim_state(const std::uint64_t reset_epoch) {
   snapshot_broker->publish_from_sim(d, reset_epoch, wall_time_now_seconds());
 }
 
-std::string make_camera_metadata_json(const CameraStreamConfig& camera,
-                                      const RenderSnapshot& snapshot) {
+void convert_mujoco_depth_to_millimeters(
+    const std::vector<float>& source_depth,
+    std::vector<std::uint16_t>& destination_depth_mm,
+    const float near_clip_m,
+    const float far_clip_m) {
+  destination_depth_mm.resize(source_depth.size());
+  const double clip_ratio = 1.0 - static_cast<double>(near_clip_m / far_clip_m);
+
+  for (size_t depth_index = 0; depth_index < source_depth.size();
+       ++depth_index) {
+    const float raw_depth = source_depth[depth_index];
+    std::uint16_t depth_mm = 0;
+
+    if (std::isfinite(raw_depth) && raw_depth >= 0.0f && raw_depth < 1.0f) {
+      const double denominator =
+          1.0 - static_cast<double>(raw_depth) * clip_ratio;
+      if (denominator > 1e-12) {
+        const double depth_m =
+            static_cast<double>(near_clip_m) / denominator;
+        const double depth_mm_value = depth_m * 1000.0;
+        if (std::isfinite(depth_mm_value) && depth_mm_value > 0.0 &&
+            depth_mm_value <=
+                static_cast<double>(std::numeric_limits<std::uint16_t>::max())) {
+          depth_mm = static_cast<std::uint16_t>(std::llround(depth_mm_value));
+        }
+      }
+    }
+
+    destination_depth_mm[depth_index] = depth_mm;
+  }
+}
+
+std::string make_rgb_camera_metadata_json(const CameraStreamConfig& camera,
+                                          const RenderSnapshot& snapshot) {
   std::ostringstream metadata_stream;
   metadata_stream << std::fixed << std::setprecision(17);
   metadata_stream << '{';
   metadata_stream << '"' << "seq" << '"' << ':' << snapshot.seq;
   metadata_stream << ',' << '"' << "reset_epoch" << '"' << ':'
                   << snapshot.reset_epoch;
+  metadata_stream << ',' << '"' << "contract_key" << '"' << ':' << '"'
+                  << camera.visual_name << '"';
+  metadata_stream << ',' << '"' << "type" << '"' << ':' << '"'
+                  << visual_stream_type_name(camera.type) << '"';
   metadata_stream << ',' << '"' << "camera_name" << '"' << ':' << '"'
                   << camera.mujoco_camera_name << '"';
   metadata_stream << ',' << '"' << "sim_time_s" << '"' << ':'
@@ -611,8 +740,46 @@ std::string make_camera_metadata_json(const CameraStreamConfig& camera,
   metadata_stream << ',' << '"' << "channels" << '"' << ':'
                   << camera.channels;
   metadata_stream << ',' << '"' << "encoding" << '"' << ':' << '"'
-                  << "jpeg" << '"';
-  metadata_stream << ',' << '"' << "jpeg_quality" << '"' << ':' << 90;
+                  << camera.encoding << '"';
+  if (camera.encoding == "jpeg") {
+    metadata_stream << ',' << '"' << "jpeg_quality" << '"' << ':' << 90;
+  }
+  metadata_stream << ',' << '"' << "dropped_slots_total" << '"' << ':'
+                  << camera.dropped_publish_slots;
+  metadata_stream << '}';
+  return metadata_stream.str();
+}
+
+std::string make_depth_camera_metadata_json(const CameraStreamConfig& camera,
+                                            const DepthStreamConfig& depth_stream,
+                                            const RenderSnapshot& snapshot) {
+  std::ostringstream metadata_stream;
+  metadata_stream << std::fixed << std::setprecision(17);
+  metadata_stream << '{';
+  metadata_stream << '"' << "seq" << '"' << ':' << snapshot.seq;
+  metadata_stream << ',' << '"' << "reset_epoch" << '"' << ':'
+                  << snapshot.reset_epoch;
+  metadata_stream << ',' << '"' << "contract_key" << '"' << ':' << '"'
+                  << depth_stream.visual_name << '"';
+  metadata_stream << ',' << '"' << "type" << '"' << ':' << '"'
+                  << visual_stream_type_name(VisualStreamType::kDepth) << '"';
+  metadata_stream << ',' << '"' << "camera_name" << '"' << ':' << '"'
+                  << camera.mujoco_camera_name << '"';
+  metadata_stream << ',' << '"' << "align_to" << '"' << ':' << '"'
+                  << depth_stream.align_to_visual_name << '"';
+  metadata_stream << ',' << '"' << "sim_time_s" << '"' << ':'
+                  << snapshot.sim_time;
+  metadata_stream << ',' << '"' << "publish_wall_time_s" << '"' << ':'
+                  << snapshot.publish_wall_time_s;
+  metadata_stream << ',' << '"' << "width" << '"' << ':' << depth_stream.width;
+  metadata_stream << ',' << '"' << "height" << '"' << ':'
+                  << depth_stream.height;
+  metadata_stream << ',' << '"' << "channels" << '"' << ':'
+                  << depth_stream.channels;
+  metadata_stream << ',' << '"' << "encoding" << '"' << ':' << '"'
+                  << depth_stream.encoding << '"';
+  metadata_stream << ',' << '"' << "unit" << '"' << ':' << '"'
+                  << depth_stream.unit << '"';
   metadata_stream << ',' << '"' << "dropped_slots_total" << '"' << ':'
                   << camera.dropped_publish_slots;
   metadata_stream << '}';
@@ -664,6 +831,10 @@ SimulationContractConfig load_simulation_contract(const fs::path& contract_path)
     return config;
   }
 
+  std::vector<VisualContractEntry> visual_entries;
+  visual_entries.reserve(camera_keys.size());
+  size_t depth_stream_count = 0;
+
   for (const auto& camera_entry : camera_keys) {
     if (!camera_entry.IsMap() || camera_entry.size() != 1) {
       throw std::runtime_error(
@@ -678,43 +849,218 @@ SimulationContractConfig load_simulation_contract(const fs::path& contract_path)
     const std::string camera_context =
         "camera `" + visual_name + "` in " + contract_context;
 
-    CameraStreamConfig camera;
+    VisualContractEntry visual_entry;
+    visual_entry.visual_name = visual_name;
     const std::string redis_suffix =
         node_or<std::string>(camera_cfg["redis"], visual_name);
-    camera.redis_key = make_redis_key(config.prefix, redis_suffix);
-    camera.metadata_redis_key = camera.redis_key + "::meta";
-    camera.mujoco_camera_name =
-        require_string(camera_cfg, "mujoco_camera_name", camera_context);
-    camera.fps = node_or<double>(camera_cfg["fps"], default_camera_fps);
+    visual_entry.redis_key = make_redis_key(config.prefix, redis_suffix);
+    visual_entry.metadata_redis_key = visual_entry.redis_key + "::meta";
+    visual_entry.type = parse_visual_stream_type(
+        node_or<std::string>(camera_cfg["type"], "rgb"), camera_context);
+    visual_entry.source =
+        lowercase_copy(node_or<std::string>(camera_cfg["source"], "sim"));
+    visual_entry.encoding = lowercase_copy(node_or<std::string>(
+        camera_cfg["encoding"],
+        visual_entry.type == VisualStreamType::kDepth ? "png16" : "jpeg"));
+    visual_entry.fps = node_or<double>(camera_cfg["fps"], default_camera_fps);
+    visual_entry.has_explicit_fps = static_cast<bool>(camera_cfg["fps"]);
+
+    if (visual_entry.source != "sim") {
+      throw std::runtime_error(
+          "simulation.cpp only supports `source: sim`, but camera `" +
+          visual_name + "` sets `source: " + visual_entry.source + "`.");
+    }
 
     const YAML::Node dim_cfg = camera_cfg["dim"];
     if (dim_cfg && dim_cfg.IsSequence()) {
       if (dim_cfg.size() >= 2) {
-        camera.width = dim_cfg[0].as<int>();
-        camera.height = dim_cfg[1].as<int>();
+        visual_entry.width = dim_cfg[0].as<int>();
+        visual_entry.height = dim_cfg[1].as<int>();
+        visual_entry.has_explicit_dimensions = true;
       }
       if (dim_cfg.size() >= 3) {
-        camera.channels = dim_cfg[2].as<int>();
+        visual_entry.channels = dim_cfg[2].as<int>();
+        visual_entry.has_explicit_channels = true;
       }
     }
 
-    if (camera.channels != 3) {
-      throw std::runtime_error("Camera '" + visual_name + "' requests " +
-                               std::to_string(camera.channels) +
-                               " channels, but simulation publishing only "
-                               "supports RGB cameras right now.");
-    }
-    if (camera.fps <= 0.0) {
+    if (visual_entry.fps <= 0.0) {
       throw std::runtime_error("Camera '" + visual_name +
                                "' has a non-positive fps in " +
                                contract_path.string() + ".");
     }
+
+    if (visual_entry.type == VisualStreamType::kRgb) {
+      visual_entry.channels = visual_entry.has_explicit_channels
+                                  ? visual_entry.channels
+                                  : 3;
+      if (visual_entry.channels != 3) {
+        throw std::runtime_error("Camera '" + visual_name + "' requests " +
+                                 std::to_string(visual_entry.channels) +
+                                 " channels, but simulation publishing only "
+                                 "supports RGB cameras right now.");
+      }
+      if (visual_entry.encoding != "jpeg") {
+        throw std::runtime_error("Camera '" + visual_name +
+                                 "' requests encoding `" +
+                                 visual_entry.encoding +
+                                 "`, but simulation publishing only supports "
+                                 "JPEG for RGB streams right now.");
+      }
+      visual_entry.mujoco_camera_name =
+          require_string(camera_cfg, "mujoco_camera_name", camera_context);
+    } else {
+      ++depth_stream_count;
+      visual_entry.channels = visual_entry.has_explicit_channels
+                                  ? visual_entry.channels
+                                  : 1;
+      if (visual_entry.channels != 1) {
+        throw std::runtime_error("Depth stream '" + visual_name +
+                                 "' requests " +
+                                 std::to_string(visual_entry.channels) +
+                                 " channels, but simulation depth publishing "
+                                 "only supports single-channel depth.");
+      }
+      if (visual_entry.encoding != "png16") {
+        throw std::runtime_error("Depth stream '" + visual_name +
+                                 "' requests encoding `" +
+                                 visual_entry.encoding +
+                                 "`, but simulation depth publishing only "
+                                 "supports png16.");
+      }
+      visual_entry.unit =
+          lowercase_copy(require_string(camera_cfg, "unit", camera_context));
+      if (visual_entry.unit != "mm") {
+        throw std::runtime_error("Depth stream '" + visual_name +
+                                 "' requests unit `" + visual_entry.unit +
+                                 "`, but simulation depth publishing only "
+                                 "supports millimeters (`mm`).");
+      }
+      visual_entry.align_to_visual_name =
+          require_string(camera_cfg, "align_to", camera_context);
+    }
+
+    visual_entries.push_back(std::move(visual_entry));
+  }
+
+  if (depth_stream_count > 1) {
+    throw std::runtime_error(
+        "simulation.cpp currently supports at most one aligned depth stream.");
+  }
+
+  std::unordered_map<std::string, const VisualContractEntry*> visual_entry_by_name;
+  visual_entry_by_name.reserve(visual_entries.size());
+  for (const auto& visual_entry : visual_entries) {
+    const auto [entry_it, inserted] =
+        visual_entry_by_name.emplace(visual_entry.visual_name, &visual_entry);
+    if (!inserted) {
+      throw std::runtime_error("Duplicate visual key `" +
+                               visual_entry.visual_name + "` in " +
+                               contract_path.string() + ".");
+    }
+  }
+
+  std::unordered_map<std::string, DepthStreamConfig> aligned_depth_by_rgb_key;
+  for (const auto& visual_entry : visual_entries) {
+    if (visual_entry.type != VisualStreamType::kDepth) {
+      continue;
+    }
+
+    const auto aligned_rgb_it =
+        visual_entry_by_name.find(visual_entry.align_to_visual_name);
+    if (aligned_rgb_it == visual_entry_by_name.end()) {
+      throw std::runtime_error("Depth stream `" + visual_entry.visual_name +
+                               "` aligns to `" +
+                               visual_entry.align_to_visual_name +
+                               "`, but that RGB stream was not found in " +
+                               contract_path.string() + ".");
+    }
+
+    const VisualContractEntry& aligned_rgb_entry = *aligned_rgb_it->second;
+    if (aligned_rgb_entry.type != VisualStreamType::kRgb) {
+      throw std::runtime_error("Depth stream `" + visual_entry.visual_name +
+                               "` aligns to `" +
+                               visual_entry.align_to_visual_name +
+                               "`, but that stream is not RGB.");
+    }
+    if (visual_entry.has_explicit_fps &&
+        std::abs(visual_entry.fps - aligned_rgb_entry.fps) > 1e-9) {
+      throw std::runtime_error("Depth stream `" + visual_entry.visual_name +
+                               "` must reuse the aligned RGB fps (" +
+                               std::to_string(aligned_rgb_entry.fps) +
+                               "), but it requests " +
+                               std::to_string(visual_entry.fps) + ".");
+    }
+
+    DepthStreamConfig depth_stream;
+    depth_stream.visual_name = visual_entry.visual_name;
+    depth_stream.redis_key = visual_entry.redis_key;
+    depth_stream.metadata_redis_key = visual_entry.metadata_redis_key;
+    depth_stream.encoding = visual_entry.encoding;
+    depth_stream.unit = visual_entry.unit;
+    depth_stream.align_to_visual_name = visual_entry.align_to_visual_name;
+    depth_stream.width = visual_entry.has_explicit_dimensions
+                             ? visual_entry.width
+                             : aligned_rgb_entry.width;
+    depth_stream.height = visual_entry.has_explicit_dimensions
+                              ? visual_entry.height
+                              : aligned_rgb_entry.height;
+    depth_stream.channels = visual_entry.channels;
+
+    if (depth_stream.width != aligned_rgb_entry.width ||
+        depth_stream.height != aligned_rgb_entry.height) {
+      throw std::runtime_error("Depth stream `" + visual_entry.visual_name +
+                               "` must match the aligned RGB dimensions (" +
+                               std::to_string(aligned_rgb_entry.width) + "x" +
+                               std::to_string(aligned_rgb_entry.height) +
+                               "), but it requests " +
+                               std::to_string(depth_stream.width) + "x" +
+                               std::to_string(depth_stream.height) + ".");
+    }
+
+    if (!aligned_depth_by_rgb_key
+             .emplace(visual_entry.align_to_visual_name, std::move(depth_stream))
+             .second) {
+      throw std::runtime_error(
+          "simulation.cpp only supports one depth stream aligned to an RGB key.");
+    }
+  }
+
+  for (const auto& visual_entry : visual_entries) {
+    if (visual_entry.type != VisualStreamType::kRgb) {
+      continue;
+    }
+
+    CameraStreamConfig camera;
+    camera.visual_name = visual_entry.visual_name;
+    camera.redis_key = visual_entry.redis_key;
+    camera.metadata_redis_key = visual_entry.metadata_redis_key;
+    camera.mujoco_camera_name = visual_entry.mujoco_camera_name;
+    camera.encoding = visual_entry.encoding;
+    camera.type = visual_entry.type;
+    camera.width = visual_entry.width;
+    camera.height = visual_entry.height;
+    camera.channels = visual_entry.channels;
+    camera.fps = visual_entry.fps;
 
     const size_t image_size =
         static_cast<size_t>(camera.width) * camera.height * camera.channels;
     camera.rgb_buffer.resize(image_size);
     camera.flipped_rgb_buffer.resize(image_size);
     camera.bgr_buffer.resize(image_size);
+
+    const auto aligned_depth_it =
+        aligned_depth_by_rgb_key.find(camera.visual_name);
+    if (aligned_depth_it != aligned_depth_by_rgb_key.end()) {
+      DepthStreamConfig depth_stream = std::move(aligned_depth_it->second);
+      const size_t depth_pixel_count =
+          static_cast<size_t>(depth_stream.width) * depth_stream.height;
+      depth_stream.raw_depth_buffer.resize(depth_pixel_count);
+      depth_stream.flipped_depth_buffer.resize(depth_pixel_count);
+      depth_stream.depth_mm_buffer.resize(depth_pixel_count);
+      camera.aligned_depth = std::move(depth_stream);
+    }
+
     config.cameras.push_back(std::move(camera));
   }
 
@@ -747,7 +1093,12 @@ void preflight_camera_publishers() {
     std::cout << "Camera publisher ready: MuJoCo camera '"
               << camera.mujoco_camera_name << "' -> Redis key '"
               << camera.redis_key << "' at " << camera.fps << " Hz ("
-              << camera.width << "x" << camera.height << ").\n";
+              << camera.width << "x" << camera.height << ").";
+    if (camera.aligned_depth) {
+      std::cout << " Aligned depth -> Redis key `"
+                << camera.aligned_depth->redis_key << "`";
+    }
+    std::cout << "\n";
   }
 
   m->vis.global.offwidth = required_offscreen_width;
@@ -980,10 +1331,60 @@ Vector3d get_filtered_sensed_moment(const mjModel* m, mjData* d,
   return get_force_sensor_rotation_in_world(d) * sensed_moment_sensor_frame;
 }
 
+void update_particle_filter() {
+
+    // Vector3d dx_world = motion_force_task->getGoalPosition() - motion_force_task->getCurrentPosition();
+    Vector3d dx_world = Vector3d(0,0, -0.1);
+
+    Vector3d robot_velocity = motion_force_task->getCurrentLinearVelocity();
+    Vector3d sensed_force_world_frame = get_filtered_sensed_force(m, d, true);
+
+    Vector3d motion_control = 0.2 * sigma_motion * dx_world;
+    Vector3d force_control = 0.2 * sigma_force * dx_world;
+
+    force_space_particle_filter->update(motion_control, force_control, robot_velocity, sensed_force_world_frame);
+    Vector3d motion_or_force_axis = force_space_particle_filter->getForceOrMotionAxis();
+    int fdim = force_space_particle_filter->getForceSpaceDimension();
+    force_dimension_queue.pop();
+    force_dimension_queue.push(fdim);
+
+    if (fdim == 0) {
+      sigma_force = Matrix3d::Zero();
+      sigma_motion = Matrix3d::Identity();
+    } else if (fdim == 1) {
+      sigma_force = motion_or_force_axis * motion_or_force_axis.transpose();
+      sigma_motion = Matrix3d::Identity() - sigma_force;
+    } else if (fdim == 2) {
+      sigma_motion = motion_or_force_axis * motion_or_force_axis.transpose();
+      sigma_force = Matrix3d::Identity() - sigma_motion;
+    } else if (fdim == 3) {
+      sigma_force = Matrix3d::Identity();
+      sigma_motion = Matrix3d::Zero();
+    }
+
+    // std::cout << "Updated particle filter. Force space dimension: " << fdim
+    //           << ", motion control: " << motion_control.transpose()
+    //           << ", force control: " << force_control.transpose()
+    //           << ", sigma_motion:\n" << sigma_motion
+    //           << "\nsigma_force:\n" << sigma_force
+    //           << std::endl;
+
+
+}
+
 void inference_time_callback(const mjModel* m, mjData* d) {
 
   //When the robot is in inference mode, we have things that are ---- 
   // only relevant to inference and not data collection.
+
+  static int particle_filter_count = 0;
+
+  if (particle_filter_count % 67 == 0) {  // Update the particle filter every 67 control steps (approximately every 1 second at 15ms control timestep)
+    update_particle_filter();
+    particle_filter_count = 0;
+  }
+
+  particle_filter_count++;
 
   update_robot_state(m, d);
   update_filtered_sensed_wrench(m, d);
@@ -995,11 +1396,6 @@ void inference_time_callback(const mjModel* m, mjData* d) {
   const VectorXd control_torques =
       motion_force_task->computeTorques() + joint_task->computeTorques() +
       robot->jointGravityVector();
-
-  // const VectorXd control_torques = robot->jointGravityVector();
-
-  // const VectorXd control_torques =
-  //     motion_force_task->computeTorques() + joint_task->computeTorques();
 
   for (int i = 0; i < std::min<int>(control_torques.size(), m->nu); ++i) {
     d->ctrl[i] = control_torques(i);
@@ -1116,6 +1512,8 @@ void update_redis(const mjModel* m, mjData* d) {
     Vector3d sensed_moment = -1 *get_filtered_sensed_moment(m, d, true);
     redis_client.setEigen(SENSED_FORCE, sensed_force);
     redis_client.setEigen(SENSED_MOMENT, sensed_moment);
+    redis_client.setEigen(FORCE_OR_MOTION_AXIS, force_space_particle_filter->getForceOrMotionAxis());
+    redis_client.setInt(FORCE_DIMENSION, force_space_particle_filter->getForceSpaceDimension());
 }
 
 void query_redis_for_desired_state() {
@@ -1158,6 +1556,81 @@ void send_haptic_commands() {
                         haptic_output.robot_goal_position);
   redis_client.setEigen(HAPTIC_COMMANDED_ORIENTATION,
                         haptic_output.robot_goal_orientation);
+}
+
+void init_haptic_controller() {
+
+  SaiPrimitives::HapticDeviceController::DeviceLimits device_limits(
+          redis_client.getEigen(createRedisKey(MAX_STIFFNESS_KEY_SUFFIX, 0)),
+          redis_client.getEigen(createRedisKey(MAX_DAMPING_KEY_SUFFIX, 0)),
+          redis_client.getEigen(createRedisKey(MAX_FORCE_KEY_SUFFIX, 0)));
+
+  haptic_controller =
+      std::make_shared<SaiPrimitives::HapticDeviceController>(
+          device_limits, robot->transformInWorld(control_link));
+
+  haptic_controller->setScalingFactors(3.5);
+  haptic_controller->setHapticControlType(
+      SaiPrimitives::HapticControlType::MOTION_MOTION);
+  directions_of_proxy_feedback = Vector3i::Zero();
+  prev_sensed_force = Vector3d::Zero();
+
+  haptic_controller->setDeviceControlGains(
+    0.02 * device_limits.max_linear_stiffness,
+    0.02 * device_limits.max_linear_damping,
+    0.02 * device_limits.max_angular_stiffness,
+    0.02 * device_limits.max_angular_damping);
+
+  haptic_controller->setReductionFactorForce(0.05);
+  haptic_controller->setReductionFactorMoment(0.05);
+}
+
+void init_particle_filter() {
+  const fs::path settings_path = fs::path("particle_filter/pfilter_settings.yaml");
+  if (!fs::exists(settings_path)) {
+    throw std::runtime_error("Could not find pfilter_settings.yaml");
+  }
+
+  const YAML::Node config = YAML::LoadFile(settings_path.string());
+  if (!config["filter"]) {
+    throw std::runtime_error("Missing 'filter' section in pfilter_settings.yaml");
+  }
+
+  const YAML::Node filter = config["filter"];
+
+  const int n_particles = filter["n_particles"].as<int>();
+  const double filter_freq = filter["filter_freq"].as<double>();
+  const int queue_size = filter["queue_size"].as<int>();
+  const double f_low = filter["f_low"].as<double>();
+  const double f_high = filter["f_high"].as<double>();
+  const double v_low = filter["v_low"].as<double>();
+  const double v_high = filter["v_high"].as<double>();
+  const double f_low_add = filter["f_low_add"].as<double>();
+  const double f_high_add = filter["f_high_add"].as<double>();
+  const double v_low_add = filter["v_low_add"].as<double>();
+  const double v_high_add = filter["v_high_add"].as<double>();
+
+  (void)filter_freq;
+
+  std::cout << "Loaded particle filter settings from: " << settings_path << std::endl;
+  std::cout << "Particle filter config: n_particles=" << n_particles
+            << " queue_size=" << queue_size << std::endl;
+
+  force_space_particle_filter =
+      std::make_shared<ForceWM::ForceSpaceParticleFilter>(n_particles);
+  force_space_particle_filter->setParameters(0, 0.025, 0.3, 0.05);
+  force_space_particle_filter->setWeightingParameters(
+      f_low, f_high, v_low, v_high, f_low_add, f_high_add, v_low_add, v_high_add);
+
+  while (!force_dimension_queue.empty()) {
+    force_dimension_queue.pop();
+  }
+
+  for (int j = 0; j < queue_size; ++j) {
+    force_dimension_queue.push(0);
+  }
+
+  force_space_particle_filter->reset();
 }
 
 void simulation_thread_main(SimulationLoopStats* simulation_loop_stats) {
@@ -1230,6 +1703,14 @@ void camera_thread_main(GLFWwindow* hidden_camera_window) {
     mjv_defaultCamera(&capture_camera);
     std::vector<double> next_camera_publish_wall_times(
         simulation_contract.cameras.size(), 0.0);
+    const float depth_near_clip_m =
+        static_cast<float>(m->vis.map.znear * m->stat.extent);
+    const float depth_far_clip_m =
+        static_cast<float>(m->vis.map.zfar * m->stat.extent);
+    if (!(depth_near_clip_m > 0.0f && depth_far_clip_m > depth_near_clip_m)) {
+      throw std::runtime_error(
+          "Invalid MuJoCo near/far clipping settings for depth publishing.");
+    }
 
     if (!snapshot_broker->wait_for_first_snapshot(snapshot, shutdown_requested)) {
       return;
@@ -1321,14 +1802,24 @@ void camera_thread_main(GLFWwindow* hidden_camera_window) {
         const auto render_end_time = std::chrono::steady_clock::now();
 
         const auto readback_start_time = render_end_time;
-        mjr_readPixels(camera.rgb_buffer.data(), nullptr, viewport,
-                       &camera_context);
+        float* depth_readback_buffer = nullptr;
+        if (camera.aligned_depth) {
+          depth_readback_buffer = camera.aligned_depth->raw_depth_buffer.data();
+        }
+        mjr_readPixels(camera.rgb_buffer.data(), depth_readback_buffer,
+                       viewport, &camera_context);
         const auto readback_end_time = std::chrono::steady_clock::now();
 
         const auto flip_start_time = readback_end_time;
-        flip_rgb_image_vertically(camera.rgb_buffer, camera.flipped_rgb_buffer,
-                                  camera.width, camera.height,
-                                  camera.channels);
+        flip_image_vertically(camera.rgb_buffer, camera.flipped_rgb_buffer,
+                              camera.width, camera.height, camera.channels);
+        if (camera.aligned_depth) {
+          auto& depth_stream = *camera.aligned_depth;
+          flip_image_vertically(depth_stream.raw_depth_buffer,
+                                depth_stream.flipped_depth_buffer,
+                                depth_stream.width, depth_stream.height,
+                                depth_stream.channels);
+        }
         const auto flip_end_time = std::chrono::steady_clock::now();
 
         cv::Mat rgb_view(camera.height, camera.width, CV_8UC3,
@@ -1345,16 +1836,40 @@ void camera_thread_main(GLFWwindow* hidden_camera_window) {
           throw std::runtime_error("Failed to JPEG-encode camera `" +
                                    camera.mujoco_camera_name + "`.");
         }
-        const auto jpeg_end_time = std::chrono::steady_clock::now();
+        if (camera.aligned_depth) {
+          auto& depth_stream = *camera.aligned_depth;
+          convert_mujoco_depth_to_millimeters(
+              depth_stream.flipped_depth_buffer, depth_stream.depth_mm_buffer,
+              depth_near_clip_m, depth_far_clip_m);
+          cv::Mat depth_view(depth_stream.height, depth_stream.width, CV_16UC1,
+                             depth_stream.depth_mm_buffer.data());
+          if (!cv::imencode(".png", depth_view,
+                            depth_stream.encoded_depth_buffer)) {
+            throw std::runtime_error("Failed to PNG16-encode depth stream `" +
+                                     depth_stream.visual_name + "`.");
+          }
+        }
+        const auto encode_end_time = std::chrono::steady_clock::now();
 
-        const auto redis_start_time = jpeg_end_time;
+        const auto redis_start_time = encode_end_time;
         camera_redis_client.set(
             camera.redis_key,
             std::string(
                 reinterpret_cast<const char*>(camera.encoded_image_buffer.data()),
                 camera.encoded_image_buffer.size()));
         camera_redis_client.set(camera.metadata_redis_key,
-                                make_camera_metadata_json(camera, snapshot));
+                                make_rgb_camera_metadata_json(camera, snapshot));
+        if (camera.aligned_depth) {
+          const auto& depth_stream = *camera.aligned_depth;
+          camera_redis_client.set(
+              depth_stream.redis_key,
+              std::string(reinterpret_cast<const char*>(
+                              depth_stream.encoded_depth_buffer.data()),
+                          depth_stream.encoded_depth_buffer.size()));
+          camera_redis_client.set(
+              depth_stream.metadata_redis_key,
+              make_depth_camera_metadata_json(camera, depth_stream, snapshot));
+        }
         const auto publish_end_time = std::chrono::steady_clock::now();
 
         camera.total_scene_update_seconds +=
@@ -1378,8 +1893,8 @@ void camera_thread_main(GLFWwindow* hidden_camera_window) {
             std::chrono::duration<double>(color_convert_end_time -
                                           color_convert_start_time)
                 .count();
-        camera.total_jpeg_encode_seconds +=
-            std::chrono::duration<double>(jpeg_end_time - jpeg_start_time)
+        camera.total_frame_encode_seconds +=
+            std::chrono::duration<double>(encode_end_time - jpeg_start_time)
                 .count();
         camera.total_redis_publish_seconds +=
             std::chrono::duration<double>(publish_end_time - redis_start_time)
@@ -1514,31 +2029,13 @@ int main(int argc, char** argv) {
   joint_task->reInitializeTask();
   // ----------------------------------------------------------------------------
 
+  // ---------------------------------FSPF------------------------------
+  init_particle_filter();
+  // -------------------------------------------------------------------
+
   if (is_data_collection) {
     try {
-      SaiPrimitives::HapticDeviceController::DeviceLimits device_limits(
-          redis_client.getEigen(createRedisKey(MAX_STIFFNESS_KEY_SUFFIX, 0)),
-          redis_client.getEigen(createRedisKey(MAX_DAMPING_KEY_SUFFIX, 0)),
-          redis_client.getEigen(createRedisKey(MAX_FORCE_KEY_SUFFIX, 0)));
-
-      haptic_controller =
-          std::make_shared<SaiPrimitives::HapticDeviceController>(
-              device_limits, robot->transformInWorld(control_link));
-
-      haptic_controller->setScalingFactors(3.5);
-      haptic_controller->setHapticControlType(
-          SaiPrimitives::HapticControlType::MOTION_MOTION);
-      directions_of_proxy_feedback = Vector3i::Zero();
-      prev_sensed_force = Vector3d::Zero();
-
-      haptic_controller->setDeviceControlGains(
-        0.02 * device_limits.max_linear_stiffness,
-        0.02 * device_limits.max_linear_damping,
-        0.02 * device_limits.max_angular_stiffness,
-        0.02 * device_limits.max_angular_damping);
-
-      haptic_controller->setReductionFactorForce(0.05);
-      haptic_controller->setReductionFactorMoment(0.05);
+      init_haptic_controller();
     } catch (const std::exception& exception) {
       std::cerr << exception.what() << "\n";
       mj_deleteData(d);
@@ -1546,9 +2043,6 @@ int main(int argc, char** argv) {
       return 1;
     }
   }
-
-  //initialize the haptic controller ---
-  
 
   mjcb_control = controller_callback;
 

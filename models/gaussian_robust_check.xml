@@ -1,0 +1,75 @@
+<mujoco model="hole">
+    <asset>
+        <mesh name="holesim" file="../../generated_cad/gaussian_robust_check/hole_block.stl"/>
+        <mesh name="geometry_0" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_0.stl"/>
+        <mesh name="geometry_1" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_1.stl"/>
+        <mesh name="geometry_10" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_10.stl"/>
+        <mesh name="geometry_11" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_11.stl"/>
+        <mesh name="geometry_12" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_12.stl"/>
+        <mesh name="geometry_13" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_13.stl"/>
+        <mesh name="geometry_14" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_14.stl"/>
+        <mesh name="geometry_15" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_15.stl"/>
+        <mesh name="geometry_16" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_16.stl"/>
+        <mesh name="geometry_17" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_17.stl"/>
+        <mesh name="geometry_18" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_18.stl"/>
+        <mesh name="geometry_19" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_19.stl"/>
+        <mesh name="geometry_2" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_2.stl"/>
+        <mesh name="geometry_20" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_20.stl"/>
+        <mesh name="geometry_21" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_21.stl"/>
+        <mesh name="geometry_22" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_22.stl"/>
+        <mesh name="geometry_23" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_23.stl"/>
+        <mesh name="geometry_24" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_24.stl"/>
+        <mesh name="geometry_25" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_25.stl"/>
+        <mesh name="geometry_26" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_26.stl"/>
+        <mesh name="geometry_27" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_27.stl"/>
+        <mesh name="geometry_28" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_28.stl"/>
+        <mesh name="geometry_29" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_29.stl"/>
+        <mesh name="geometry_3" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_3.stl"/>
+        <mesh name="geometry_30" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_30.stl"/>
+        <mesh name="geometry_31" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_31.stl"/>
+        <mesh name="geometry_4" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_4.stl"/>
+        <mesh name="geometry_5" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_5.stl"/>
+        <mesh name="geometry_6" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_6.stl"/>
+        <mesh name="geometry_7" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_7.stl"/>
+        <mesh name="geometry_8" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_8.stl"/>
+        <mesh name="geometry_9" file="../../generated_cad/gaussian_robust_check/hole_block_convex/geometry_9.stl"/>
+    </asset>
+
+    <worldbody>
+        <body name="task" pos="0.4 0.0 0.3" quat="1.0 0.0 0.0 0.0">
+            <geom mesh="holesim" class="visual" rgba="0.55 0.35 0.2 1"/>
+            <geom mesh="geometry_0" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_1" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_10" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_11" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_12" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_13" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_14" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_15" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_16" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_17" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_18" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_19" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_2" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_20" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_21" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_22" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_23" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_24" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_25" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_26" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_27" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_28" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_29" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_3" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_30" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_31" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_4" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_5" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_6" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_7" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_8" class="collision" friction="0 0 0"/>
+            <geom mesh="geometry_9" class="collision" friction="0 0 0"/>
+        </body>
+    </worldbody>
+</mujoco>

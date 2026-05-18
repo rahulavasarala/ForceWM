@@ -1,0 +1,78 @@
+<mujoco model="hole">
+    <asset>
+        <mesh name="holesim" file="../parametric_hole_1/hole_block.stl"/>
+        <mesh name="geom0" file="../parametric_hole_1/hole_block_convex/geometry_0.stl"/>
+        <mesh name="geom1" file="../parametric_hole_1/hole_block_convex/geometry_1.stl"/>
+        <mesh name="geom2" file="../parametric_hole_1/hole_block_convex/geometry_2.stl"/>
+        <mesh name="geom3" file="../parametric_hole_1/hole_block_convex/geometry_3.stl"/>
+        <mesh name="geom4" file="../parametric_hole_1/hole_block_convex/geometry_4.stl"/>
+        <mesh name="geom5" file="../parametric_hole_1/hole_block_convex/geometry_5.stl"/>
+        <mesh name="geom6" file="../parametric_hole_1/hole_block_convex/geometry_6.stl"/>
+        <mesh name="geom7" file="../parametric_hole_1/hole_block_convex/geometry_7.stl"/>
+        <mesh name="geom8" file="../parametric_hole_1/hole_block_convex/geometry_8.stl"/>
+        <mesh name="geom9" file="../parametric_hole_1/hole_block_convex/geometry_9.stl"/>
+        <mesh name="geom10" file="../parametric_hole_1/hole_block_convex/geometry_10.stl"/>
+        <mesh name="geom11" file="../parametric_hole_1/hole_block_convex/geometry_11.stl"/>
+        <mesh name="geom12" file="../parametric_hole_1/hole_block_convex/geometry_12.stl"/>
+        <mesh name="geom13" file="../parametric_hole_1/hole_block_convex/geometry_13.stl"/>
+        <mesh name="geom14" file="../parametric_hole_1/hole_block_convex/geometry_14.stl"/>
+        <mesh name="geom15" file="../parametric_hole_1/hole_block_convex/geometry_15.stl"/>
+        <mesh name="geom16" file="../parametric_hole_1/hole_block_convex/geometry_16.stl"/>
+        <mesh name="geom17" file="../parametric_hole_1/hole_block_convex/geometry_17.stl"/>
+        <mesh name="geom18" file="../parametric_hole_1/hole_block_convex/geometry_18.stl"/>
+        <mesh name="geom19" file="../parametric_hole_1/hole_block_convex/geometry_19.stl"/>
+        <mesh name="geom20" file="../parametric_hole_1/hole_block_convex/geometry_20.stl"/>
+        <mesh name="geom21" file="../parametric_hole_1/hole_block_convex/geometry_21.stl"/>
+        <mesh name="geom22" file="../parametric_hole_1/hole_block_convex/geometry_22.stl"/>
+        <mesh name="geom23" file="../parametric_hole_1/hole_block_convex/geometry_23.stl"/>
+        <mesh name="geom24" file="../parametric_hole_1/hole_block_convex/geometry_24.stl"/>
+        <mesh name="geom25" file="../parametric_hole_1/hole_block_convex/geometry_25.stl"/>
+        <mesh name="geom26" file="../parametric_hole_1/hole_block_convex/geometry_26.stl"/>
+        <mesh name="geom27" file="../parametric_hole_1/hole_block_convex/geometry_27.stl"/>
+        <mesh name="geom28" file="../parametric_hole_1/hole_block_convex/geometry_28.stl"/>
+        <mesh name="geom29" file="../parametric_hole_1/hole_block_convex/geometry_29.stl"/>
+        <mesh name="geom30" file="../parametric_hole_1/hole_block_convex/geometry_30.stl"/>
+        <mesh name="geom31" file="../parametric_hole_1/hole_block_convex/geometry_31.stl"/>
+    </asset>
+
+    <worldbody>
+        <body name="task" pos="0.4 0 0.3" quat="1 0 0 0">
+            <geom mesh="holesim" class="visual" rgba="0.55 0.35 0.2 1"/>
+            <!-- Collision submeshes are intentionally disabled here.
+                 Some generated pieces are planar, which makes MuJoCo's
+                 convex-hull construction fail during model load. -->
+            <geom mesh="geom0"  class="collision" friction="0 0 0"/>
+            <geom mesh="geom1" rgba="0.9716724395095205 0.4155773668635704 0.4891406227984333 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom2" rgba="0.14830229256383265 0.6475927777174105 0.7338673709396254 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom3" rgba="0.9669567561504457 0.1597578128209678 0.014474842421785983 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom4" rgba="0.6799236025959631 0.3699565607110832 0.5072143585472161 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom5" rgba="0.4268029638925618 0.48928493834570574 0.5899333271522715 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom6" rgba="0.8260291399072678 0.4209205902022757 0.8043892236206673 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom7" rgba="0.6130379479462504 0.42045031701196356 0.540917958831619 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom8"  class="collision"/>
+            <geom mesh="geom9"  class="collision"/>
+            <geom mesh="geom10" rgba="0.9716724395095205 0.4155773668635704 0.4891406227984333 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom11" rgba="0.14830229256383265 0.6475927777174105 0.7338673709396254 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom12" rgba="0.9669567561504457 0.1597578128209678 0.014474842421785983 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom13" rgba="0.6799236025959631 0.3699565607110832 0.5072143585472161 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom14" rgba="0.4268029638925618 0.48928493834570574 0.5899333271522715 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom15" rgba="0.8260291399072678 0.4209205902022757 0.8043892236206673 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom16" rgba="0.6130379479462504 0.42045031701196356 0.540917958831619 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom17"  class="collision"/>
+            <geom mesh="geom18"  class="collision"/>
+            <geom mesh="geom19" rgba="0.9716724395095205 0.4155773668635704 0.4891406227984333 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom20" rgba="0.14830229256383265 0.6475927777174105 0.7338673709396254 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom21" rgba="0.9669567561504457 0.1597578128209678 0.014474842421785983 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom22" rgba="0.6799236025959631 0.3699565607110832 0.5072143585472161 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom23" rgba="0.4268029638925618 0.48928493834570574 0.5899333271522715 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom24" rgba="0.8260291399072678 0.4209205902022757 0.8043892236206673 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom25" rgba="0.6130379479462504 0.42045031701196356 0.540917958831619 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom26"  class="collision"/>
+            <geom mesh="geom27"  class="collision"/>
+            <geom mesh="geom28" rgba="0.9716724395095205 0.4155773668635704 0.4891406227984333 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom29" rgba="0.14830229256383265 0.6475927777174105 0.7338673709396254 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom30" rgba="0.9669567561504457 0.1597578128209678 0.014474842421785983 1" class="collision" friction="0 0 0"/>
+            <geom mesh="geom31" rgba="0.6799236025959631 0.3699565607110832 0.5072143585472161 1" class="collision" friction="0 0 0"/>
+        </body>
+    </worldbody>
+</mujoco>

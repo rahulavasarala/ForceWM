@@ -36,7 +36,11 @@ set(FORCEWM_SIMULATION_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/simulation.cpp")
 file(SIZE "${FORCEWM_SIMULATION_SOURCE}" FORCEWM_SIMULATION_SOURCE_SIZE)
 
 if(FORCEWM_SIMULATION_SOURCE_SIZE GREATER 0)
-  add_executable(forcewm_simulation "${FORCEWM_SIMULATION_SOURCE}")
+  add_executable(forcewm_simulation
+    "${FORCEWM_SIMULATION_SOURCE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/control_utils.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/utils.cpp"
+  )
   target_link_libraries(forcewm_simulation PRIVATE
     forcewm_particle_filter
     forcewm::runtime

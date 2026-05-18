@@ -28,16 +28,16 @@
 
 #include "SaiModel.h"
 #include "SaiPrimitives.h"
+#include "control_utils.h"
 #include "particle_filter/ForceSpaceParticleFilter.h"
 
 #include "redis/RedisClient.h"
 #include "redis_keys.h"
-#include "redis/keys/chai_haptic_devices_driver.h"
+#include "utils.h"
 
 SaiCommon::RedisClient redis_client = SaiCommon::RedisClient("sai");;
 
 using std::string;
-using namespace SaiCommon::ChaiHapticDriverKeys;
 namespace fs = std::filesystem;
 
 namespace {
@@ -48,8 +48,6 @@ constexpr int kSceneMaxGeometry = 2000;
 constexpr mjtNum kRenderTimestep = 1.0 / 60.0;
 constexpr int kRobotDof = 7;
 constexpr double kSensedWrenchLowPassAlpha = 0.2;
-constexpr const char* kDefaultSceneXmlPath = "models/parametric_scene.xml";
-constexpr const char* kDefaultRobotUrdfPath = "models/fr3.urdf";
 constexpr const char* kEndEffectorForceSensorName = "ee_force";
 constexpr const char* kEndEffectorTorqueSensorName = "ee_torque";
 constexpr const char* kEndEffectorSensorSiteName = "ft_site";
@@ -87,9 +85,10 @@ std::shared_ptr<SaiPrimitives::JointTask> joint_task;
 // Init the force space particle filter ---- 
 std::shared_ptr<ForceWM::ForceSpaceParticleFilter> force_space_particle_filter;
 std::queue<int> force_dimension_queue;
-int QUEUE_SIZE = 10;
 Matrix3d sigma_force = Matrix3d::Zero();
 Matrix3d sigma_motion = Matrix3d::Identity();
+Vector3d force_or_motion_axis = Vector3d::Zero();
+int force_dimension = 0;
 
 std::shared_ptr<SaiPrimitives::HapticDeviceController> haptic_controller;
 SaiPrimitives::HapticControllerInput haptic_input;
@@ -110,89 +109,6 @@ int ee_torque_sensor_id = -1;
 int ee_sensor_site_id = -1;
 std::atomic<bool> shutdown_requested = false;
 std::atomic<bool> reset_requested = false;
-
-enum class VisualStreamType {
-  kRgb,
-  kDepth,
-};
-
-struct DepthStreamConfig {
-  std::string visual_name;
-  std::string redis_key;
-  std::string metadata_redis_key;
-  std::string encoding = "png16";
-  std::string unit = "mm";
-  std::string align_to_visual_name;
-  int width = 640;
-  int height = 480;
-  int channels = 1;
-  std::vector<float> raw_depth_buffer;
-  std::vector<float> flipped_depth_buffer;
-  std::vector<std::uint16_t> depth_mm_buffer;
-  std::vector<unsigned char> encoded_depth_buffer;
-};
-
-struct CameraStreamConfig {
-  std::string visual_name;
-  std::string redis_key;
-  std::string metadata_redis_key;
-  std::string mujoco_camera_name;
-  std::string encoding = "jpeg";
-  VisualStreamType type = VisualStreamType::kRgb;
-  int model_camera_id = -1;
-  int width = 640;
-  int height = 480;
-  int channels = 3;
-  double fps = 0.0;
-  mjtNum next_publish_sim_time = 0.0;
-  std::vector<unsigned char> rgb_buffer;
-  std::vector<unsigned char> flipped_rgb_buffer;
-  std::vector<unsigned char> bgr_buffer;
-  std::vector<unsigned char> encoded_image_buffer;
-  std::optional<DepthStreamConfig> aligned_depth;
-  std::uint64_t publish_count = 0;
-  std::uint64_t dropped_publish_slots = 0;
-  double total_scene_update_seconds = 0.0;
-  double total_render_seconds = 0.0;
-  double total_render_draw_seconds = 0.0;
-  double total_readback_seconds = 0.0;
-  double total_flip_seconds = 0.0;
-  double total_color_convert_seconds = 0.0;
-  double total_frame_encode_seconds = 0.0;
-  double total_redis_publish_seconds = 0.0;
-  double total_publish_seconds = 0.0;
-};
-
-struct VisualContractEntry {
-  std::string visual_name;
-  VisualStreamType type = VisualStreamType::kRgb;
-  std::string source = "sim";
-  std::string redis_key;
-  std::string metadata_redis_key;
-  std::string mujoco_camera_name;
-  std::string encoding = "jpeg";
-  std::string unit;
-  std::string align_to_visual_name;
-  int width = 640;
-  int height = 480;
-  int channels = 3;
-  double fps = 0.0;
-  bool has_explicit_dimensions = false;
-  bool has_explicit_channels = false;
-  bool has_explicit_fps = false;
-};
-
-struct SimulationContractConfig {
-  std::string prefix;
-  fs::path xml_path;
-  fs::path urdf_path;
-  std::vector<CameraStreamConfig> cameras;
-};
-
-struct StartupOptions {
-  fs::path contract_path;
-  bool is_data_collection = false;
-};
 
 struct SimulationPerformanceStats {
   std::uint64_t physics_step_count = 0;
@@ -363,78 +279,6 @@ void load_mujoco_plugins() {
   mj_loadAllPluginLibraries(path->string().c_str(), nullptr);
 }
 
-fs::path repo_root_directory() {
-  return fs::path(FORCEWM_MODEL_ROOT).parent_path();
-}
-
-fs::path default_contract_path() {
-  return repo_root_directory() / "universal_contract.yaml";
-}
-
-fs::path resolve_input_path(const char* argument) {
-  if (!argument) {
-    return default_contract_path();
-  }
-
-  const fs::path input_path(argument);
-  if (input_path.is_absolute()) {
-    return input_path.lexically_normal();
-  }
-
-  return fs::absolute(input_path).lexically_normal();
-}
-
-fs::path resolve_contract_relative_path(const fs::path& contract_path,
-                                        const std::string& path_string) {
-  const fs::path input_path(path_string);
-  if (input_path.is_absolute()) {
-    return input_path;
-  }
-  return (contract_path.parent_path() / input_path).lexically_normal();
-}
-
-std::string normalize_mode_token(std::string mode) {
-  std::transform(mode.begin(), mode.end(), mode.begin(),
-                 [](unsigned char character) {
-                   if (character == '-' || character == ' ') {
-                     return static_cast<char>('_');
-                   }
-                   return static_cast<char>(std::tolower(character));
-                 });
-  return mode;
-}
-
-bool parse_mode_argument(const std::string& mode_argument,
-                         bool& parsed_is_data_collection) {
-  const std::string normalized_mode = normalize_mode_token(mode_argument);
-  if (normalized_mode == "inference") {
-    parsed_is_data_collection = false;
-    return true;
-  }
-
-  if (normalized_mode == "data_collection" ||
-      normalized_mode == "datacollection" ||
-      normalized_mode == "collection") {
-    parsed_is_data_collection = true;
-    return true;
-  }
-
-  return false;
-}
-
-void print_usage(const char* executable_name) {
-  std::cout << "Usage: " << executable_name
-            << " [universal_contract.yaml] [inference|data_collection]\n"
-            << "Defaults are loaded from " << default_contract_path().string()
-            << " and mode defaults to inference.\n"
-            << "\n"
-            << "Examples:\n"
-            << "  " << executable_name << "\n"
-            << "  " << executable_name << " data_collection\n"
-            << "  " << executable_name
-            << " /full/path/to/universal_contract.yaml inference\n";
-}
-
 void print_simulation_summary(const SimulationPerformanceStats& stats) {
   std::cout << "\nSimulation summary\n";
   std::cout << std::fixed << std::setprecision(3);
@@ -528,91 +372,6 @@ void print_camera_publish_summary() {
   }
 
   std::cout << std::defaultfloat;
-}
-
-std::optional<StartupOptions> parse_startup_options(int argc, char** argv) {
-  if (argc > 3) {
-    print_usage(argv[0]);
-    return std::nullopt;
-  }
-
-  StartupOptions options;
-  const char* contract_argument = nullptr;
-  const char* mode_argument = nullptr;
-
-  if (argc == 2) {
-    if (!parse_mode_argument(argv[1], options.is_data_collection)) {
-      contract_argument = argv[1];
-    }
-  } else if (argc == 3) {
-    contract_argument = argv[1];
-    mode_argument = argv[2];
-  }
-
-  if (mode_argument &&
-      !parse_mode_argument(mode_argument, options.is_data_collection)) {
-    std::cerr << "Invalid mode `" << mode_argument
-              << "`. Expected `inference` or `data_collection`.\n";
-    print_usage(argv[0]);
-    return std::nullopt;
-  }
-
-  options.contract_path = resolve_input_path(contract_argument);
-  return options;
-}
-
-template <typename T>
-T node_or(const YAML::Node& node, const T& fallback) {
-  return node ? node.as<T>() : fallback;
-}
-
-std::string require_string(const YAML::Node& parent,
-                           const char* key,
-                           const std::string& context) {
-  const YAML::Node value = parent[key];
-  if (!value) {
-    throw std::runtime_error("Missing required `" + std::string(key) +
-                             "` in " + context + ".");
-  }
-
-  const std::string parsed_value = value.as<std::string>();
-  if (parsed_value.empty()) {
-    throw std::runtime_error("Required `" + std::string(key) + "` in " +
-                             context + " cannot be empty.");
-  }
-
-  return parsed_value;
-}
-
-std::string make_redis_key(const std::string& prefix,
-                           const std::string& suffix) {
-  if (prefix.empty()) {
-    return suffix;
-  }
-  return prefix + "::" + suffix;
-}
-
-std::string lowercase_copy(std::string value) {
-  std::transform(value.begin(), value.end(), value.begin(),
-                 [](unsigned char character) {
-                   return static_cast<char>(std::tolower(character));
-                 });
-  return value;
-}
-
-VisualStreamType parse_visual_stream_type(const std::string& visual_type,
-                                          const std::string& context) {
-  const std::string normalized_type = lowercase_copy(visual_type);
-  if (normalized_type == "rgb") {
-    return VisualStreamType::kRgb;
-  }
-  if (normalized_type == "depth") {
-    return VisualStreamType::kDepth;
-  }
-
-  throw std::runtime_error(
-      "Unsupported visual `type: " + visual_type + "` in " + context +
-      ". simulation.cpp only supports `rgb` and `depth` visual streams.");
 }
 
 const char* visual_stream_type_name(const VisualStreamType type) {
@@ -786,287 +545,6 @@ std::string make_depth_camera_metadata_json(const CameraStreamConfig& camera,
   return metadata_stream.str();
 }
 
-SimulationContractConfig load_simulation_contract(const fs::path& contract_path) {
-  const YAML::Node contract = YAML::LoadFile(contract_path.string());
-  const YAML::Node robot_cfg = contract["robot"];
-  if (!robot_cfg || !robot_cfg.IsMap()) {
-    throw std::runtime_error("Expected a top-level `robot` mapping in " +
-                             contract_path.string() + ".");
-  }
-
-  const std::string contract_context =
-      "contract `" + contract_path.string() + "`";
-  const std::string robot_type =
-      require_string(robot_cfg, "type", contract_context);
-  if (robot_type != "sim") {
-    throw std::runtime_error(
-        "simulation.cpp only supports `robot.type: sim`, but the contract sets "
-        "`robot.type: " +
-        robot_type + "`.");
-  }
-
-  SimulationContractConfig config;
-  config.prefix = node_or<std::string>(robot_cfg["prefix"], "");
-  config.xml_path = resolve_contract_relative_path(
-      contract_path,
-      node_or<std::string>(robot_cfg["xml_path"], kDefaultSceneXmlPath));
-  config.urdf_path = resolve_contract_relative_path(
-      contract_path,
-      node_or<std::string>(robot_cfg["urdf_path"], kDefaultRobotUrdfPath));
-
-  const YAML::Node visual_cfg =
-      robot_cfg["data_sources"] ? robot_cfg["data_sources"]["visual"]
-                                : YAML::Node();
-  const double default_camera_fps =
-      node_or<double>(visual_cfg["fps"], 1.0 / kRenderTimestep);
-  const YAML::Node camera_keys = visual_cfg ? visual_cfg["keys"] : YAML::Node();
-
-  if (camera_keys && !camera_keys.IsSequence()) {
-    throw std::runtime_error(
-        "`robot.data_sources.visual.keys` must be a sequence in " +
-        contract_path.string() + ".");
-  }
-
-  if (!camera_keys) {
-    return config;
-  }
-
-  std::vector<VisualContractEntry> visual_entries;
-  visual_entries.reserve(camera_keys.size());
-  size_t depth_stream_count = 0;
-
-  for (const auto& camera_entry : camera_keys) {
-    if (!camera_entry.IsMap() || camera_entry.size() != 1) {
-      throw std::runtime_error(
-          "Each entry in `robot.data_sources.visual.keys` must be a single-key "
-          "mapping in " +
-          contract_path.string() + ".");
-    }
-
-    const auto camera_it = camera_entry.begin();
-    const std::string visual_name = camera_it->first.as<std::string>();
-    const YAML::Node camera_cfg = camera_it->second;
-    const std::string camera_context =
-        "camera `" + visual_name + "` in " + contract_context;
-
-    VisualContractEntry visual_entry;
-    visual_entry.visual_name = visual_name;
-    const std::string redis_suffix =
-        node_or<std::string>(camera_cfg["redis"], visual_name);
-    visual_entry.redis_key = make_redis_key(config.prefix, redis_suffix);
-    visual_entry.metadata_redis_key = visual_entry.redis_key + "::meta";
-    visual_entry.type = parse_visual_stream_type(
-        node_or<std::string>(camera_cfg["type"], "rgb"), camera_context);
-    visual_entry.source =
-        lowercase_copy(node_or<std::string>(camera_cfg["source"], "sim"));
-    visual_entry.encoding = lowercase_copy(node_or<std::string>(
-        camera_cfg["encoding"],
-        visual_entry.type == VisualStreamType::kDepth ? "png16" : "jpeg"));
-    visual_entry.fps = node_or<double>(camera_cfg["fps"], default_camera_fps);
-    visual_entry.has_explicit_fps = static_cast<bool>(camera_cfg["fps"]);
-
-    if (visual_entry.source != "sim") {
-      throw std::runtime_error(
-          "simulation.cpp only supports `source: sim`, but camera `" +
-          visual_name + "` sets `source: " + visual_entry.source + "`.");
-    }
-
-    const YAML::Node dim_cfg = camera_cfg["dim"];
-    if (dim_cfg && dim_cfg.IsSequence()) {
-      if (dim_cfg.size() >= 2) {
-        visual_entry.width = dim_cfg[0].as<int>();
-        visual_entry.height = dim_cfg[1].as<int>();
-        visual_entry.has_explicit_dimensions = true;
-      }
-      if (dim_cfg.size() >= 3) {
-        visual_entry.channels = dim_cfg[2].as<int>();
-        visual_entry.has_explicit_channels = true;
-      }
-    }
-
-    if (visual_entry.fps <= 0.0) {
-      throw std::runtime_error("Camera '" + visual_name +
-                               "' has a non-positive fps in " +
-                               contract_path.string() + ".");
-    }
-
-    if (visual_entry.type == VisualStreamType::kRgb) {
-      visual_entry.channels = visual_entry.has_explicit_channels
-                                  ? visual_entry.channels
-                                  : 3;
-      if (visual_entry.channels != 3) {
-        throw std::runtime_error("Camera '" + visual_name + "' requests " +
-                                 std::to_string(visual_entry.channels) +
-                                 " channels, but simulation publishing only "
-                                 "supports RGB cameras right now.");
-      }
-      if (visual_entry.encoding != "jpeg") {
-        throw std::runtime_error("Camera '" + visual_name +
-                                 "' requests encoding `" +
-                                 visual_entry.encoding +
-                                 "`, but simulation publishing only supports "
-                                 "JPEG for RGB streams right now.");
-      }
-      visual_entry.mujoco_camera_name =
-          require_string(camera_cfg, "mujoco_camera_name", camera_context);
-    } else {
-      ++depth_stream_count;
-      visual_entry.channels = visual_entry.has_explicit_channels
-                                  ? visual_entry.channels
-                                  : 1;
-      if (visual_entry.channels != 1) {
-        throw std::runtime_error("Depth stream '" + visual_name +
-                                 "' requests " +
-                                 std::to_string(visual_entry.channels) +
-                                 " channels, but simulation depth publishing "
-                                 "only supports single-channel depth.");
-      }
-      if (visual_entry.encoding != "png16") {
-        throw std::runtime_error("Depth stream '" + visual_name +
-                                 "' requests encoding `" +
-                                 visual_entry.encoding +
-                                 "`, but simulation depth publishing only "
-                                 "supports png16.");
-      }
-      visual_entry.unit =
-          lowercase_copy(require_string(camera_cfg, "unit", camera_context));
-      if (visual_entry.unit != "mm") {
-        throw std::runtime_error("Depth stream '" + visual_name +
-                                 "' requests unit `" + visual_entry.unit +
-                                 "`, but simulation depth publishing only "
-                                 "supports millimeters (`mm`).");
-      }
-      visual_entry.align_to_visual_name =
-          require_string(camera_cfg, "align_to", camera_context);
-    }
-
-    visual_entries.push_back(std::move(visual_entry));
-  }
-
-  if (depth_stream_count > 1) {
-    throw std::runtime_error(
-        "simulation.cpp currently supports at most one aligned depth stream.");
-  }
-
-  std::unordered_map<std::string, const VisualContractEntry*> visual_entry_by_name;
-  visual_entry_by_name.reserve(visual_entries.size());
-  for (const auto& visual_entry : visual_entries) {
-    const auto [entry_it, inserted] =
-        visual_entry_by_name.emplace(visual_entry.visual_name, &visual_entry);
-    if (!inserted) {
-      throw std::runtime_error("Duplicate visual key `" +
-                               visual_entry.visual_name + "` in " +
-                               contract_path.string() + ".");
-    }
-  }
-
-  std::unordered_map<std::string, DepthStreamConfig> aligned_depth_by_rgb_key;
-  for (const auto& visual_entry : visual_entries) {
-    if (visual_entry.type != VisualStreamType::kDepth) {
-      continue;
-    }
-
-    const auto aligned_rgb_it =
-        visual_entry_by_name.find(visual_entry.align_to_visual_name);
-    if (aligned_rgb_it == visual_entry_by_name.end()) {
-      throw std::runtime_error("Depth stream `" + visual_entry.visual_name +
-                               "` aligns to `" +
-                               visual_entry.align_to_visual_name +
-                               "`, but that RGB stream was not found in " +
-                               contract_path.string() + ".");
-    }
-
-    const VisualContractEntry& aligned_rgb_entry = *aligned_rgb_it->second;
-    if (aligned_rgb_entry.type != VisualStreamType::kRgb) {
-      throw std::runtime_error("Depth stream `" + visual_entry.visual_name +
-                               "` aligns to `" +
-                               visual_entry.align_to_visual_name +
-                               "`, but that stream is not RGB.");
-    }
-    if (visual_entry.has_explicit_fps &&
-        std::abs(visual_entry.fps - aligned_rgb_entry.fps) > 1e-9) {
-      throw std::runtime_error("Depth stream `" + visual_entry.visual_name +
-                               "` must reuse the aligned RGB fps (" +
-                               std::to_string(aligned_rgb_entry.fps) +
-                               "), but it requests " +
-                               std::to_string(visual_entry.fps) + ".");
-    }
-
-    DepthStreamConfig depth_stream;
-    depth_stream.visual_name = visual_entry.visual_name;
-    depth_stream.redis_key = visual_entry.redis_key;
-    depth_stream.metadata_redis_key = visual_entry.metadata_redis_key;
-    depth_stream.encoding = visual_entry.encoding;
-    depth_stream.unit = visual_entry.unit;
-    depth_stream.align_to_visual_name = visual_entry.align_to_visual_name;
-    depth_stream.width = visual_entry.has_explicit_dimensions
-                             ? visual_entry.width
-                             : aligned_rgb_entry.width;
-    depth_stream.height = visual_entry.has_explicit_dimensions
-                              ? visual_entry.height
-                              : aligned_rgb_entry.height;
-    depth_stream.channels = visual_entry.channels;
-
-    if (depth_stream.width != aligned_rgb_entry.width ||
-        depth_stream.height != aligned_rgb_entry.height) {
-      throw std::runtime_error("Depth stream `" + visual_entry.visual_name +
-                               "` must match the aligned RGB dimensions (" +
-                               std::to_string(aligned_rgb_entry.width) + "x" +
-                               std::to_string(aligned_rgb_entry.height) +
-                               "), but it requests " +
-                               std::to_string(depth_stream.width) + "x" +
-                               std::to_string(depth_stream.height) + ".");
-    }
-
-    if (!aligned_depth_by_rgb_key
-             .emplace(visual_entry.align_to_visual_name, std::move(depth_stream))
-             .second) {
-      throw std::runtime_error(
-          "simulation.cpp only supports one depth stream aligned to an RGB key.");
-    }
-  }
-
-  for (const auto& visual_entry : visual_entries) {
-    if (visual_entry.type != VisualStreamType::kRgb) {
-      continue;
-    }
-
-    CameraStreamConfig camera;
-    camera.visual_name = visual_entry.visual_name;
-    camera.redis_key = visual_entry.redis_key;
-    camera.metadata_redis_key = visual_entry.metadata_redis_key;
-    camera.mujoco_camera_name = visual_entry.mujoco_camera_name;
-    camera.encoding = visual_entry.encoding;
-    camera.type = visual_entry.type;
-    camera.width = visual_entry.width;
-    camera.height = visual_entry.height;
-    camera.channels = visual_entry.channels;
-    camera.fps = visual_entry.fps;
-
-    const size_t image_size =
-        static_cast<size_t>(camera.width) * camera.height * camera.channels;
-    camera.rgb_buffer.resize(image_size);
-    camera.flipped_rgb_buffer.resize(image_size);
-    camera.bgr_buffer.resize(image_size);
-
-    const auto aligned_depth_it =
-        aligned_depth_by_rgb_key.find(camera.visual_name);
-    if (aligned_depth_it != aligned_depth_by_rgb_key.end()) {
-      DepthStreamConfig depth_stream = std::move(aligned_depth_it->second);
-      const size_t depth_pixel_count =
-          static_cast<size_t>(depth_stream.width) * depth_stream.height;
-      depth_stream.raw_depth_buffer.resize(depth_pixel_count);
-      depth_stream.flipped_depth_buffer.resize(depth_pixel_count);
-      depth_stream.depth_mm_buffer.resize(depth_pixel_count);
-      camera.aligned_depth = std::move(depth_stream);
-    }
-
-    config.cameras.push_back(std::move(camera));
-  }
-
-  return config;
-}
-
 void preflight_camera_publishers() {
   if (simulation_contract.cameras.empty()) {
     std::cout << "No visual keys found in the contract. Camera publishing is "
@@ -1197,50 +675,6 @@ void initialize_camera() {
 }  // namespace
 
 void controller_callback(const mjModel* m, mjData* d);
-void update_robot_state(const mjModel* m, const mjData* d);
-void update_redis(const mjModel* m, mjData* d);
-void query_redis_for_desired_state();
-void update_haptic_information(std::shared_ptr<SaiModel::SaiModel> robot);
-void send_haptic_commands();
-
-bool initialize_force_sensor_handles(const mjModel* model) {
-  ee_force_sensor_id =
-      mj_name2id(model, mjOBJ_SENSOR, kEndEffectorForceSensorName);
-  ee_torque_sensor_id =
-      mj_name2id(model, mjOBJ_SENSOR, kEndEffectorTorqueSensorName);
-  ee_sensor_site_id =
-      mj_name2id(model, mjOBJ_SITE, kEndEffectorSensorSiteName);
-
-  if (ee_force_sensor_id < 0 || ee_torque_sensor_id < 0 ||
-      ee_sensor_site_id < 0) {
-    std::cerr << "Could not find MuJoCo force/torque sensors `"
-              << kEndEffectorForceSensorName << "` and `"
-              << kEndEffectorTorqueSensorName << "` or site `"
-              << kEndEffectorSensorSiteName << "` in the loaded model.\n";
-    return false;
-  }
-
-  if (model->sensor_dim[ee_force_sensor_id] < 3 ||
-      model->sensor_dim[ee_torque_sensor_id] < 3) {
-    std::cerr << "MuJoCo force/torque sensors must each provide 3 values.\n";
-    return false;
-  }
-
-  return true;
-}
-
-Matrix3d get_force_sensor_rotation_in_world(const mjData* d) {
-  if (!d || ee_sensor_site_id < 0) {
-    return Matrix3d::Identity();
-  }
-
-  const mjtNum* site_rotation = d->site_xmat + 9 * ee_sensor_site_id;
-  Matrix3d world_rotation;
-  world_rotation << site_rotation[0], site_rotation[1], site_rotation[2],
-      site_rotation[3], site_rotation[4], site_rotation[5], site_rotation[6],
-      site_rotation[7], site_rotation[8];
-  return world_rotation;
-}
 
 void update_robot_state(const mjModel* m, const mjData* d) {
   VectorXd robot_q(kRobotDof);
@@ -1256,122 +690,6 @@ void update_robot_state(const mjModel* m, const mjData* d) {
   robot->updateModel();
 }
 
-Vector3d get_sensed_force(const mjModel* m, mjData* d,
-                         const bool express_in_world_frame = false) {
-  if (!m || !d || ee_force_sensor_id < 0) {
-    return Vector3d::Zero();
-  }
-
-  const int sensor_address = m->sensor_adr[ee_force_sensor_id];
-  const Vector3d sensed_force_sensor_frame(
-      d->sensordata[sensor_address + 0], d->sensordata[sensor_address + 1],
-      d->sensordata[sensor_address + 2]);
-  if (!express_in_world_frame) {
-    return sensed_force_sensor_frame;
-  }
-
-  return get_force_sensor_rotation_in_world(d) * sensed_force_sensor_frame;
-}
-
-Vector3d get_sensed_moment(const mjModel* m, mjData* d,
-                          const bool express_in_world_frame = false) {
-  if (!m || !d || ee_torque_sensor_id < 0) {
-    return Vector3d::Zero();
-  }
-
-  const int sensor_address = m->sensor_adr[ee_torque_sensor_id];
-  const Vector3d sensed_moment_sensor_frame(
-      d->sensordata[sensor_address + 0], d->sensordata[sensor_address + 1],
-      d->sensordata[sensor_address + 2]);
-  if (!express_in_world_frame) {
-    return sensed_moment_sensor_frame;
-  }
-
-  return get_force_sensor_rotation_in_world(d) * sensed_moment_sensor_frame;
-}
-
-void update_filtered_sensed_wrench(const mjModel* m, mjData* d) {
-  const Vector3d raw_force_sensor_frame = get_sensed_force(m, d, false);
-  const Vector3d raw_moment_sensor_frame = get_sensed_moment(m, d, false);
-
-  if (!sensed_wrench_filter_initialized) {
-    filtered_sensed_force_sensor_frame = raw_force_sensor_frame;
-    filtered_sensed_moment_sensor_frame = raw_moment_sensor_frame;
-    sensed_wrench_filter_initialized = true;
-    return;
-  }
-
-  filtered_sensed_force_sensor_frame =
-      (1.0 - kSensedWrenchLowPassAlpha) * filtered_sensed_force_sensor_frame +
-      kSensedWrenchLowPassAlpha * raw_force_sensor_frame;
-  filtered_sensed_moment_sensor_frame =
-      (1.0 - kSensedWrenchLowPassAlpha) * filtered_sensed_moment_sensor_frame +
-      kSensedWrenchLowPassAlpha * raw_moment_sensor_frame;
-}
-
-Vector3d get_filtered_sensed_force(const mjModel* m, mjData* d,
-                                   const bool express_in_world_frame = false) {
-  const Vector3d sensed_force_sensor_frame = sensed_wrench_filter_initialized
-                                                 ? filtered_sensed_force_sensor_frame
-                                                 : get_sensed_force(m, d, false);
-  if (!express_in_world_frame) {
-    return sensed_force_sensor_frame;
-  }
-  return get_force_sensor_rotation_in_world(d) * sensed_force_sensor_frame;
-}
-
-Vector3d get_filtered_sensed_moment(const mjModel* m, mjData* d,
-                                    const bool express_in_world_frame = false) {
-  const Vector3d sensed_moment_sensor_frame = sensed_wrench_filter_initialized
-                                                  ? filtered_sensed_moment_sensor_frame
-                                                  : get_sensed_moment(m, d, false);
-  if (!express_in_world_frame) {
-    return sensed_moment_sensor_frame;
-  }
-  return get_force_sensor_rotation_in_world(d) * sensed_moment_sensor_frame;
-}
-
-void update_particle_filter() {
-
-    // Vector3d dx_world = motion_force_task->getGoalPosition() - motion_force_task->getCurrentPosition();
-    Vector3d dx_world = Vector3d(0,0, -0.1);
-
-    Vector3d robot_velocity = motion_force_task->getCurrentLinearVelocity();
-    Vector3d sensed_force_world_frame = get_filtered_sensed_force(m, d, true);
-
-    Vector3d motion_control = 0.2 * sigma_motion * dx_world;
-    Vector3d force_control = 0.2 * sigma_force * dx_world;
-
-    force_space_particle_filter->update(motion_control, force_control, robot_velocity, sensed_force_world_frame);
-    Vector3d motion_or_force_axis = force_space_particle_filter->getForceOrMotionAxis();
-    int fdim = force_space_particle_filter->getForceSpaceDimension();
-    force_dimension_queue.pop();
-    force_dimension_queue.push(fdim);
-
-    if (fdim == 0) {
-      sigma_force = Matrix3d::Zero();
-      sigma_motion = Matrix3d::Identity();
-    } else if (fdim == 1) {
-      sigma_force = motion_or_force_axis * motion_or_force_axis.transpose();
-      sigma_motion = Matrix3d::Identity() - sigma_force;
-    } else if (fdim == 2) {
-      sigma_motion = motion_or_force_axis * motion_or_force_axis.transpose();
-      sigma_force = Matrix3d::Identity() - sigma_motion;
-    } else if (fdim == 3) {
-      sigma_force = Matrix3d::Identity();
-      sigma_motion = Matrix3d::Zero();
-    }
-
-    // std::cout << "Updated particle filter. Force space dimension: " << fdim
-    //           << ", motion control: " << motion_control.transpose()
-    //           << ", force control: " << force_control.transpose()
-    //           << ", sigma_motion:\n" << sigma_motion
-    //           << "\nsigma_force:\n" << sigma_force
-    //           << std::endl;
-
-
-}
-
 void inference_time_callback(const mjModel* m, mjData* d) {
 
   //When the robot is in inference mode, we have things that are ---- 
@@ -1380,16 +698,29 @@ void inference_time_callback(const mjModel* m, mjData* d) {
   static int particle_filter_count = 0;
 
   if (particle_filter_count % 67 == 0) {  // Update the particle filter every 67 control steps (approximately every 1 second at 15ms control timestep)
-    update_particle_filter();
+    update_particle_filter(
+        motion_force_task, force_space_particle_filter, force_dimension_queue,
+        sigma_force, sigma_motion, m, d, ee_force_sensor_id,
+        ee_sensor_site_id, filtered_sensed_force_sensor_frame,
+        sensed_wrench_filter_initialized);
     particle_filter_count = 0;
   }
 
   particle_filter_count++;
 
   update_robot_state(m, d);
-  update_filtered_sensed_wrench(m, d);
-  update_redis(m, d);
-  query_redis_for_desired_state();
+  update_filtered_sensed_wrench(
+      m, d, ee_force_sensor_id, ee_torque_sensor_id, ee_sensor_site_id,
+      kSensedWrenchLowPassAlpha, filtered_sensed_force_sensor_frame,
+      filtered_sensed_moment_sensor_frame, sensed_wrench_filter_initialized);
+  update_redis(redis_client, motion_force_task, force_space_particle_filter, m,
+               d, kRobotDof, ee_force_sensor_id, ee_torque_sensor_id,
+               ee_sensor_site_id, filtered_sensed_force_sensor_frame,
+               filtered_sensed_moment_sensor_frame,
+               sensed_wrench_filter_initialized, force_or_motion_axis,
+               force_dimension);
+  query_redis_for_desired_state(redis_client, motion_force_task,
+                                force_dimension, force_or_motion_axis);
 
   motion_force_task->updateTaskModel(MatrixXd::Identity(robot->dof(), robot->dof()));
   joint_task->updateTaskModel(motion_force_task->getTaskAndPreviousNullspace());
@@ -1408,16 +739,35 @@ void data_collection_time_callback(const mjModel* m, mjData* d) {
   //If inference mode is false ---- then we are in data collection mo
 
   update_robot_state(m, d);
-  update_filtered_sensed_wrench(m, d);
-  update_redis(m, d);
-  update_haptic_information(robot);
+  update_filtered_sensed_wrench(
+      m, d, ee_force_sensor_id, ee_torque_sensor_id, ee_sensor_site_id,
+      kSensedWrenchLowPassAlpha, filtered_sensed_force_sensor_frame,
+      filtered_sensed_moment_sensor_frame, sensed_wrench_filter_initialized);
+  update_redis(redis_client, motion_force_task, force_space_particle_filter, m,
+               d, kRobotDof, ee_force_sensor_id, ee_torque_sensor_id,
+               ee_sensor_site_id, filtered_sensed_force_sensor_frame,
+               filtered_sensed_moment_sensor_frame,
+               sensed_wrench_filter_initialized, force_or_motion_axis,
+               force_dimension);
+  update_haptic_information(robot, control_link, redis_client, m, d,
+                            ee_force_sensor_id, ee_torque_sensor_id,
+                            ee_sensor_site_id,
+                            filtered_sensed_force_sensor_frame,
+                            filtered_sensed_moment_sensor_frame,
+                            sensed_wrench_filter_initialized, haptic_input);
   haptic_output = haptic_controller->computeHapticControl(haptic_input);
 
-  send_haptic_commands();
+  send_haptic_commands(redis_client, haptic_output);
 
   motion_force_task->updateSensedForceAndMoment(
-     -1 * get_filtered_sensed_force(m, d),
-      -1 *get_filtered_sensed_moment(m, d));
+      -1 * get_filtered_sensed_force(
+               m, d, ee_force_sensor_id, ee_sensor_site_id,
+               filtered_sensed_force_sensor_frame,
+               sensed_wrench_filter_initialized),
+      -1 * get_filtered_sensed_moment(
+               m, d, ee_torque_sensor_id, ee_sensor_site_id,
+               filtered_sensed_moment_sensor_frame,
+               sensed_wrench_filter_initialized));
 
   motion_force_task->setGoalPosition(haptic_output.robot_goal_position);
   motion_force_task->setGoalOrientation(
@@ -1430,7 +780,11 @@ void data_collection_time_callback(const mjModel* m, mjData* d) {
       motion_force_task->computeTorques() + joint_task->computeTorques() +
       robot->jointGravityVector();
 
-  Vector3d sensed_force_world_frame = -1 *get_filtered_sensed_force(m, d, true);
+  Vector3d sensed_force_world_frame =
+      -1 * get_filtered_sensed_force(
+               m, d, ee_force_sensor_id, ee_sensor_site_id,
+               filtered_sensed_force_sensor_frame,
+               sensed_wrench_filter_initialized, true);
 
   for (int i = 0; i < 3; ++i) {
     if (fabs(sensed_force_world_frame(i)) >= 0.5 &&
@@ -1476,161 +830,13 @@ void controller_callback(const mjModel* m, mjData* d) {
     return;
   }
 
+  update_reset_request_from_redis(redis_client, reset_requested);
+
   if (is_data_collection) {
     data_collection_time_callback(m, d);
   } else {
     inference_time_callback(m, d);
   }
-}
-
-// -------- Redis Code ---------------------------------
-
-void init_redis() {
-    redis_client.setEigen(DESIRED_CARTESIAN_POSITION, START_POS);
-    redis_client.setEigen(DESIRED_CARTESIAN_ORIENTATION, START_ORIENTATION);
-    redis_client.setBool(RESET, false);
-}
-
-void update_redis(const mjModel* m, mjData* d) {
-    Vector3d currentPosition = motion_force_task->getCurrentPosition();
-    Matrix3d currentOrientation = motion_force_task->getCurrentOrientation();
-    Vector3d currentLinearVelocity =
-        motion_force_task->getCurrentLinearVelocity();
-
-    redis_client.setEigen(CURRENT_CARTESIAN_POSITION, currentPosition);
-    redis_client.setEigen(CURRENT_CARTESIAN_ORIENTATION, currentOrientation);
-    redis_client.setEigen(CURRENT_CARTESIAN_VELOCITY, currentLinearVelocity);
-
-    VectorXd qpos(kRobotDof);
-    for (int i = 0; i < kRobotDof; ++i) {
-      qpos(i) = d->qpos[i];
-    }
-
-    redis_client.setEigen(QPOS, qpos);
-
-    Vector3d sensed_force = -1 * get_filtered_sensed_force(m, d, true);
-    Vector3d sensed_moment = -1 *get_filtered_sensed_moment(m, d, true);
-    redis_client.setEigen(SENSED_FORCE, sensed_force);
-    redis_client.setEigen(SENSED_MOMENT, sensed_moment);
-    redis_client.setEigen(FORCE_OR_MOTION_AXIS, force_space_particle_filter->getForceOrMotionAxis());
-    redis_client.setInt(FORCE_DIMENSION, force_space_particle_filter->getForceSpaceDimension());
-}
-
-void query_redis_for_desired_state() {
-    const MatrixXd desired_position = redis_client.getEigen(DESIRED_CARTESIAN_POSITION);
-    const MatrixXd desired_orientation = redis_client.getEigen(DESIRED_CARTESIAN_ORIENTATION);
-
-    motion_force_task->setGoalPosition(desired_position.col(0).head<3>());
-    motion_force_task->setGoalOrientation(desired_orientation.topLeftCorner<3, 3>());
-}
-
-void update_haptic_information(std::shared_ptr<SaiModel::SaiModel> robot) {
-  haptic_input.device_position =
-      redis_client.getEigen(createRedisKey(POSITION_KEY_SUFFIX, 0));
-  haptic_input.device_orientation =
-      redis_client.getEigen(createRedisKey(ROTATION_KEY_SUFFIX, 0));
-  haptic_input.device_linear_velocity =
-      redis_client.getEigen(createRedisKey(LINEAR_VELOCITY_KEY_SUFFIX, 0));
-  haptic_input.device_angular_velocity =
-      redis_client.getEigen(createRedisKey(ANGULAR_VELOCITY_KEY_SUFFIX, 0));
-
-  haptic_input.robot_position = robot->positionInWorld(control_link);
-  haptic_input.robot_orientation = robot->rotationInWorld(control_link);
-  haptic_input.robot_linear_velocity =
-    robot->linearVelocityInWorld(control_link);
-  haptic_input.robot_angular_velocity =
-    robot->angularVelocityInWorld(control_link);
-  // This example still uses proxy feedback instead of direct wrench feedback.
-  // The MuJoCo helpers above can now return either sensor-frame or world-frame
-  // wrench depending on the call-site flag.
-  haptic_input.robot_sensed_force = -1 *get_filtered_sensed_force(m, d, true);
-  haptic_input.robot_sensed_moment = -1 * get_filtered_sensed_moment(m, d, true);
-}
-
-void send_haptic_commands() {
-  redis_client.setEigen(createRedisKey(COMMANDED_FORCE_KEY_SUFFIX, 0),
-                        haptic_output.device_command_force);
-  redis_client.setEigen(createRedisKey(COMMANDED_TORQUE_KEY_SUFFIX, 0),
-                        haptic_output.device_command_moment);
-  redis_client.setEigen(HAPTIC_COMMANDED_POSITION,
-                        haptic_output.robot_goal_position);
-  redis_client.setEigen(HAPTIC_COMMANDED_ORIENTATION,
-                        haptic_output.robot_goal_orientation);
-}
-
-void init_haptic_controller() {
-
-  SaiPrimitives::HapticDeviceController::DeviceLimits device_limits(
-          redis_client.getEigen(createRedisKey(MAX_STIFFNESS_KEY_SUFFIX, 0)),
-          redis_client.getEigen(createRedisKey(MAX_DAMPING_KEY_SUFFIX, 0)),
-          redis_client.getEigen(createRedisKey(MAX_FORCE_KEY_SUFFIX, 0)));
-
-  haptic_controller =
-      std::make_shared<SaiPrimitives::HapticDeviceController>(
-          device_limits, robot->transformInWorld(control_link));
-
-  haptic_controller->setScalingFactors(3.5);
-  haptic_controller->setHapticControlType(
-      SaiPrimitives::HapticControlType::MOTION_MOTION);
-  directions_of_proxy_feedback = Vector3i::Zero();
-  prev_sensed_force = Vector3d::Zero();
-
-  haptic_controller->setDeviceControlGains(
-    0.02 * device_limits.max_linear_stiffness,
-    0.02 * device_limits.max_linear_damping,
-    0.02 * device_limits.max_angular_stiffness,
-    0.02 * device_limits.max_angular_damping);
-
-  haptic_controller->setReductionFactorForce(0.05);
-  haptic_controller->setReductionFactorMoment(0.05);
-}
-
-void init_particle_filter() {
-  const fs::path settings_path = fs::path("particle_filter/pfilter_settings.yaml");
-  if (!fs::exists(settings_path)) {
-    throw std::runtime_error("Could not find pfilter_settings.yaml");
-  }
-
-  const YAML::Node config = YAML::LoadFile(settings_path.string());
-  if (!config["filter"]) {
-    throw std::runtime_error("Missing 'filter' section in pfilter_settings.yaml");
-  }
-
-  const YAML::Node filter = config["filter"];
-
-  const int n_particles = filter["n_particles"].as<int>();
-  const double filter_freq = filter["filter_freq"].as<double>();
-  const int queue_size = filter["queue_size"].as<int>();
-  const double f_low = filter["f_low"].as<double>();
-  const double f_high = filter["f_high"].as<double>();
-  const double v_low = filter["v_low"].as<double>();
-  const double v_high = filter["v_high"].as<double>();
-  const double f_low_add = filter["f_low_add"].as<double>();
-  const double f_high_add = filter["f_high_add"].as<double>();
-  const double v_low_add = filter["v_low_add"].as<double>();
-  const double v_high_add = filter["v_high_add"].as<double>();
-
-  (void)filter_freq;
-
-  std::cout << "Loaded particle filter settings from: " << settings_path << std::endl;
-  std::cout << "Particle filter config: n_particles=" << n_particles
-            << " queue_size=" << queue_size << std::endl;
-
-  force_space_particle_filter =
-      std::make_shared<ForceWM::ForceSpaceParticleFilter>(n_particles);
-  force_space_particle_filter->setParameters(0, 0.025, 0.3, 0.05);
-  force_space_particle_filter->setWeightingParameters(
-      f_low, f_high, v_low, v_high, f_low_add, f_high_add, v_low_add, v_high_add);
-
-  while (!force_dimension_queue.empty()) {
-    force_dimension_queue.pop();
-  }
-
-  for (int j = 0; j < queue_size; ++j) {
-    force_dimension_queue.push(0);
-  }
-
-  force_space_particle_filter->reset();
 }
 
 void simulation_thread_main(SimulationLoopStats* simulation_loop_stats) {
@@ -1982,7 +1188,10 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  if (!initialize_force_sensor_handles(m)) {
+  if (!initialize_force_sensor_handles(
+          m, kEndEffectorForceSensorName, kEndEffectorTorqueSensorName,
+          kEndEffectorSensorSiteName, ee_force_sensor_id, ee_torque_sensor_id,
+          ee_sensor_site_id)) {
     mj_deleteData(d);
     mj_deleteModel(m);
     return 1;
@@ -2007,7 +1216,7 @@ int main(int argc, char** argv) {
 
   // loading up the redis client 
   redis_client.connect();
-  init_redis();
+  init_redis(redis_client, START_POS, START_ORIENTATION);
 
   //resetting the robot to the home position
   reset_to_home();
@@ -2030,12 +1239,15 @@ int main(int argc, char** argv) {
   // ----------------------------------------------------------------------------
 
   // ---------------------------------FSPF------------------------------
-  init_particle_filter();
+  init_particle_filter(fs::path("particle_filter/pfilter_settings.yaml"),
+                       force_space_particle_filter, force_dimension_queue);
   // -------------------------------------------------------------------
 
   if (is_data_collection) {
     try {
-      init_haptic_controller();
+      init_haptic_controller(redis_client, robot, control_link,
+                             haptic_controller, directions_of_proxy_feedback,
+                             prev_sensed_force);
     } catch (const std::exception& exception) {
       std::cerr << exception.what() << "\n";
       mj_deleteData(d);

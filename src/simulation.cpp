@@ -87,8 +87,7 @@ std::shared_ptr<ForceWM::ForceSpaceParticleFilter> force_space_particle_filter;
 std::queue<int> force_dimension_queue;
 Matrix3d sigma_force = Matrix3d::Zero();
 Matrix3d sigma_motion = Matrix3d::Identity();
-Vector3d force_or_motion_axis = Vector3d::Zero();
-int force_dimension = 0;
+PFilterOutput pfilter_output;
 
 std::shared_ptr<SaiPrimitives::HapticDeviceController> haptic_controller;
 SaiPrimitives::HapticControllerInput haptic_input;
@@ -600,6 +599,20 @@ void reset_to_home() {
   filtered_sensed_moment_sensor_frame = Vector3d::Zero();
   sensed_wrench_filter_initialized = false;
   directions_of_proxy_feedback = Vector3i::Zero();
+  sigma_force = Matrix3d::Zero();
+  sigma_motion = Matrix3d::Identity();
+  pfilter_output = PFilterOutput{};
+  if (force_space_particle_filter) {
+    force_space_particle_filter->reset();
+  }
+
+  const std::size_t queue_size = force_dimension_queue.size();
+  while (!force_dimension_queue.empty()) {
+    force_dimension_queue.pop();
+  }
+  for (std::size_t i = 0; i < queue_size; ++i) {
+    force_dimension_queue.push(0);
+  }
 
   mj_forward(m, d);
 }
@@ -699,8 +712,8 @@ void inference_time_callback(const mjModel* m, mjData* d) {
 
   if (particle_filter_count % 67 == 0) {  // Update the particle filter every 67 control steps (approximately every 1 second at 15ms control timestep)
     update_particle_filter(
-        motion_force_task, force_space_particle_filter, force_dimension_queue,
-        sigma_force, sigma_motion, m, d, ee_force_sensor_id,
+        motion_force_task, force_space_particle_filter, pfilter_output,
+        force_dimension_queue, sigma_force, sigma_motion, m, d, ee_force_sensor_id,
         ee_sensor_site_id, filtered_sensed_force_sensor_frame,
         sensed_wrench_filter_initialized);
     particle_filter_count = 0;
@@ -713,14 +726,15 @@ void inference_time_callback(const mjModel* m, mjData* d) {
       m, d, ee_force_sensor_id, ee_torque_sensor_id, ee_sensor_site_id,
       kSensedWrenchLowPassAlpha, filtered_sensed_force_sensor_frame,
       filtered_sensed_moment_sensor_frame, sensed_wrench_filter_initialized);
-  update_redis(redis_client, motion_force_task, force_space_particle_filter, m,
+  update_redis(redis_client, motion_force_task, force_space_particle_filter,
+               pfilter_output, m,
                d, kRobotDof, ee_force_sensor_id, ee_torque_sensor_id,
                ee_sensor_site_id, filtered_sensed_force_sensor_frame,
                filtered_sensed_moment_sensor_frame,
-               sensed_wrench_filter_initialized, force_or_motion_axis,
-               force_dimension);
+               sensed_wrench_filter_initialized);
   query_redis_for_desired_state(redis_client, motion_force_task,
-                                force_dimension, force_or_motion_axis);
+                                pfilter_output.force_space_dimension,
+                                pfilter_output.force_or_motion_axis);
 
   motion_force_task->updateTaskModel(MatrixXd::Identity(robot->dof(), robot->dof()));
   joint_task->updateTaskModel(motion_force_task->getTaskAndPreviousNullspace());
@@ -743,12 +757,12 @@ void data_collection_time_callback(const mjModel* m, mjData* d) {
       m, d, ee_force_sensor_id, ee_torque_sensor_id, ee_sensor_site_id,
       kSensedWrenchLowPassAlpha, filtered_sensed_force_sensor_frame,
       filtered_sensed_moment_sensor_frame, sensed_wrench_filter_initialized);
-  update_redis(redis_client, motion_force_task, force_space_particle_filter, m,
+  update_redis(redis_client, motion_force_task, force_space_particle_filter,
+               pfilter_output, m,
                d, kRobotDof, ee_force_sensor_id, ee_torque_sensor_id,
                ee_sensor_site_id, filtered_sensed_force_sensor_frame,
                filtered_sensed_moment_sensor_frame,
-               sensed_wrench_filter_initialized, force_or_motion_axis,
-               force_dimension);
+               sensed_wrench_filter_initialized);
   update_haptic_information(robot, control_link, redis_client, m, d,
                             ee_force_sensor_id, ee_torque_sensor_id,
                             ee_sensor_site_id,

@@ -1,6 +1,7 @@
 #include "control_utils.h"
 
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 
 #include <yaml-cpp/yaml.h>
@@ -9,6 +10,41 @@
 #include "redis_keys.h"
 
 using namespace SaiCommon::ChaiHapticDriverKeys;
+
+namespace {
+
+bool all_elements_same(std::queue<int> queue) {
+  if (queue.empty()) {
+    return true;
+  }
+
+  const int first = queue.front();
+  while (!queue.empty()) {
+    if (queue.front() != first) {
+      return false;
+    }
+    queue.pop();
+  }
+  return true;
+}
+
+std::string queue_to_string(std::queue<int> queue) {
+  std::ostringstream stream;
+  stream << "[";
+  bool first = true;
+  while (!queue.empty()) {
+    if (!first) {
+      stream << ", ";
+    }
+    first = false;
+    stream << queue.front();
+    queue.pop();
+  }
+  stream << "]";
+  return stream.str();
+}
+
+}  // namespace
 
 bool initialize_force_sensor_handles(const mjModel* model,
                                      const char* force_sensor_name,
@@ -168,6 +204,7 @@ void update_particle_filter(
     const std::shared_ptr<SaiPrimitives::MotionForceTask>& motion_force_task,
     const std::shared_ptr<ForceWM::ForceSpaceParticleFilter>&
         force_space_particle_filter,
+    PFilterOutput& pfilter_output,
     std::queue<int>& force_dimension_queue,
     Matrix3d& sigma_force,
     Matrix3d& sigma_motion,
@@ -177,7 +214,7 @@ void update_particle_filter(
     int ee_sensor_site_id,
     const Vector3d& filtered_sensed_force_sensor_frame,
     bool sensed_wrench_filter_initialized) {
-  Vector3d dx_world = Vector3d(0, 0, -0.1);
+  Vector3d dx_world = motion_force_task->getGoalPosition() - motion_force_task->getCurrentPosition();
 
   const Vector3d robot_velocity = motion_force_task->getCurrentLinearVelocity();
   const Vector3d sensed_force_world_frame = get_filtered_sensed_force(
@@ -185,8 +222,8 @@ void update_particle_filter(
       filtered_sensed_force_sensor_frame, sensed_wrench_filter_initialized,
       true);
 
-  const Vector3d motion_control = 0.2 * sigma_motion * dx_world;
-  const Vector3d force_control = 0.2 * sigma_force * dx_world;
+  const Vector3d motion_control = 50 * sigma_motion * dx_world;
+  const Vector3d force_control = 50 * sigma_force * dx_world;
 
   force_space_particle_filter->update(motion_control, force_control,
                                       robot_velocity,
@@ -196,17 +233,44 @@ void update_particle_filter(
   const int fdim = force_space_particle_filter->getForceSpaceDimension();
   force_dimension_queue.pop();
   force_dimension_queue.push(fdim);
+  pfilter_output.flag_force_to_free = false;
+  const bool queue_is_uniform = all_elements_same(force_dimension_queue);
 
   if (fdim == 0) {
+    if (!queue_is_uniform) {
+      std::cout << "Particle filter update: raw_fdim=" << fdim
+                << " queue=" << queue_to_string(force_dimension_queue)
+                << " force_to_free=false"
+                << " action=hold_previous_constraint" << std::endl;
+      return;
+    }
+    pfilter_output.flag_force_to_free = true;
+  }
+
+  pfilter_output.force_space_dimension = fdim;
+  pfilter_output.force_or_motion_axis = motion_or_force_axis;
+  std::cout << "Particle filter update: raw_fdim=" << fdim
+            << " queue=" << queue_to_string(force_dimension_queue)
+            << " force_to_free="
+            << (pfilter_output.flag_force_to_free ? "true" : "false")
+            << " committed_fdim=" << pfilter_output.force_space_dimension
+            << "dx_world=" << dx_world.transpose()
+            << "motion_control=" << motion_control.transpose()
+            << "force_control=" << force_control.transpose()
+            << std::endl;
+
+  if (pfilter_output.force_space_dimension == 0) {
     sigma_force = Matrix3d::Zero();
     sigma_motion = Matrix3d::Identity();
-  } else if (fdim == 1) {
-    sigma_force = motion_or_force_axis * motion_or_force_axis.transpose();
+  } else if (pfilter_output.force_space_dimension == 1) {
+    sigma_force = pfilter_output.force_or_motion_axis *
+                  pfilter_output.force_or_motion_axis.transpose();
     sigma_motion = Matrix3d::Identity() - sigma_force;
-  } else if (fdim == 2) {
-    sigma_motion = motion_or_force_axis * motion_or_force_axis.transpose();
+  } else if (pfilter_output.force_space_dimension == 2) {
+    sigma_motion = pfilter_output.force_or_motion_axis *
+                   pfilter_output.force_or_motion_axis.transpose();
     sigma_force = Matrix3d::Identity() - sigma_motion;
-  } else if (fdim == 3) {
+  } else if (pfilter_output.force_space_dimension == 3) {
     sigma_force = Matrix3d::Identity();
     sigma_motion = Matrix3d::Zero();
   }
@@ -238,6 +302,7 @@ void update_redis(
     const std::shared_ptr<SaiPrimitives::MotionForceTask>& motion_force_task,
     const std::shared_ptr<ForceWM::ForceSpaceParticleFilter>&
         force_space_particle_filter,
+    const PFilterOutput& pfilter_output,
     const mjModel* m,
     const mjData* d,
     int robot_dof,
@@ -246,9 +311,7 @@ void update_redis(
     int ee_sensor_site_id,
     const Vector3d& filtered_sensed_force_sensor_frame,
     const Vector3d& filtered_sensed_moment_sensor_frame,
-    bool sensed_wrench_filter_initialized,
-    Vector3d& force_or_motion_axis,
-    int& force_dimension) {
+    bool sensed_wrench_filter_initialized) {
   const Vector3d current_position = motion_force_task->getCurrentPosition();
   const Matrix3d current_orientation =
       motion_force_task->getCurrentOrientation();
@@ -280,10 +343,9 @@ void update_redis(
   redis_client.setEigen(SENSED_FORCE, sensed_force);
   redis_client.setEigen(SENSED_MOMENT, sensed_moment);
 
-  force_or_motion_axis = force_space_particle_filter->getForceOrMotionAxis();
-  force_dimension = force_space_particle_filter->getForceSpaceDimension();
-  redis_client.setEigen(FORCE_OR_MOTION_AXIS, force_or_motion_axis);
-  redis_client.setInt(FORCE_DIMENSION, force_dimension);
+  (void)force_space_particle_filter;
+  redis_client.setEigen(FORCE_OR_MOTION_AXIS, pfilter_output.force_or_motion_axis);
+  redis_client.setInt(FORCE_DIMENSION, pfilter_output.force_space_dimension);
 }
 
 void query_redis_for_desired_state(
@@ -297,7 +359,7 @@ void query_redis_for_desired_state(
       redis_client.getEigen(DESIRED_CARTESIAN_ORIENTATION);
   const Vector3d desired_force = redis_client.getEigen(DESIRED_FORCE);
 
-  motion_force_task->setGoalForce(desired_force);
+  // motion_force_task->setGoalForce(desired_force);
   motion_force_task->parametrizeForceMotionSpaces(force_dimension,
                                                   force_or_motion_axis);
   motion_force_task->setGoalPosition(desired_position.col(0).head<3>());

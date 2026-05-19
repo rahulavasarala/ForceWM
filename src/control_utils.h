@@ -13,6 +13,12 @@
 #include "particle_filter/ForceSpaceParticleFilter.h"
 #include "redis/RedisClient.h"
 
+struct PFilterOutput {
+  Vector3d force_or_motion_axis = Vector3d::Zero();
+  bool flag_force_to_free = false;
+  int force_space_dimension = 0;
+};
+
 bool initialize_force_sensor_handles(const mjModel* model,
                                      const char* force_sensor_name,
                                      const char* torque_sensor_name,
@@ -68,6 +74,7 @@ void update_particle_filter(
     const std::shared_ptr<SaiPrimitives::MotionForceTask>& motion_force_task,
     const std::shared_ptr<ForceWM::ForceSpaceParticleFilter>&
         force_space_particle_filter,
+    PFilterOutput& pfilter_output,
     std::queue<int>& force_dimension_queue,
     Matrix3d& sigma_force,
     Matrix3d& sigma_motion,
@@ -90,6 +97,7 @@ void update_redis(
     const std::shared_ptr<SaiPrimitives::MotionForceTask>& motion_force_task,
     const std::shared_ptr<ForceWM::ForceSpaceParticleFilter>&
         force_space_particle_filter,
+    const PFilterOutput& pfilter_output,
     const mjModel* m,
     const mjData* d,
     int robot_dof,
@@ -98,9 +106,7 @@ void update_redis(
     int ee_sensor_site_id,
     const Vector3d& filtered_sensed_force_sensor_frame,
     const Vector3d& filtered_sensed_moment_sensor_frame,
-    bool sensed_wrench_filter_initialized,
-    Vector3d& force_or_motion_axis,
-    int& force_dimension);
+    bool sensed_wrench_filter_initialized);
 
 void query_redis_for_desired_state(
     SaiCommon::RedisClient& redis_client,

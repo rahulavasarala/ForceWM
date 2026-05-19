@@ -34,7 +34,7 @@
         density="1000"
         contype="1"
         conaffinity="1"
-        friction = "0.0 0.0 0.0"
+        friction = "0.1 0.1 0.1"
         rgba="1 1 1 1"/>
 
   </worldbody>

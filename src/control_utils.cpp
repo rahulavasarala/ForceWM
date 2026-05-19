@@ -3,6 +3,7 @@
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
+#include <cmath>
 
 #include <yaml-cpp/yaml.h>
 
@@ -231,6 +232,9 @@ void update_particle_filter(
   const Vector3d motion_or_force_axis =
       force_space_particle_filter->getForceOrMotionAxis();
   const int fdim = force_space_particle_filter->getForceSpaceDimension();
+  const double normal_force =
+      fdim == 1 ? std::abs(motion_or_force_axis.dot(sensed_force_world_frame))
+                : 0.0;
   force_dimension_queue.pop();
   force_dimension_queue.push(fdim);
   pfilter_output.flag_force_to_free = false;
@@ -241,6 +245,9 @@ void update_particle_filter(
       std::cout << "Particle filter update: raw_fdim=" << fdim
                 << " queue=" << queue_to_string(force_dimension_queue)
                 << " force_to_free=false"
+                << " sensed_force_world_frame="
+                << sensed_force_world_frame.transpose()
+                << " normal_force=" << normal_force
                 << " action=hold_previous_constraint" << std::endl;
       return;
     }
@@ -254,6 +261,9 @@ void update_particle_filter(
             << " force_to_free="
             << (pfilter_output.flag_force_to_free ? "true" : "false")
             << " committed_fdim=" << pfilter_output.force_space_dimension
+            << " sensed_force_world_frame="
+            << sensed_force_world_frame.transpose()
+            << " normal_force=" << normal_force
             << "dx_world=" << dx_world.transpose()
             << "motion_control=" << motion_control.transpose()
             << "force_control=" << force_control.transpose()
@@ -359,9 +369,12 @@ void query_redis_for_desired_state(
       redis_client.getEigen(DESIRED_CARTESIAN_ORIENTATION);
   const Vector3d desired_force = redis_client.getEigen(DESIRED_FORCE);
 
-  // motion_force_task->setGoalForce(desired_force);
+  motion_force_task->setGoalForce(desired_force);
   motion_force_task->parametrizeForceMotionSpaces(force_dimension,
                                                   force_or_motion_axis);
+
+  
+  
   motion_force_task->setGoalPosition(desired_position.col(0).head<3>());
   motion_force_task->setGoalOrientation(
       desired_orientation.topLeftCorner<3, 3>());

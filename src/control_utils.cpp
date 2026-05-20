@@ -223,8 +223,8 @@ void update_particle_filter(
       filtered_sensed_force_sensor_frame, sensed_wrench_filter_initialized,
       true);
 
-  const Vector3d motion_control = 50 * sigma_motion * dx_world;
-  const Vector3d force_control = 50 * sigma_force * dx_world;
+  const Vector3d motion_control = 30 * sigma_motion * dx_world;
+  const Vector3d force_control = 30 * sigma_force * dx_world;
 
   force_space_particle_filter->update(motion_control, force_control,
                                       robot_velocity,

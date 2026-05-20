@@ -710,7 +710,7 @@ void inference_time_callback(const mjModel* m, mjData* d) {
 
   static int particle_filter_count = 0;
 
-  if (particle_filter_count % 67 == 0) {  // Update the particle filter every 67 control steps (approximately every 1 second at 15ms control timestep)
+  if (particle_filter_count % 33 == 0) {  // Update the particle filter every 67 control steps (approximately every 1 second at 15ms control timestep)
     update_particle_filter(
         motion_force_task, force_space_particle_filter, pfilter_output,
         force_dimension_queue, sigma_force, sigma_motion, m, d, ee_force_sensor_id,

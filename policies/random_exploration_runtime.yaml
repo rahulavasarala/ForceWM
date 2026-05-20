@@ -1,0 +1,24 @@
+metadata_path: generated_cad/default_part/generation_metadata.json
+universal_contract: universal_contract.yaml
+
+redis:
+  host: 127.0.0.1
+  port: 6379
+  db: 0
+
+runtime:
+  translation_world: [0.4, 0.0, 0.3]
+  interpolator_frequency_hz: 100.0
+  blend_duration_s: 0.1
+  rng_seed: null
+
+planner:
+  chunk_length: 8
+  replan_every_n_chunks: 4
+  action_hz_q: 10.0
+  step_length_k: 0.001
+  step_noise_std: 0.001
+  direction_noise_std_deg: 35.0
+  z_noise_std: 0.0005
+  step_noise_decay: 0.98
+  direction_noise_decay: 0.98

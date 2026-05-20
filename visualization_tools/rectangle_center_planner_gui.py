@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib import patches
 from matplotlib.widgets import Button, Slider
+from mpl_toolkits.mplot3d import proj3d
 from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation, Slerp
 
@@ -21,11 +23,16 @@ from policies.random_exploration_policy import (  # noqa: E402
     PlannerParams,
     compute_surface_tangent_quaternion,
     direction_noise_std_deg,
-    load_planner_params,
+    load_planner_params_from_generation_metadata,
     plan_action_poses,
     step_noise_std,
     surface_position_at_xy,
 )
+
+
+SURFACE_MESH_RESOLUTION = 65
+SURFACE_PICK_RESOLUTION = 95
+SURFACE_PICK_PIXEL_THRESHOLD = 18.0
 
 
 def _format_vector(vector: np.ndarray | None) -> str:
@@ -44,9 +51,21 @@ def effective_replan_after(params: PlannerParams) -> int:
 
 
 class RectangleCenterPlannerGui:
-    def __init__(self, config_path: Path, seed: int | None = None) -> None:
-        self.config_path = Path(config_path).expanduser().resolve()
-        self.initial_params = load_planner_params(self.config_path)
+    def __init__(
+        self,
+        metadata_path: Path,
+        planner_config_path: Path = DEFAULT_CONFIG_PATH,
+        seed: int | None = None,
+    ) -> None:
+        self.metadata_path = Path(metadata_path).expanduser().resolve()
+        if not self.metadata_path.is_file():
+            raise FileNotFoundError(f"Generation metadata not found: {self.metadata_path}")
+        self.planner_config_path = Path(planner_config_path).expanduser().resolve()
+        self.params = load_planner_params_from_generation_metadata(
+            self.metadata_path,
+            planner_config_path=self.planner_config_path,
+        )
+        self.metadata = json.loads(self.metadata_path.read_text(encoding="utf-8"))
         self.rng = np.random.default_rng(seed)
 
         self.start_xy: np.ndarray | None = None
@@ -66,7 +85,6 @@ class RectangleCenterPlannerGui:
         self.orientation_slerp: Slerp | None = None
         self.plan_key_times = np.zeros(0, dtype=float)
         self.plan_cycle_start_wall_time: float | None = None
-        self.active_plan_params: PlannerParams | None = None
         self.plan_point_index = 0
         self.global_step_index = 0
         self.replan_count = 0
@@ -74,19 +92,19 @@ class RectangleCenterPlannerGui:
         self.running = False
         self.next_step_wall_time: float | None = None
         self.paused_progress_steps: float | None = None
-        self.last_status_message = "Click inside the XY selector to start."
-        self.last_draw_time = time.perf_counter()
+        self.last_status_message = "Click on the 3D surface to start."
+        self._last_draw_time = time.perf_counter()
 
-        self.surface_mesh = self._build_surface_mesh(self.initial_params)
+        self.surface_mesh = self._build_surface_mesh(self.params)
+        self.surface_pick_points = self._build_surface_pick_points(self.params)
 
-        self.figure = plt.figure("Rectangle-Center 3D Planner", figsize=(16.0, 9.0))
-        self.surface_axis = self.figure.add_axes([0.05, 0.10, 0.58, 0.82], projection="3d")
-        self.selection_axis = self.figure.add_axes([0.67, 0.77, 0.28, 0.16])
-        self.info_axis = self.figure.add_axes([0.67, 0.51, 0.28, 0.21])
+        self.figure = plt.figure("CAD Metadata Surface Planner", figsize=(16.0, 9.0))
+        self.surface_axis = self.figure.add_axes([0.05, 0.10, 0.60, 0.82], projection="3d")
+        self.info_axis = self.figure.add_axes([0.69, 0.43, 0.27, 0.46])
         self.info_axis.axis("off")
 
-        self.sliders: dict[str, Slider] = {}
         self.buttons: dict[str, Button] = {}
+        self.sliders: dict[str, Slider] = {}
         self._build_controls()
 
         self.figure.canvas.mpl_connect("button_press_event", self._on_click)
@@ -96,108 +114,84 @@ class RectangleCenterPlannerGui:
         self.timer.add_callback(self._on_timer)
         self._draw()
 
+    def _workspace_mask(
+        self,
+        mesh_x: np.ndarray,
+        mesh_y: np.ndarray,
+        params: PlannerParams,
+    ) -> np.ndarray:
+        mask = np.ones_like(mesh_x, dtype=bool)
+        if params.hole_radius > 0.0:
+            hole_center = params.hole_center
+            hole_distance_sq = (mesh_x - hole_center[0]) ** 2 + (mesh_y - hole_center[1]) ** 2
+            mask &= hole_distance_sq >= params.hole_radius * params.hole_radius
+        return mask
+
     def _build_surface_mesh(
-        self, params: PlannerParams, resolution: int = 45
+        self,
+        params: PlannerParams,
+        resolution: int = SURFACE_MESH_RESOLUTION,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         rectangle = params.rectangle
         x_grid = np.linspace(rectangle.x_min, rectangle.x_max, resolution)
         y_grid = np.linspace(rectangle.y_min, rectangle.y_max, resolution)
         mesh_x, mesh_y = np.meshgrid(x_grid, y_grid, indexing="xy")
-        mesh_z = params.surface.height(mesh_x, mesh_y)
-        return mesh_x, mesh_y, np.asarray(mesh_z, dtype=float)
+        mesh_z = np.asarray(params.surface.height(mesh_x, mesh_y), dtype=float)
+        valid_mask = self._workspace_mask(mesh_x, mesh_y, params)
+        return mesh_x, mesh_y, np.where(valid_mask, mesh_z, np.nan)
+
+    def _build_surface_pick_points(
+        self,
+        params: PlannerParams,
+        resolution: int = SURFACE_PICK_RESOLUTION,
+    ) -> np.ndarray:
+        rectangle = params.rectangle
+        x_grid = np.linspace(rectangle.x_min, rectangle.x_max, resolution)
+        y_grid = np.linspace(rectangle.y_min, rectangle.y_max, resolution)
+        mesh_x, mesh_y = np.meshgrid(x_grid, y_grid, indexing="xy")
+        mesh_z = np.asarray(params.surface.height(mesh_x, mesh_y), dtype=float)
+        valid_mask = self._workspace_mask(mesh_x, mesh_y, params)
+        return np.column_stack((mesh_x[valid_mask], mesh_y[valid_mask], mesh_z[valid_mask]))
 
     def _build_controls(self) -> None:
+        rectangle = self.params.rectangle
+        x_span = max(rectangle.x_max - rectangle.x_min, 1e-6)
+        y_span = max(rectangle.y_max - rectangle.y_min, 1e-6)
+        diagonal_span = float(np.hypot(x_span, y_span))
+
+        step_length_max = max(self.params.step_length_k * 2.5, 0.5 * diagonal_span, 1e-4)
+        step_noise_max = max(self.params.step_noise_std_0 * 2.5, step_length_max, 1e-4)
+        z_noise_max = max(self.params.z_noise_std * 4.0, 0.1 * max(x_span, y_span), 1e-5)
+
         slider_specs = [
-            (
-                "chunk_length",
-                "Action Chunk Size",
-                1,
-                32,
-                self.initial_params.chunk_length,
-                1,
-            ),
-            (
-                "replan_every_n_chunks",
-                "Replan After",
-                1,
-                32,
-                self.initial_params.replan_every_n_chunks,
-                1,
-            ),
-            (
-                "step_length_k",
-                "Step Length k",
-                0.001,
-                0.25,
-                self.initial_params.step_length_k,
-                None,
-            ),
-            ("action_hz_q", "Action Hz q", 1, 60, self.initial_params.action_hz_q, 1),
-            (
-                "step_noise_std_0",
-                "Step Noise Std",
-                0.0,
-                0.15,
-                self.initial_params.step_noise_std_0,
-                None,
-            ),
+            ("step_length_k", "Step size", [0.69, 0.33, 0.24, 0.03], 0.0, step_length_max, self.params.step_length_k, "%.4f"),
+            ("step_noise_std_0", "XY noise", [0.69, 0.27, 0.24, 0.03], 0.0, step_noise_max, self.params.step_noise_std_0, "%.4f"),
             (
                 "direction_noise_std_deg_0",
-                "Dir Noise Std (deg)",
+                "Dir noise (deg)",
+                [0.69, 0.21, 0.24, 0.03],
                 0.0,
                 180.0,
-                self.initial_params.direction_noise_std_deg_0,
-                None,
+                self.params.direction_noise_std_deg_0,
+                "%.1f",
             ),
-            (
-                "z_noise_std",
-                "Z Noise Std",
-                0.0,
-                0.01,
-                self.initial_params.z_noise_std,
-                None,
-            ),
-            (
-                "step_noise_decay",
-                "Step Noise Decay",
-                0.0,
-                1.0,
-                self.initial_params.step_noise_decay,
-                None,
-            ),
-            (
-                "direction_noise_decay",
-                "Dir Noise Decay",
-                0.0,
-                1.0,
-                self.initial_params.direction_noise_decay,
-                None,
-            ),
+            ("z_noise_std", "Z noise", [0.69, 0.15, 0.24, 0.03], 0.0, z_noise_max, self.params.z_noise_std, "%.4f"),
         ]
-
-        slider_left = 0.69
-        slider_width = 0.24
-        slider_height = 0.03
-        slider_top = 0.45
-        slider_gap = 0.037
-
-        for index, (key, label, vmin, vmax, init, valstep) in enumerate(slider_specs):
-            axis = self.figure.add_axes(
-                [slider_left, slider_top - index * slider_gap, slider_width, slider_height]
-            )
+        for slider_key, label, axes_rect, minimum, maximum, initial, value_format in slider_specs:
+            slider_axis = self.figure.add_axes(axes_rect)
             slider = Slider(
-                ax=axis,
-                label=label,
-                valmin=vmin,
-                valmax=vmax,
-                valinit=init,
-                valstep=valstep,
+                slider_axis,
+                label,
+                minimum,
+                maximum,
+                valinit=initial,
+                valfmt=value_format,
             )
-            slider.on_changed(self._on_slider_change)
-            self.sliders[key] = slider
+            slider.on_changed(self._on_motion_slider_changed)
+            self.sliders[slider_key] = slider
 
-        pause_axis = self.figure.add_axes([0.69, 0.07, 0.08, 0.05])
-        reset_axis = self.figure.add_axes([0.79, 0.07, 0.08, 0.05])
+        pause_axis = self.figure.add_axes([0.69, 0.06, 0.08, 0.05])
+        reset_axis = self.figure.add_axes([0.79, 0.06, 0.08, 0.05])
         replan_axis = self.figure.add_axes([0.69, 0.01, 0.18, 0.05])
 
         self.buttons["pause"] = Button(pause_axis, "Pause")
@@ -207,47 +201,46 @@ class RectangleCenterPlannerGui:
         self.buttons["replan_now"] = Button(replan_axis, "Replan Now")
         self.buttons["replan_now"].on_clicked(self._replan_now)
 
-    def _slider_int(self, key: str) -> int:
-        return int(round(float(self.sliders[key].val)))
-
-    def _current_params(self) -> PlannerParams:
-        params = PlannerParams(
-            rectangle=self.initial_params.rectangle,
-            surface=self.initial_params.surface,
-            chunk_length=self._slider_int("chunk_length"),
-            replan_every_n_chunks=self._slider_int("replan_every_n_chunks"),
+    def _on_motion_slider_changed(self, _) -> None:
+        self.params = replace(
+            self.params,
             step_length_k=float(self.sliders["step_length_k"].val),
-            action_hz_q=float(self.sliders["action_hz_q"].val),
             step_noise_std_0=float(self.sliders["step_noise_std_0"].val),
             direction_noise_std_deg_0=float(
                 self.sliders["direction_noise_std_deg_0"].val
             ),
             z_noise_std=float(self.sliders["z_noise_std"].val),
-            step_noise_decay=float(self.sliders["step_noise_decay"].val),
-            direction_noise_decay=float(self.sliders["direction_noise_decay"].val),
-            center_tolerance=self.initial_params.center_tolerance,
         )
-        params.validate()
-        return params
+        self.params.validate()
 
-    def _surface_position(
-        self, point_xy: np.ndarray, params: PlannerParams | None = None
-    ) -> np.ndarray:
-        active_params = params or self.active_plan_params or self._current_params()
-        return surface_position_at_xy(point_xy, active_params)
+        if self.current_position is not None:
+            self._plan_from_current_pose()
+            if self.running:
+                self.next_step_wall_time = time.perf_counter() + 1.0 / self.params.action_hz_q
+                self.last_status_message = (
+                    "Updated step/noise sliders and replanned from the current pose."
+                )
+            else:
+                self.last_status_message = (
+                    "Updated step/noise sliders. Resume to follow the refreshed plan."
+                )
+        else:
+            self.last_status_message = (
+                "Updated step/noise sliders. Click on the 3D surface to start."
+            )
+        self._draw()
+
+    def _surface_position(self, point_xy: np.ndarray) -> np.ndarray:
+        return surface_position_at_xy(point_xy, self.params)
 
     def _current_progress_steps(self, now: float) -> float:
-        if (
-            self.plan_cycle_start_wall_time is None
-            or self.active_plan_params is None
-            or self.plan_anchor_positions.shape[0] == 0
-        ):
+        if self.plan_cycle_start_wall_time is None or self.plan_anchor_positions.shape[0] == 0:
             return float(self.plan_point_index)
 
         max_progress = float(max(self.plan_anchor_positions.shape[0] - 1, 0))
         return float(
             np.clip(
-                (now - self.plan_cycle_start_wall_time) * self.active_plan_params.action_hz_q,
+                (now - self.plan_cycle_start_wall_time) * self.params.action_hz_q,
                 0.0,
                 max_progress,
             )
@@ -316,17 +309,16 @@ class RectangleCenterPlannerGui:
         )
 
     def _current_plan_point_counter(self) -> tuple[int, int]:
-        params = self.active_plan_params or self._current_params()
-        total_points = params.chunk_length
-        if self.active_plan_params is None and self.planned_positions.size == 0:
+        total_points = self.params.chunk_length
+        if self.planned_positions.size == 0:
             return 0, total_points
 
         current_point_index = min(total_points, self.plan_point_index + 1)
         return current_point_index, total_points
 
-    def _points_until_replan(self, params: PlannerParams) -> int:
-        replan_after = effective_replan_after(params)
-        if self.active_plan_params is None and self.planned_positions.size == 0:
+    def _points_until_replan(self) -> int:
+        replan_after = effective_replan_after(self.params)
+        if self.planned_positions.size == 0:
             return 0
         return max(0, replan_after - self.plan_point_index)
 
@@ -334,23 +326,22 @@ class RectangleCenterPlannerGui:
         if self.current_position is None:
             return
 
-        params = self._current_params()
         start_xy = np.asarray(self.current_position[:2], dtype=float)
         planned_positions, planned_orientations = plan_action_poses(
             start_xy=start_xy,
             global_step_index=self.global_step_index,
-            num_points=params.chunk_length,
-            params=params,
+            num_points=self.params.chunk_length,
+            params=self.params,
             rng=self.rng,
         )
 
-        start_anchor_position = self._surface_position(start_xy, params=params)
+        start_anchor_position = self._surface_position(start_xy)
         if self.current_orientation_xyzw is None:
             start_direction_xy = planned_positions[0, :2] - start_xy
             start_orientation_xyzw, _ = compute_surface_tangent_quaternion(
                 start_xy,
                 start_direction_xy,
-                params.surface,
+                self.params.surface,
             )
             self.current_orientation_xyzw = np.array(start_orientation_xyzw, copy=True)
         start_anchor_orientation = np.array(self.current_orientation_xyzw, copy=True)
@@ -377,7 +368,6 @@ class RectangleCenterPlannerGui:
             self.position_splines = None
             self.orientation_slerp = None
 
-        self.active_plan_params = params
         self.plan_point_index = 0
         self.plan_cycle_start_wall_time = time.perf_counter()
         self.replan_count += 1
@@ -385,19 +375,19 @@ class RectangleCenterPlannerGui:
         self.paused_progress_steps = None
         self.last_status_message = (
             f"Replanned batch {self.replan_count} from {_format_vector(start_anchor_position)} "
-            f"for {params.chunk_length} planned pose(s); "
-            f"replan after {effective_replan_after(params)} executed pose(s)."
+            f"for {self.params.chunk_length} planned pose(s); "
+            f"replan after {effective_replan_after(self.params)} executed pose(s)."
         )
         self._update_display_pose_from_progress(0.0)
 
     def _start_from_xy(self, point_xy: np.ndarray) -> None:
-        rectangle = self.initial_params.rectangle
-        clamped_xy = rectangle.clamp(point_xy)
-        if not rectangle.contains(clamped_xy):
+        point_xy = np.asarray(point_xy, dtype=float).reshape(2)
+        if not self.params.contains_workspace(point_xy):
+            self.last_status_message = "Ignored click outside the valid top surface."
             return
 
-        start_position = self._surface_position(clamped_xy, params=self.initial_params)
-        self.start_xy = np.array(clamped_xy, copy=True)
+        start_position = self._surface_position(point_xy)
+        self.start_xy = np.array(point_xy, copy=True)
         self.start_position = np.array(start_position, copy=True)
         self.current_position = np.array(start_position, copy=True)
         self.current_orientation_xyzw = None
@@ -414,7 +404,6 @@ class RectangleCenterPlannerGui:
         self.orientation_slerp = None
         self.plan_key_times = np.zeros(0, dtype=float)
         self.plan_cycle_start_wall_time = None
-        self.active_plan_params = None
 
         self.plan_point_index = 0
         self.global_step_index = 0
@@ -423,19 +412,14 @@ class RectangleCenterPlannerGui:
         self.paused_progress_steps = None
 
         self._plan_from_current_pose()
-        params = self.active_plan_params or self._current_params()
-        self.next_step_wall_time = time.perf_counter() + 1.0 / params.action_hz_q
+        self.next_step_wall_time = time.perf_counter() + 1.0 / self.params.action_hz_q
 
     def _step_once(self) -> None:
-        if (
-            self.current_position is None
-            or self.active_plan_params is None
-            or self.planned_positions.size == 0
-        ):
+        if self.current_position is None or self.planned_positions.size == 0:
             return
 
-        total_points = self.active_plan_params.chunk_length
-        replan_after = effective_replan_after(self.active_plan_params)
+        total_points = self.params.chunk_length
+        replan_after = effective_replan_after(self.params)
         if self.plan_point_index >= min(total_points, replan_after):
             self._plan_from_current_pose()
             return
@@ -467,27 +451,25 @@ class RectangleCenterPlannerGui:
             self.buttons["pause"].label.set_text("Pause")
             self.last_status_message = "Simulation resumed."
 
-            params = self.active_plan_params or self._current_params()
             now = time.perf_counter()
-            if self.paused_progress_steps is not None and self.active_plan_params is not None:
+            if self.paused_progress_steps is not None:
                 self.plan_cycle_start_wall_time = (
-                    now - self.paused_progress_steps / self.active_plan_params.action_hz_q
+                    now - self.paused_progress_steps / self.params.action_hz_q
                 )
                 remaining_until_next_point = max(
                     0.0,
                     (self.plan_point_index + 1 - self.paused_progress_steps)
-                    / self.active_plan_params.action_hz_q,
+                    / self.params.action_hz_q,
                 )
                 self.next_step_wall_time = now + remaining_until_next_point
             else:
-                self.next_step_wall_time = now + 1.0 / params.action_hz_q
+                self.next_step_wall_time = now + 1.0 / self.params.action_hz_q
             self.paused_progress_steps = None
         else:
             self.running = False
             self.buttons["pause"].label.set_text("Resume")
             self.last_status_message = "Simulation paused."
-            if self.active_plan_params is not None:
-                self.paused_progress_steps = self._current_progress_steps(time.perf_counter())
+            self.paused_progress_steps = self._current_progress_steps(time.perf_counter())
 
         self.figure.canvas.draw_idle()
 
@@ -509,7 +491,6 @@ class RectangleCenterPlannerGui:
         self.orientation_slerp = None
         self.plan_key_times = np.zeros(0, dtype=float)
         self.plan_cycle_start_wall_time = None
-        self.active_plan_params = None
 
         self.plan_point_index = 0
         self.global_step_index = 0
@@ -517,7 +498,7 @@ class RectangleCenterPlannerGui:
         self.running = False
         self.next_step_wall_time = None
         self.paused_progress_steps = None
-        self.last_status_message = "Reset. Click inside the XY selector to start."
+        self.last_status_message = "Reset. Click on the 3D surface to start."
         self.buttons["pause"].label.set_text("Pause")
         self._draw()
 
@@ -528,37 +509,56 @@ class RectangleCenterPlannerGui:
             return
 
         self._plan_from_current_pose()
-        if self.running and self.active_plan_params is not None:
-            self.next_step_wall_time = time.perf_counter() + 1.0 / self.active_plan_params.action_hz_q
-        self._draw()
-
-    def _on_slider_change(self, _) -> None:
-        self.last_status_message = (
-            "Planner parameters updated. Changes apply on next replan."
-        )
-        self.figure.canvas.draw_idle()
-
-    def _on_click(self, event) -> None:
-        if (
-            event.inaxes is not self.selection_axis
-            or event.xdata is None
-            or event.ydata is None
-        ):
-            return
-
-        point_xy = np.array([float(event.xdata), float(event.ydata)], dtype=float)
-        if not self.initial_params.rectangle.contains(point_xy):
-            self.last_status_message = "Ignored click outside rectangle."
-            self._draw()
-            return
-
-        self.buttons["pause"].label.set_text("Pause")
-        self._start_from_xy(point_xy)
+        if self.running:
+            self.next_step_wall_time = time.perf_counter() + 1.0 / self.params.action_hz_q
         self._draw()
 
     def _on_close(self, _) -> None:
         if self.timer is not None:
             self.timer.stop()
+
+    def _project_world_points_to_pixels(self, points_xyz: np.ndarray) -> np.ndarray:
+        self.figure.canvas.draw()
+        projected_x, projected_y, _ = proj3d.proj_transform(
+            points_xyz[:, 0],
+            points_xyz[:, 1],
+            points_xyz[:, 2],
+            self.surface_axis.get_proj(),
+        )
+        return self.surface_axis.transData.transform(
+            np.column_stack((projected_x, projected_y))
+        )
+
+    def _pick_surface_point_from_pixels(
+        self,
+        pixel_x: float,
+        pixel_y: float,
+        pixel_threshold: float = SURFACE_PICK_PIXEL_THRESHOLD,
+    ) -> np.ndarray | None:
+        if self.surface_pick_points.size == 0:
+            return None
+
+        projected_pixels = self._project_world_points_to_pixels(self.surface_pick_points)
+        deltas = projected_pixels - np.array([pixel_x, pixel_y], dtype=float)
+        distances_sq = np.einsum("ij,ij->i", deltas, deltas)
+        min_index = int(np.argmin(distances_sq))
+        if float(np.sqrt(distances_sq[min_index])) > pixel_threshold:
+            return None
+        return np.array(self.surface_pick_points[min_index], copy=True)
+
+    def _on_click(self, event) -> None:
+        if event.inaxes is not self.surface_axis or event.x is None or event.y is None:
+            return
+
+        picked_point = self._pick_surface_point_from_pixels(float(event.x), float(event.y))
+        if picked_point is None:
+            self.last_status_message = "Ignored click away from the valid top surface."
+            self._draw()
+            return
+
+        self.buttons["pause"].label.set_text("Pause")
+        self._start_from_xy(picked_point[:2])
+        self._draw()
 
     def _draw_orientation_triad(
         self,
@@ -591,7 +591,7 @@ class RectangleCenterPlannerGui:
         axis = self.surface_axis
         axis.clear()
 
-        rectangle = self.initial_params.rectangle
+        rectangle = self.params.rectangle
         mesh_x, mesh_y, mesh_z = self.surface_mesh
         x_span = max(rectangle.x_max - rectangle.x_min, 1e-6)
         y_span = max(rectangle.y_max - rectangle.y_min, 1e-6)
@@ -600,27 +600,37 @@ class RectangleCenterPlannerGui:
         axis.plot_surface(
             mesh_x,
             mesh_y,
-            mesh_z,
+            np.ma.masked_invalid(mesh_z),
             color="lightsteelblue",
-            alpha=0.55,
+            alpha=0.62,
             linewidth=0,
             antialiased=True,
         )
-        axis.set_title("3D Surface Planner")
-        axis.set_xlabel("X")
-        axis.set_ylabel("Y")
-        axis.set_zlabel("Z")
 
-        center_xy = rectangle.center
-        center_xyz = self._surface_position(center_xy, params=self.initial_params)
+        if self.params.hole_radius > 0.0:
+            theta = np.linspace(0.0, 2.0 * np.pi, 220)
+            rim_x = self.params.hole_center[0] + self.params.hole_radius * np.cos(theta)
+            rim_y = self.params.hole_center[1] + self.params.hole_radius * np.sin(theta)
+            rim_z = np.asarray(self.params.surface.height(rim_x, rim_y), dtype=float)
+            axis.plot(
+                rim_x,
+                rim_y,
+                rim_z,
+                color="crimson",
+                linewidth=2.0,
+                label="Hole rim",
+            )
+
+        goal_xy = self.params.goal
+        goal_z = float(self.params.surface.height(goal_xy[0], goal_xy[1]))
         axis.scatter(
-            [center_xyz[0]],
-            [center_xyz[1]],
-            [center_xyz[2]],
+            [goal_xy[0]],
+            [goal_xy[1]],
+            [goal_z],
             color="crimson",
             s=70,
             marker="x",
-            label="Center",
+            label="Hole center / goal",
         )
 
         if self.start_position is not None:
@@ -703,11 +713,7 @@ class RectangleCenterPlannerGui:
             )
 
         current_point, total_points = self._current_plan_point_counter()
-        replan_after = (
-            effective_replan_after(self.active_plan_params)
-            if self.active_plan_params is not None
-            else effective_replan_after(self._current_params())
-        )
+        replan_after = effective_replan_after(self.params)
         axis.text2D(
             0.02,
             0.98,
@@ -725,7 +731,8 @@ class RectangleCenterPlannerGui:
             },
         )
 
-        z_candidates = [float(mesh_z.min()), float(mesh_z.max())]
+        finite_mesh_z = mesh_z[np.isfinite(mesh_z)]
+        z_candidates = [float(finite_mesh_z.min()), float(finite_mesh_z.max())]
         for pose_set in (self.executed_positions, self.replan_positions):
             if pose_set:
                 stacked = np.vstack(pose_set)
@@ -739,6 +746,7 @@ class RectangleCenterPlannerGui:
             )
         if self.display_position is not None:
             z_candidates.append(float(self.display_position[2]))
+        z_candidates.append(goal_z)
 
         z_min = min(z_candidates)
         z_max = max(z_candidates)
@@ -747,131 +755,37 @@ class RectangleCenterPlannerGui:
         axis.set_ylim(rectangle.y_min, rectangle.y_max)
         axis.set_zlim(z_min - 0.1 * z_span, z_max + 0.15 * z_span)
         axis.set_box_aspect((x_span, y_span, z_span))
-        axis.legend(loc="upper right", fontsize=8, frameon=True)
-
-    def _draw_selection_axis(self) -> None:
-        axis = self.selection_axis
-        axis.clear()
-
-        rectangle = self.initial_params.rectangle
-        axis.set_title("XY Start Selector")
+        axis.set_title(f"CAD Surface Planner - {self.metadata.get('part_name', 'part')}")
         axis.set_xlabel("X")
         axis.set_ylabel("Y")
-        axis.set_aspect("equal", adjustable="box")
-
-        x_pad = 0.08 * max(rectangle.x_max - rectangle.x_min, 1e-3)
-        y_pad = 0.08 * max(rectangle.y_max - rectangle.y_min, 1e-3)
-        axis.set_xlim(rectangle.x_min - x_pad, rectangle.x_max + x_pad)
-        axis.set_ylim(rectangle.y_min - y_pad, rectangle.y_max + y_pad)
-
-        axis.add_patch(
-            patches.Rectangle(
-                (rectangle.x_min, rectangle.y_min),
-                rectangle.x_max - rectangle.x_min,
-                rectangle.y_max - rectangle.y_min,
-                fill=False,
-                linewidth=2.0,
-                edgecolor="black",
-            )
-        )
-
-        center_xy = rectangle.center
-        axis.scatter(
-            [center_xy[0]],
-            [center_xy[1]],
-            color="crimson",
-            s=45,
-            marker="x",
-            label="Center",
-        )
-
-        if self.start_xy is not None:
-            axis.scatter(
-                [self.start_xy[0]],
-                [self.start_xy[1]],
-                color="goldenrod",
-                s=50,
-                marker="o",
-                label="Start",
-                zorder=5,
-            )
-
-        if self.executed_positions:
-            executed = np.vstack(self.executed_positions)
-            axis.plot(
-                executed[:, 0],
-                executed[:, 1],
-                color="black",
-                linewidth=1.8,
-                label="Executed XY",
-            )
-
-        if self.replan_positions:
-            replans = np.vstack(self.replan_positions)
-            axis.scatter(
-                replans[:, 0],
-                replans[:, 1],
-                color="darkorange",
-                s=32,
-                marker="D",
-                label="Replan XY",
-            )
-
-        if self.display_position is not None:
-            axis.scatter(
-                [self.display_position[0]],
-                [self.display_position[1]],
-                color="royalblue",
-                s=58,
-                marker="o",
-                label="Current XY",
-                zorder=6,
-            )
-
-        if self.planned_positions.size > 0:
-            smooth_path = self._sample_plan_spline(0.0)
-            if smooth_path.size > 0:
-                axis.plot(
-                    smooth_path[:, 0],
-                    smooth_path[:, 1],
-                    linestyle="--",
-                    linewidth=1.2,
-                    color="teal",
-                    alpha=0.9,
-                    label="Planned spline XY",
-                )
-            axis.scatter(
-                self.planned_positions[:, 0],
-                self.planned_positions[:, 1],
-                color="teal",
-                s=20,
-                marker="o",
-                alpha=0.9,
-                label="Planned XY",
-            )
-
-        axis.legend(loc="upper right", fontsize=7, frameon=True)
+        axis.set_zlabel("Z")
+        axis.legend(loc="upper right", fontsize=8, frameon=True)
 
     def _draw_info(self) -> None:
-        params = self.active_plan_params or self._current_params()
         self.info_axis.clear()
         self.info_axis.axis("off")
 
-        next_step_sigma = step_noise_std(self.global_step_index, params)
-        next_dir_sigma = direction_noise_std_deg(self.global_step_index, params)
+        next_step_sigma = step_noise_std(self.global_step_index, self.params)
+        next_dir_sigma = direction_noise_std_deg(self.global_step_index, self.params)
         current_point_number, total_plan_points = self._current_plan_point_counter()
-        replan_after = effective_replan_after(params)
-        points_until_replan = self._points_until_replan(params)
+        replan_after = effective_replan_after(self.params)
+        points_until_replan = self._points_until_replan()
 
         info_lines = [
             "Controls",
-            "  Click inside the XY selector to start a new run",
+            "  Click on the 3D top surface to start a new run",
+            "  Motion sliders adjust step size and planner noise only",
             "  Pause: stop/resume smooth playback",
             "  Reset: clear the current run",
             "  Replan Now: rebuild future poses from current XY",
             "",
             f"Status: {self.last_status_message}",
-            f"Running: {'yes' if self.running else 'no'}",
+            f"Part: {self.metadata.get('part_name', 'unknown')}",
+            f"Metadata: {self.metadata_path.name}",
+            f"Planner defaults: {self.planner_config_path.name}",
+            f"Surface family: {self.params.surface.config.family}",
+            f"Goal XY: {_format_vector(self.params.goal)}",
+            f"Hole radius: {self.params.hole_radius:.6f}",
             f"Current XYZ: {_format_vector(self.display_position)}",
             f"Current quat xyzw: {_format_vector(self.display_orientation_xyzw)}",
             f"Current anchor XYZ: {_format_vector(self.current_position)}",
@@ -879,14 +793,13 @@ class RectangleCenterPlannerGui:
             f"Global step index: {self.global_step_index}",
             f"Replan count: {self.replan_count}",
             f"Current planned pose: {current_point_number}/{total_plan_points}",
-            f"Planned poses per cycle: {params.chunk_length}",
+            f"Planned poses per cycle: {self.params.chunk_length}",
             f"Replan after: {replan_after}",
             f"Poses until replan: {points_until_replan}",
-            f"Surface family: {params.surface.config.family}",
-            f"Z noise std: {params.z_noise_std:.6f}",
+            f"Z noise std: {self.params.z_noise_std:.6f}",
             f"Next XY step noise std: {next_step_sigma:.6f}",
             f"Next dir noise std (deg): {next_dir_sigma:.6f}",
-            f"Configured action Hz q: {params.action_hz_q:.2f}",
+            f"Configured action Hz q: {self.params.action_hz_q:.2f}",
         ]
         self.info_axis.text(
             0.0,
@@ -900,18 +813,16 @@ class RectangleCenterPlannerGui:
 
     def _draw(self) -> None:
         self._draw_surface_axis()
-        self._draw_selection_axis()
         self._draw_info()
         self.figure.canvas.draw_idle()
 
     def _on_timer(self) -> None:
         now = time.perf_counter()
-        params = self.active_plan_params or self._current_params()
 
         if self.running and self.current_position is not None:
             if self.next_step_wall_time is None:
-                self.next_step_wall_time = now + 1.0 / params.action_hz_q
-            step_period = 1.0 / params.action_hz_q
+                self.next_step_wall_time = now + 1.0 / self.params.action_hz_q
+            step_period = 1.0 / self.params.action_hz_q
             while self.next_step_wall_time is not None and now >= self.next_step_wall_time:
                 self._step_once()
                 self.next_step_wall_time += step_period
@@ -919,44 +830,58 @@ class RectangleCenterPlannerGui:
             progress = self._current_progress_steps(now)
             self._update_display_pose_from_progress(progress)
 
-        if now - self.last_draw_time >= 1.0 / 20.0:
-            self.last_draw_time = now
+        if now - getattr(self, "_last_draw_time", 0.0) >= 1.0 / 30.0:
+            self._last_draw_time = now
             self._draw()
 
-    def run(self) -> None:
+    def show(self) -> None:
         self.timer.start()
         plt.show()
 
+    def close(self) -> None:
+        self._on_close(None)
+        plt.close(self.figure)
 
-def _parse_args() -> argparse.Namespace:
+
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Offline 3D rectangle-center planner simulator. The planner emits "
-            "discrete XYZ poses on an analytic surface, and the GUI visualizes "
-            "cubic position interpolation with quaternion slerp."
+            "Visualize random exploration over a CAD part top surface loaded from generation metadata."
         )
     )
     parser.add_argument(
-        "--config",
+        "metadata_json",
+        type=Path,
+        help="Path to the CAD part generation_metadata.json file.",
+    )
+    parser.add_argument(
+        "--planner-config",
         type=Path,
         default=DEFAULT_CONFIG_PATH,
-        help="Path to the planner YAML config.",
+        help=(
+            "YAML planner defaults file used for motion/noise parameters. "
+            f"Default: {DEFAULT_CONFIG_PATH}"
+        ),
     )
     parser.add_argument(
         "--seed",
         type=int,
         default=None,
-        help="Optional RNG seed for repeatable noisy trajectories.",
+        help="Optional RNG seed for repeatable planning.",
     )
     return parser.parse_args()
 
 
 def main() -> int:
-    args = _parse_args()
-    simulator = RectangleCenterPlannerGui(config_path=args.config, seed=args.seed)
-    simulator.run()
+    args = parse_args()
+    gui = RectangleCenterPlannerGui(
+        metadata_path=args.metadata_json,
+        planner_config_path=args.planner_config,
+        seed=args.seed,
+    )
+    gui.show()
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

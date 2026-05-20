@@ -12,12 +12,19 @@ from policies.random_exploration_policy import (
     RectangleConfig,
     direction_noise_std_deg,
     load_planner_params,
+    load_planner_params_from_generation_metadata,
     plan_action_points,
     plan_action_poses,
     plan_chunks,
     step_noise_std,
 )
 from policies.surface_models import SurfaceConfig, build_surface_model
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_METADATA_PATH = (
+    REPO_ROOT / "generated_cad" / "default_part" / "generation_metadata.json"
+)
 
 
 def _surface_config(
@@ -209,6 +216,70 @@ defaults:
         expected_z = params.surface.height(points_xy[:, 0], points_xy[:, 1])
         np.testing.assert_allclose(positions_xyz[:, 2], expected_z, atol=1e-9)
 
+    def test_load_planner_params_from_generation_metadata_uses_part_bounds(self) -> None:
+        params = load_planner_params_from_generation_metadata(DEFAULT_METADATA_PATH)
+        self.assertAlmostEqual(params.rectangle.x_min, -0.05)
+        self.assertAlmostEqual(params.rectangle.x_max, 0.05)
+        self.assertAlmostEqual(params.goal[0], 0.0)
+        self.assertAlmostEqual(params.goal[1], 0.0)
+        self.assertGreater(params.hole_radius, 0.0)
+
+    def test_plan_action_points_rejects_start_inside_hole(self) -> None:
+        params = load_planner_params_from_generation_metadata(DEFAULT_METADATA_PATH)
+        with self.assertRaisesRegex(ValueError, "outside the hole opening"):
+            plan_action_points(
+                start_xy=np.array(params.goal, copy=True),
+                global_step_index=0,
+                num_points=3,
+                params=params,
+                rng=np.random.default_rng(0),
+            )
+
+    def test_plan_action_points_stops_at_hole_rim(self) -> None:
+        params = PlannerParams(
+            rectangle=RectangleConfig(0.0, 1.0, 0.0, 1.0),
+            surface=build_surface_model(_surface_config(base_height=0.0, amp=0.0)),
+            chunk_length=4,
+            step_length_k=0.25,
+            replan_every_n_chunks=1,
+            action_hz_q=10.0,
+            step_noise_std_0=0.0,
+            direction_noise_std_deg_0=0.0,
+            z_noise_std=0.0,
+            step_noise_decay=1.0,
+            direction_noise_decay=1.0,
+            goal_xy=(0.5, 0.5),
+            hole_center_xy=(0.5, 0.5),
+            hole_radius=0.1,
+        )
+        start_xy = np.array([0.72, 0.5], dtype=float)
+
+        points_xy = plan_action_points(
+            start_xy=start_xy,
+            global_step_index=0,
+            num_points=4,
+            params=params,
+            rng=np.random.default_rng(0),
+        )
+
+        expected_rim_point = np.array([0.6, 0.5], dtype=float)
+        np.testing.assert_allclose(points_xy[0], expected_rim_point, atol=1e-9)
+        np.testing.assert_allclose(points_xy, np.tile(expected_rim_point, (4, 1)), atol=1e-9)
+
+    def test_plan_action_points_stay_within_rectangle_and_outside_hole(self) -> None:
+        params = load_planner_params_from_generation_metadata(DEFAULT_METADATA_PATH)
+        points_xy = plan_action_points(
+            start_xy=np.array([params.rectangle.x_max, 0.0], dtype=float),
+            global_step_index=0,
+            num_points=12,
+            params=params,
+            rng=np.random.default_rng(2),
+        )
+
+        for point_xy in points_xy:
+            self.assertTrue(params.rectangle.contains(point_xy))
+            self.assertFalse(params.point_is_in_hole(point_xy))
+
     def test_random_gaussian_surface_is_deterministic_for_fixed_seed(self) -> None:
         surface_a = build_surface_model(
             _surface_config(
@@ -241,7 +312,7 @@ defaults:
         np.testing.assert_allclose(grad_a[0], grad_b[0], atol=1e-12)
         np.testing.assert_allclose(grad_a[1], grad_b[1], atol=1e-12)
 
-    def test_quaternion_orientation_is_normalized_and_matches_surface_normal(self) -> None:
+    def test_quaternion_orientation_is_normalized_and_matches_surface_underside_normal(self) -> None:
         params = PlannerParams(
             rectangle=RectangleConfig(0.0, 1.0, 0.0, 1.0),
             surface=build_surface_model(
@@ -274,12 +345,12 @@ defaults:
             z_axis = rotation_matrix[:, 2]
             dzdx, dzdy = params.surface.gradient(point_xyz[0], point_xyz[1])
             expected_normal = np.array(
-                [-float(dzdx), -float(dzdy), 1.0], dtype=float
+                [float(dzdx), float(dzdy), -1.0], dtype=float
             )
             expected_normal = expected_normal / np.linalg.norm(expected_normal)
             self.assertGreater(float(np.dot(z_axis, expected_normal)), 0.999)
 
-    def test_orientation_x_axis_follows_projected_travel_direction_on_flat_surface(self) -> None:
+    def test_flat_surface_orientation_matches_requested_base_matrix(self) -> None:
         params = PlannerParams(
             rectangle=RectangleConfig(0.0, 1.0, 0.0, 1.0),
             surface=build_surface_model(_surface_config(base_height=0.0, amp=0.0)),
@@ -301,11 +372,55 @@ defaults:
             rng=np.random.default_rng(1),
         )
 
-        first_direction = positions_xyz[0] - np.array([0.0, 0.0, 0.0], dtype=float)
-        first_direction = first_direction / np.linalg.norm(first_direction)
         first_rotation = Rotation.from_quat(orientations_xyzw[0]).as_matrix()
-        x_axis = first_rotation[:, 0]
-        self.assertGreater(float(np.dot(x_axis, first_direction)), 0.999)
+        expected_rotation = np.array(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, -1.0, 0.0],
+                [0.0, 0.0, -1.0],
+            ],
+            dtype=float,
+        )
+        np.testing.assert_allclose(first_rotation, expected_rotation, atol=1e-9)
+
+    def test_surface_orientation_uses_projected_world_x_not_travel_direction(self) -> None:
+        params = PlannerParams(
+            rectangle=RectangleConfig(0.0, 1.0, 0.0, 1.0),
+            surface=build_surface_model(
+                _surface_config(base_height=0.03, amp=0.002, origin_x=0.5, origin_y=0.5)
+            ),
+            chunk_length=2,
+            step_length_k=0.2,
+            replan_every_n_chunks=1,
+            action_hz_q=10.0,
+            step_noise_std_0=0.0,
+            direction_noise_std_deg_0=0.0,
+            z_noise_std=0.0,
+            step_noise_decay=1.0,
+            direction_noise_decay=1.0,
+        )
+        positions_xyz, orientations_xyzw = plan_action_poses(
+            start_xy=np.array([0.5, 0.9]),
+            global_step_index=0,
+            num_points=2,
+            params=params,
+            rng=np.random.default_rng(1),
+        )
+
+        point_xyz = positions_xyz[0]
+        rotation_matrix = Rotation.from_quat(orientations_xyzw[0]).as_matrix()
+        dzdx, dzdy = params.surface.gradient(point_xyz[0], point_xyz[1])
+        expected_z_axis = np.array([float(dzdx), float(dzdy), -1.0], dtype=float)
+        expected_z_axis = expected_z_axis / np.linalg.norm(expected_z_axis)
+
+        expected_x_axis = np.array([1.0, 0.0, 0.0], dtype=float)
+        expected_x_axis = expected_x_axis - expected_z_axis * float(
+            np.dot(expected_x_axis, expected_z_axis)
+        )
+        expected_x_axis = expected_x_axis / np.linalg.norm(expected_x_axis)
+
+        np.testing.assert_allclose(rotation_matrix[:, 2], expected_z_axis, atol=1e-9)
+        np.testing.assert_allclose(rotation_matrix[:, 0], expected_x_axis, atol=1e-9)
 
     def test_plan_chunks_returns_single_pose_per_chunk(self) -> None:
         params = PlannerParams(

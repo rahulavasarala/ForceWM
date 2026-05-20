@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -135,28 +137,128 @@ def surface_config_from_mapping(
     )
 
 
-def build_surface_model(config: SurfaceConfig) -> AnalyticSurface:
+def _build_analytic_surface(
+    config: SurfaceConfig,
+    *,
+    gaussian_centers_local: np.ndarray | None = None,
+    gaussian_peak_amps: np.ndarray | None = None,
+    gaussian_sigma: float | None = None,
+) -> AnalyticSurface:
     config.validate()
     if config.family == "default":
         return AnalyticSurface(
             config=config,
             gaussian_centers_local=np.zeros((0, 2), dtype=float),
             gaussian_peak_amps=np.zeros(0, dtype=float),
-            gaussian_sigma=max(config.gaussian_curvature, 1e-4),
+            gaussian_sigma=max(float(config.gaussian_curvature), 1e-4),
         )
 
-    rng = np.random.default_rng(config.seed)
-    peak_offset = config.gaussian_peak_offset
-    centers = rng.uniform(-peak_offset, peak_offset, size=(2, 2))
-    weights = rng.uniform(0.7, 1.3, size=2)
-    weights = weights / np.sum(weights)
-    peak_amps = config.amp * weights
+    if gaussian_centers_local is None or gaussian_peak_amps is None:
+        rng = np.random.default_rng(config.seed)
+        peak_offset = config.gaussian_peak_offset
+        centers = rng.uniform(-peak_offset, peak_offset, size=(2, 2))
+        weights = rng.uniform(0.7, 1.3, size=2)
+        weights = weights / np.sum(weights)
+        peak_amps = config.amp * weights
+        sigma = float(config.gaussian_curvature)
+    else:
+        centers = np.asarray(gaussian_centers_local, dtype=float)
+        peak_amps = np.asarray(gaussian_peak_amps, dtype=float)
+        sigma = float(
+            config.gaussian_curvature if gaussian_sigma is None else gaussian_sigma
+        )
+        if centers.ndim != 2 or centers.shape[1] != 2:
+            raise ValueError(
+                "gaussian_centers_local must have shape (N, 2) when provided explicitly."
+            )
+        if peak_amps.ndim != 1 or peak_amps.shape[0] != centers.shape[0]:
+            raise ValueError(
+                "gaussian_peak_amps must be a 1D array with the same length as gaussian_centers_local."
+            )
+
     return AnalyticSurface(
         config=config,
-        gaussian_centers_local=centers,
-        gaussian_peak_amps=peak_amps,
-        gaussian_sigma=max(config.gaussian_curvature, 1e-4),
+        gaussian_centers_local=np.asarray(centers, dtype=float),
+        gaussian_peak_amps=np.asarray(peak_amps, dtype=float),
+        gaussian_sigma=max(float(sigma), 1e-4),
     )
+
+
+def build_surface_model(config: SurfaceConfig) -> AnalyticSurface:
+    return _build_analytic_surface(config)
+
+
+def surface_model_from_generation_metadata(
+    generation_metadata: dict[str, Any],
+) -> AnalyticSurface:
+    if not isinstance(generation_metadata, dict):
+        raise ValueError("Expected mapping for generation metadata.")
+
+    block_cfg = generation_metadata.get("block_dimensions")
+    surface_cfg = generation_metadata.get("surface")
+    if not isinstance(block_cfg, dict):
+        raise ValueError("Expected `block_dimensions` mapping in generation metadata.")
+    if not isinstance(surface_cfg, dict):
+        raise ValueError("Expected `surface` mapping in generation metadata.")
+
+    _require_keys(block_cfg, ["height"], "block_dimensions")
+    _require_keys(
+        surface_cfg,
+        [
+            "family",
+            "base_height",
+            "amp",
+            "freq_x",
+            "freq_y",
+            "seed",
+            "gaussian_curvature",
+            "gaussian_peak_offset",
+            "origin_x",
+            "origin_y",
+        ],
+        "surface",
+    )
+
+    config = SurfaceConfig(
+        family=str(surface_cfg["family"]),
+        base_height=float(block_cfg["height"]) + float(surface_cfg["base_height"]),
+        amp=float(surface_cfg["amp"]),
+        freq_x=float(surface_cfg["freq_x"]),
+        freq_y=float(surface_cfg["freq_y"]),
+        seed=int(surface_cfg["seed"]),
+        gaussian_curvature=float(surface_cfg["gaussian_curvature"]),
+        gaussian_peak_offset=float(surface_cfg["gaussian_peak_offset"]),
+        origin_x=float(surface_cfg["origin_x"]),
+        origin_y=float(surface_cfg["origin_y"]),
+    )
+
+    if config.family == "default":
+        return _build_analytic_surface(config)
+
+    _require_keys(
+        surface_cfg,
+        ["gaussian_centers_local", "gaussian_peak_amps", "gaussian_sigma"],
+        "surface",
+    )
+    return _build_analytic_surface(
+        config,
+        gaussian_centers_local=np.asarray(
+            surface_cfg["gaussian_centers_local"], dtype=float
+        ),
+        gaussian_peak_amps=np.asarray(surface_cfg["gaussian_peak_amps"], dtype=float),
+        gaussian_sigma=float(surface_cfg["gaussian_sigma"]),
+    )
+
+
+def load_surface_model_from_generation_metadata(
+    metadata_path: str | Path,
+) -> AnalyticSurface:
+    path = Path(metadata_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Generation metadata not found: {path}")
+    with path.open("r", encoding="utf-8") as handle:
+        generation_metadata = json.load(handle)
+    return surface_model_from_generation_metadata(generation_metadata)
 
 
 def build_surface_model_from_argparse(

@@ -5,6 +5,13 @@ from pathlib import Path
 
 import numpy as np
 import yaml
+from scipy.spatial.transform import Rotation
+
+from policies.surface_models import (
+    AnalyticSurface,
+    build_surface_model,
+    surface_config_from_mapping,
+)
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).with_suffix(".yaml")
@@ -55,12 +62,14 @@ class RectangleConfig:
 @dataclass(frozen=True)
 class PlannerParams:
     rectangle: RectangleConfig
+    surface: AnalyticSurface
     chunk_length: int
     step_length_k: float
     replan_every_n_chunks: int
     action_hz_q: float
     step_noise_std_0: float
     direction_noise_std_deg_0: float
+    z_noise_std: float
     step_noise_decay: float
     direction_noise_decay: float
     center_tolerance: float = CENTER_TOLERANCE
@@ -79,6 +88,8 @@ class PlannerParams:
             raise ValueError("step_noise_std_0 must be non-negative.")
         if self.direction_noise_std_deg_0 < 0.0:
             raise ValueError("direction_noise_std_deg_0 must be non-negative.")
+        if self.z_noise_std < 0.0:
+            raise ValueError("z_noise_std must be non-negative.")
         if not 0.0 <= self.step_noise_decay <= 1.0:
             raise ValueError("step_noise_decay must lie in [0, 1].")
         if not 0.0 <= self.direction_noise_decay <= 1.0:
@@ -104,20 +115,29 @@ def load_planner_params(config_path: str | Path = DEFAULT_CONFIG_PATH) -> Planne
 
     rectangle_cfg = _require_mapping(config_dict, "rectangle")
     defaults_cfg = _require_mapping(config_dict, "defaults")
+    surface_cfg = _require_mapping(config_dict, "surface")
 
+    rectangle = RectangleConfig(
+        x_min=float(rectangle_cfg["x_min"]),
+        x_max=float(rectangle_cfg["x_max"]),
+        y_min=float(rectangle_cfg["y_min"]),
+        y_max=float(rectangle_cfg["y_max"]),
+    )
+    rectangle.validate()
+
+    surface = build_surface_model(
+        surface_config_from_mapping(surface_cfg, origin_xy=tuple(rectangle.center))
+    )
     params = PlannerParams(
-        rectangle=RectangleConfig(
-            x_min=float(rectangle_cfg["x_min"]),
-            x_max=float(rectangle_cfg["x_max"]),
-            y_min=float(rectangle_cfg["y_min"]),
-            y_max=float(rectangle_cfg["y_max"]),
-        ),
+        rectangle=rectangle,
+        surface=surface,
         chunk_length=int(defaults_cfg["chunk_length"]),
         step_length_k=float(defaults_cfg["step_length_k"]),
         replan_every_n_chunks=int(defaults_cfg["replan_every_n_chunks"]),
         action_hz_q=float(defaults_cfg["action_hz_q"]),
         step_noise_std_0=float(defaults_cfg["step_noise_std"]),
         direction_noise_std_deg_0=float(defaults_cfg["direction_noise_std_deg"]),
+        z_noise_std=float(defaults_cfg["z_noise_std"]),
         step_noise_decay=float(defaults_cfg["step_noise_decay"]),
         direction_noise_decay=float(defaults_cfg["direction_noise_decay"]),
     )
@@ -129,7 +149,7 @@ def step_noise_std(step_index: int, params: PlannerParams) -> float:
     params.validate()
     if step_index < 0:
         raise ValueError("step_index must be non-negative.")
-    return float(params.step_noise_std_0 * (params.step_noise_decay ** step_index))
+    return float(params.step_noise_std_0 * (params.step_noise_decay**step_index))
 
 
 def direction_noise_std_deg(step_index: int, params: PlannerParams) -> float:
@@ -138,7 +158,15 @@ def direction_noise_std_deg(step_index: int, params: PlannerParams) -> float:
         raise ValueError("step_index must be non-negative.")
     return float(
         params.direction_noise_std_deg_0
-        * (params.direction_noise_decay ** step_index)
+        * (params.direction_noise_decay**step_index)
+    )
+
+
+def surface_position_at_xy(point_xy: np.ndarray, params: PlannerParams) -> np.ndarray:
+    point = np.asarray(point_xy, dtype=float).reshape(2)
+    return np.array(
+        [point[0], point[1], float(params.surface.height(point[0], point[1]))],
+        dtype=float,
     )
 
 
@@ -151,6 +179,56 @@ def _nominal_direction(current_xy: np.ndarray, params: PlannerParams) -> np.ndar
     return to_center / distance
 
 
+def _normalize_vector(vector: np.ndarray, *, tol: float = 1e-10) -> np.ndarray | None:
+    vector = np.asarray(vector, dtype=float).reshape(3)
+    norm = float(np.linalg.norm(vector))
+    if norm <= tol:
+        return None
+    return vector / norm
+
+
+def compute_surface_tangent_quaternion(
+    point_xy: np.ndarray,
+    direction_xy: np.ndarray,
+    surface: AnalyticSurface,
+    previous_x_axis: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    point = np.asarray(point_xy, dtype=float).reshape(2)
+    direction = np.asarray(direction_xy, dtype=float).reshape(2)
+
+    dzdx, dzdy = surface.gradient(point[0], point[1])
+    normal = _normalize_vector(np.array([-float(dzdx), -float(dzdy), 1.0]))
+    if normal is None:
+        normal = np.array([0.0, 0.0, 1.0], dtype=float)
+
+    candidate_vectors: list[np.ndarray] = [np.array([direction[0], direction[1], 0.0])]
+    if previous_x_axis is not None:
+        candidate_vectors.append(np.asarray(previous_x_axis, dtype=float).reshape(3))
+    candidate_vectors.append(np.array([1.0, 0.0, 0.0], dtype=float))
+    candidate_vectors.append(np.array([0.0, 1.0, 0.0], dtype=float))
+
+    x_axis = None
+    for candidate in candidate_vectors:
+        projected = candidate - normal * float(np.dot(candidate, normal))
+        x_axis = _normalize_vector(projected)
+        if x_axis is not None:
+            break
+
+    if x_axis is None:
+        x_axis = np.array([1.0, 0.0, 0.0], dtype=float)
+
+    y_axis = _normalize_vector(np.cross(normal, x_axis))
+    if y_axis is None:
+        y_axis = np.array([0.0, 1.0, 0.0], dtype=float)
+    x_axis = _normalize_vector(np.cross(y_axis, normal))
+    if x_axis is None:
+        x_axis = np.array([1.0, 0.0, 0.0], dtype=float)
+
+    rotation_matrix = np.column_stack((x_axis, y_axis, normal))
+    quaternion_xyzw = Rotation.from_matrix(rotation_matrix).as_quat()
+    return quaternion_xyzw.astype(float), x_axis.astype(float)
+
+
 def plan_chunks(
     start_xy: np.ndarray,
     global_step_index: int,
@@ -158,14 +236,15 @@ def plan_chunks(
     params: PlannerParams,
     rng: np.random.Generator,
 ) -> list[np.ndarray]:
-    points = plan_action_points(
+    positions_xyz, orientations_xyzw = plan_action_poses(
         start_xy=start_xy,
         global_step_index=global_step_index,
         num_points=num_chunks,
         params=params,
         rng=rng,
     )
-    return [point.reshape(1, 2) for point in points]
+    poses = np.hstack((positions_xyz, orientations_xyzw))
+    return [pose.reshape(1, 7) for pose in poses]
 
 
 def plan_action_points(
@@ -219,3 +298,39 @@ def plan_action_points(
         planned_points[point_index] = current_xy
 
     return planned_points
+
+
+def plan_action_poses(
+    start_xy: np.ndarray,
+    global_step_index: int,
+    num_points: int,
+    params: PlannerParams,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    points_xy = plan_action_points(
+        start_xy=start_xy,
+        global_step_index=global_step_index,
+        num_points=num_points,
+        params=params,
+        rng=rng,
+    )
+
+    heights = params.surface.height(points_xy[:, 0], points_xy[:, 1])
+    z_noise = rng.normal(0.0, params.z_noise_std, size=num_points)
+    positions_xyz = np.column_stack((points_xy, heights + z_noise)).astype(float)
+
+    orientations_xyzw = np.zeros((num_points, 4), dtype=float)
+    previous_x_axis = None
+    previous_xy = np.asarray(start_xy, dtype=float).reshape(2)
+    for point_index, point_xy in enumerate(points_xy):
+        direction_xy = point_xy - previous_xy
+        quaternion_xyzw, previous_x_axis = compute_surface_tangent_quaternion(
+            point_xy,
+            direction_xy,
+            params.surface,
+            previous_x_axis=previous_x_axis,
+        )
+        orientations_xyzw[point_index] = quaternion_xyzw
+        previous_xy = point_xy
+
+    return positions_xyz, orientations_xyzw

@@ -138,7 +138,7 @@
 
                         <geom name="ee_contact"
                           type="cylinder"
-                          size="0.0235 0.05"
+                          size="0.015 0.05"
                           pos="0 0 0"
                           mass="0"
                           friction="0.1 0.1 0.1"

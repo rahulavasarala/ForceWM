@@ -4,6 +4,16 @@ rectangle:
   y_min: 0.0
   y_max: 1.0
 
+surface:
+  family: default
+  base_height: 0.03
+  amp: 0.003
+  freq_x: 8.0
+  freq_y: 6.0
+  seed: 0
+  gaussian_curvature: 0.08
+  gaussian_peak_offset: 0.18
+
 defaults:
   chunk_length: 8
   step_length_k: 0.04
@@ -11,5 +21,6 @@ defaults:
   action_hz_q: 10.0
   step_noise_std: 0.015
   direction_noise_std_deg: 35.0
+  z_noise_std: 0.0005
   step_noise_decay: 0.98
   direction_noise_decay: 0.98

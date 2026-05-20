@@ -10,6 +10,8 @@ import mujoco
 import numpy as np
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+MODELS_DIR = REPO_ROOT / "models"
 DEFAULT_SITE_NAME = "ft_site"
 DEFAULT_KEYPOINT_GEOM = "tool_keypoint"
 DEFAULT_X_AXIS_GEOM = "x_axis"
@@ -18,6 +20,30 @@ DEFAULT_Z_AXIS_GEOM = "z_axis"
 DEFAULT_KEYFRAME_NAME = "home"
 WINDOW_WIDTH = 1400
 WINDOW_HEIGHT = 900
+
+
+def resolve_scene_xml_path(scene_path: Path | str) -> Path:
+    requested_path = Path(scene_path).expanduser()
+    candidate_paths: list[Path] = []
+
+    if requested_path.is_absolute():
+        candidate_paths.append(requested_path)
+    else:
+        candidate_paths.append((Path.cwd() / requested_path).resolve())
+        candidate_paths.append((MODELS_DIR / requested_path).resolve())
+
+    seen: set[Path] = set()
+    for candidate_path in candidate_paths:
+        if candidate_path in seen:
+            continue
+        seen.add(candidate_path)
+        if candidate_path.is_file():
+            return candidate_path
+
+    searched_locations = ", ".join(str(path) for path in candidate_paths)
+    raise FileNotFoundError(
+        f"Scene XML not found for `{requested_path}`. Searched: {searched_locations}"
+    )
 
 
 def _print_runtime_summary(
@@ -84,9 +110,7 @@ class RobotVis:
         axis_radius: float = 0.002,
         keypoint_radius: float = 0.006,
     ) -> None:
-        self.scene_path = Path(scene_path).expanduser().resolve()
-        if not self.scene_path.is_file():
-            raise FileNotFoundError(f"Scene XML not found: {self.scene_path}")
+        self.scene_path = resolve_scene_xml_path(scene_path)
 
         self.model = mujoco.MjModel.from_xml_path(str(self.scene_path))
         self.data = mujoco.MjData(self.model)
@@ -474,7 +498,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "scene_xml",
         type=Path,
-        help="Path to the MuJoCo XML scene file.",
+        help="MuJoCo scene XML file name or path. Bare file names are resolved under models/.",
     )
     parser.add_argument(
         "--site",

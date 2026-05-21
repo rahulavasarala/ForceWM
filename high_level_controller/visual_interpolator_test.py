@@ -11,6 +11,9 @@ from scipy.spatial.transform import Rotation as R
 
 DESIRED_CARTESIAN_POSITION = "sai::sim::franka::desired_cartesian_position"
 DESIRED_CARTESIAN_ORIENTATION = "sai::sim::franka::desired_cartesian_orientation"
+DESIRED_FORCE = "sai::sim::franka::desired_force"
+FORCE_DIMENSION = "sai::sim::franka::force_dimension"
+FORCE_OR_MOTION_AXIS = "sai::sim::franka::force_or_motion_axis"
 
 action_hz = 10
 n_actions = 4
@@ -18,19 +21,20 @@ chunk_size = 8
 
 redis_client = redis.Redis()
 
-def generate_straight_action_chunk(p1, p2): 
-    orientation = np.array([[1,0,0], [0, -1, 0], [0,0,-1]])
+def generate_straight_action_chunk(p1, p2, force_magnitude):
+    orientation = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
     quat = R.from_matrix(orientation).as_quat()
 
     pos_chunk = np.linspace(p1, p2, chunk_size)
-    quat_stacked = np.broadcast_to(quat, (chunk_size , 4 ))
-    action_chunk = np.hstack((pos_chunk, quat_stacked))
+    quat_stacked = np.broadcast_to(quat, (chunk_size, 4))
+    force_column = np.full((chunk_size, 1), float(force_magnitude), dtype=float)
+    action_chunk = np.hstack((pos_chunk, quat_stacked, force_column))
 
     return action_chunk
 
 
-chunk1 = generate_straight_action_chunk(np.array([0.4, 0.0, 0.36]), np.array([0.4,0.0,0.45]))  
-chunk2 = generate_straight_action_chunk(np.array([0.4,0.0,0.45]), np.array([0.4,0.2, 0.45])) 
+chunk1 = generate_straight_action_chunk(np.array([0.4, 0.0, 0.36]), np.array([0.4, 0.0, 0.45]), 0.0)
+chunk2 = generate_straight_action_chunk(np.array([0.4, 0.0, 0.45]), np.array([0.4, 0.2, 0.45]), 2.0)
 
 chunk_list = [chunk1, chunk2]
 
@@ -42,6 +46,9 @@ def schedule_action_chunks(action_chunks):
         redis_client,
         desired_position_key=DESIRED_CARTESIAN_POSITION,
         desired_orientation_key=DESIRED_CARTESIAN_ORIENTATION,
+        desired_force_key=DESIRED_FORCE,
+        force_dimension_key=FORCE_DIMENSION,
+        force_or_motion_axis_key=FORCE_OR_MOTION_AXIS,
     )
     interpolator.start()
 
@@ -71,7 +78,6 @@ time.sleep(5)
 schedule_action_chunks(chunk_list)
 
 #The mid level interpolator is moving correctly --- which is really good --
-
 
 
 

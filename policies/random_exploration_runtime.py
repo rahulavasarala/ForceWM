@@ -34,6 +34,9 @@ CURRENT_POSITION_SUFFIX = "current_cartesian_position"
 CURRENT_ORIENTATION_SUFFIX = "current_cartesian_orientation"
 DESIRED_POSITION_SUFFIX = "desired_cartesian_position"
 DESIRED_ORIENTATION_SUFFIX = "desired_cartesian_orientation"
+DESIRED_FORCE_SUFFIX = "desired_force"
+FORCE_DIMENSION_SUFFIX = "force_dimension"
+FORCE_OR_MOTION_AXIS_SUFFIX = "force_or_motion_axis"
 
 
 @dataclass(frozen=True)
@@ -74,6 +77,9 @@ class PoseRedisKeys:
     current_orientation: str
     desired_position: str
     desired_orientation: str
+    desired_force: str
+    force_dimension: str
+    force_or_motion_axis: str
 
 
 @dataclass(frozen=True)
@@ -168,6 +174,15 @@ def resolve_pose_redis_keys_from_contract(contract: dict[str, Any]) -> PoseRedis
         desired_orientation=_make_redis_key(
             redis_namespace, prefix, DESIRED_ORIENTATION_SUFFIX
         ),
+        desired_force=_make_redis_key(
+            redis_namespace, prefix, DESIRED_FORCE_SUFFIX
+        ),
+        force_dimension=_make_redis_key(
+            redis_namespace, prefix, FORCE_DIMENSION_SUFFIX
+        ),
+        force_or_motion_axis=_make_redis_key(
+            redis_namespace, prefix, FORCE_OR_MOTION_AXIS_SUFFIX
+        ),
     )
 
 
@@ -207,6 +222,7 @@ def load_runtime_config(
     )
 
     generation_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    raw_z_noise_upper_bound = planner_cfg.get("z_noise_upper_bound")
     planner_defaults = {
         "chunk_length": int(planner_cfg["chunk_length"]),
         "step_length_k": float(planner_cfg["step_length_k"]),
@@ -214,10 +230,15 @@ def load_runtime_config(
         "action_hz_q": float(planner_cfg["action_hz_q"]),
         "step_noise_std": float(planner_cfg["step_noise_std"]),
         "direction_noise_std_deg": float(planner_cfg["direction_noise_std_deg"]),
-        "z_noise_std": float(planner_cfg["z_noise_std"]),
+        "z_noise_std": float(planner_cfg.get("z_noise_std", 0.0 if raw_z_noise_upper_bound is None else raw_z_noise_upper_bound)),
+        "z_noise_lower_bound": float(planner_cfg.get("z_noise_lower_bound", 0.0)),
         "step_noise_decay": float(planner_cfg["step_noise_decay"]),
         "direction_noise_decay": float(planner_cfg["direction_noise_decay"]),
+        "force_magnitude_lower_bound": float(planner_cfg.get("force_magnitude_lower_bound", 0.0)),
+        "force_magnitude_upper_bound": float(planner_cfg.get("force_magnitude_upper_bound", 0.0)),
     }
+    if raw_z_noise_upper_bound is not None:
+        planner_defaults["z_noise_upper_bound"] = float(raw_z_noise_upper_bound)
     planner_params = planner_params_from_generation_metadata_defaults(
         generation_metadata,
         planner_defaults,
@@ -257,8 +278,8 @@ def local_chunk_to_world(
 ) -> np.ndarray:
     chunk = np.asarray(chunk_local, dtype=float)
     translation = np.asarray(translation_world, dtype=float).reshape(-1)
-    if chunk.ndim != 2 or chunk.shape[1] != 7:
-        raise ValueError("chunk_local must have shape (N, 7).")
+    if chunk.ndim != 2 or chunk.shape[1] != 8:
+        raise ValueError("chunk_local must have shape (N, 8).")
     if translation.size != 3:
         raise ValueError("translation_world must contain exactly three values.")
 
@@ -331,6 +352,9 @@ class RandomExplorationRuntime:
             self.redis_client,
             config.pose_keys.desired_position,
             config.pose_keys.desired_orientation,
+            config.pose_keys.desired_force,
+            config.pose_keys.force_dimension,
+            config.pose_keys.force_or_motion_axis,
             publish_rate_hz=config.runtime.interpolator_frequency_hz,
             blend_duration=config.runtime.blend_duration_s,
         )
@@ -379,7 +403,18 @@ class RandomExplorationRuntime:
             params=self.params,
             rng=self.rng,
         )
-        local_chunk = np.hstack((local_positions, local_orientations))
+        chunk_force_magnitude = float(
+            self.rng.uniform(
+                self.params.force_magnitude_lower,
+                self.params.force_magnitude_upper,
+            )
+        )
+        force_magnitudes = np.full(
+            (local_positions.shape[0], 1),
+            chunk_force_magnitude,
+            dtype=float,
+        )
+        local_chunk = np.hstack((local_positions, local_orientations, force_magnitudes))
         world_chunk = local_chunk_to_world(
             local_chunk,
             self.config.runtime.translation_world,
@@ -442,7 +477,10 @@ def main() -> int:
         f"current_pos=`{config.pose_keys.current_position}` "
         f"current_ori=`{config.pose_keys.current_orientation}` "
         f"desired_pos=`{config.pose_keys.desired_position}` "
-        f"desired_ori=`{config.pose_keys.desired_orientation}`",
+        f"desired_ori=`{config.pose_keys.desired_orientation}` "
+        f"desired_force=`{config.pose_keys.desired_force}` "
+        f"force_dimension=`{config.pose_keys.force_dimension}` "
+        f"force_axis=`{config.pose_keys.force_or_motion_axis}`",
         flush=True,
     )
     print(

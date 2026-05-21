@@ -57,6 +57,8 @@ def _planner_params(
     replan_every_n_chunks: int = 2,
     step_length_k: float = 0.0,
     hole_radius: float = 0.0,
+    force_magnitude_lower_bound: float = 0.0,
+    force_magnitude_upper_bound: float = 0.0,
 ) -> PlannerParams:
     return PlannerParams(
         rectangle=RectangleConfig(-0.5, 0.5, -0.5, 0.5),
@@ -70,6 +72,8 @@ def _planner_params(
         z_noise_std=0.0,
         step_noise_decay=1.0,
         direction_noise_decay=1.0,
+        force_magnitude_lower_bound=force_magnitude_lower_bound,
+        force_magnitude_upper_bound=force_magnitude_upper_bound,
         goal_xy=(0.0, 0.0),
         hole_center_xy=(0.0, 0.0),
         hole_radius=hole_radius,
@@ -100,6 +104,9 @@ def _runtime_config(
             current_orientation="test::current_cartesian_orientation",
             desired_position="test::desired_cartesian_position",
             desired_orientation="test::desired_cartesian_orientation",
+            desired_force="test::desired_force",
+            force_dimension="test::force_dimension",
+            force_or_motion_axis="test::force_or_motion_axis",
         ),
     )
 
@@ -255,7 +262,10 @@ planner:
   step_length_k: 0.02
   step_noise_std: 0.01
   direction_noise_std_deg: 12.0
-  z_noise_std: 0.0004
+  z_noise_lower_bound: 0.0001
+  z_noise_upper_bound: 0.0004
+  force_magnitude_lower_bound: 1.5
+  force_magnitude_upper_bound: 2.5
   step_noise_decay: 0.91
   direction_noise_decay: 0.82
 """
@@ -286,7 +296,10 @@ planner:
         self.assertAlmostEqual(config.planner_params.step_length_k, 0.02)
         self.assertAlmostEqual(config.planner_params.step_noise_std_0, 0.01)
         self.assertAlmostEqual(config.planner_params.direction_noise_std_deg_0, 12.0)
-        self.assertAlmostEqual(config.planner_params.z_noise_std, 0.0004)
+        self.assertAlmostEqual(config.planner_params.z_noise_lower, 0.0001)
+        self.assertAlmostEqual(config.planner_params.z_noise_upper, 0.0004)
+        self.assertAlmostEqual(config.planner_params.force_magnitude_lower, 1.5)
+        self.assertAlmostEqual(config.planner_params.force_magnitude_upper, 2.5)
         self.assertAlmostEqual(config.planner_params.rectangle.x_min, -0.1)
         self.assertAlmostEqual(config.planner_params.rectangle.x_max, 0.1)
         self.assertAlmostEqual(config.planner_params.goal[0], 0.01)
@@ -298,6 +311,18 @@ planner:
         self.assertEqual(
             config.pose_keys.desired_orientation,
             "demo::arm::tool::desired_cartesian_orientation",
+        )
+        self.assertEqual(
+            config.pose_keys.desired_force,
+            "demo::arm::tool::desired_force",
+        )
+        self.assertEqual(
+            config.pose_keys.force_dimension,
+            "demo::arm::tool::force_dimension",
+        )
+        self.assertEqual(
+            config.pose_keys.force_or_motion_axis,
+            "demo::arm::tool::force_or_motion_axis",
         )
 
     def test_resolve_pose_redis_keys_from_contract_uses_namespace_and_prefix(self) -> None:
@@ -326,13 +351,25 @@ planner:
             pose_keys.desired_orientation,
             "sai::sim::franka::desired_cartesian_orientation",
         )
+        self.assertEqual(
+            pose_keys.desired_force,
+            "sai::sim::franka::desired_force",
+        )
+        self.assertEqual(
+            pose_keys.force_dimension,
+            "sai::sim::franka::force_dimension",
+        )
+        self.assertEqual(
+            pose_keys.force_or_motion_axis,
+            "sai::sim::franka::force_or_motion_axis",
+        )
 
     def test_local_world_transform_helpers_translate_positions_only(self) -> None:
         translation = np.array([0.4, 0.0, 0.3], dtype=float)
         local_chunk = np.array(
             [
-                [0.02, -0.01, 0.03, 0.1, 0.2, 0.3, 0.9],
-                [0.04, 0.05, 0.04, -0.1, 0.0, 0.4, 0.91],
+                [0.02, -0.01, 0.03, 0.1, 0.2, 0.3, 0.9, 0.0],
+                [0.04, 0.05, 0.04, -0.1, 0.0, 0.4, 0.91, 1.5],
             ],
             dtype=float,
         )
@@ -345,7 +382,12 @@ planner:
         np.testing.assert_allclose(local_xy, local_chunk[0, :2])
 
     def test_runtime_run_schedules_chunks_and_replans_from_measured_current_pose(self) -> None:
-        config = _runtime_config(planner_params=_planner_params())
+        config = _runtime_config(
+            planner_params=_planner_params(
+                force_magnitude_lower_bound=1.25,
+                force_magnitude_upper_bound=1.75,
+            )
+        )
         current_positions = [
             np.array([0.42, 0.01, 0.33], dtype=float),
             np.array([0.44, 0.02, 0.33], dtype=float),
@@ -381,8 +423,16 @@ planner:
             second_ts,
             100.2 + np.arange(config.planner_params.chunk_length, dtype=float) * 0.1,
         )
+        self.assertEqual(first_chunk.shape[1], 8)
+        self.assertEqual(second_chunk.shape[1], 8)
         np.testing.assert_allclose(first_chunk[0, :3], current_positions[0], atol=1e-9)
         np.testing.assert_allclose(second_chunk[0, :3], current_positions[1], atol=1e-9)
+        self.assertTrue(np.allclose(first_chunk[:, 7], first_chunk[0, 7]))
+        self.assertTrue(np.allclose(second_chunk[:, 7], second_chunk[0, 7]))
+        self.assertGreaterEqual(first_chunk[0, 7], config.planner_params.force_magnitude_lower)
+        self.assertLessEqual(first_chunk[0, 7], config.planner_params.force_magnitude_upper)
+        self.assertGreaterEqual(second_chunk[0, 7], config.planner_params.force_magnitude_lower)
+        self.assertLessEqual(second_chunk[0, 7], config.planner_params.force_magnitude_upper)
         self.assertEqual(runtime.global_step_index, 4)
 
     def test_runtime_stops_and_surfaces_interpolator_fault(self) -> None:

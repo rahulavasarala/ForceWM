@@ -74,6 +74,10 @@ class PlannerParams:
     z_noise_std: float
     step_noise_decay: float
     direction_noise_decay: float
+    z_noise_lower_bound: float = 0.0
+    z_noise_upper_bound: float | None = None
+    force_magnitude_lower_bound: float = 0.0
+    force_magnitude_upper_bound: float = 0.0
     goal_xy: tuple[float, float] | None = None
     hole_center_xy: tuple[float, float] | None = None
     hole_radius: float = 0.0
@@ -95,6 +99,20 @@ class PlannerParams:
             raise ValueError("direction_noise_std_deg_0 must be non-negative.")
         if self.z_noise_std < 0.0:
             raise ValueError("z_noise_std must be non-negative.")
+        if self.z_noise_lower_bound < 0.0:
+            raise ValueError("z_noise_lower_bound must be non-negative.")
+        if self.z_noise_upper < 0.0:
+            raise ValueError("z_noise_upper_bound must be non-negative.")
+        if self.z_noise_lower > self.z_noise_upper:
+            raise ValueError("z_noise_lower_bound must be <= z_noise_upper_bound.")
+        if self.force_magnitude_lower_bound < 0.0:
+            raise ValueError("force_magnitude_lower_bound must be non-negative.")
+        if self.force_magnitude_upper_bound < 0.0:
+            raise ValueError("force_magnitude_upper_bound must be non-negative.")
+        if self.force_magnitude_lower_bound > self.force_magnitude_upper_bound:
+            raise ValueError(
+                "force_magnitude_lower_bound must be <= force_magnitude_upper_bound."
+            )
         if not 0.0 <= self.step_noise_decay <= 1.0:
             raise ValueError("step_noise_decay must lie in [0, 1].")
         if not 0.0 <= self.direction_noise_decay <= 1.0:
@@ -107,6 +125,24 @@ class PlannerParams:
             raise ValueError("hole_radius must be non-negative.")
         if self.center_tolerance <= 0.0:
             raise ValueError("center_tolerance must be positive.")
+
+    @property
+    def z_noise_lower(self) -> float:
+        return float(self.z_noise_lower_bound)
+
+    @property
+    def z_noise_upper(self) -> float:
+        if self.z_noise_upper_bound is None:
+            return float(self.z_noise_std)
+        return float(self.z_noise_upper_bound)
+
+    @property
+    def force_magnitude_lower(self) -> float:
+        return float(self.force_magnitude_lower_bound)
+
+    @property
+    def force_magnitude_upper(self) -> float:
+        return float(self.force_magnitude_upper_bound)
 
     @property
     def goal(self) -> np.ndarray:
@@ -219,6 +255,14 @@ def _planner_params_from_defaults(
     hole_center_xy: tuple[float, float] | None = None,
     hole_radius: float = 0.0,
 ) -> PlannerParams:
+    raw_z_noise_upper_bound = defaults_cfg.get("z_noise_upper_bound")
+    z_noise_std = float(defaults_cfg.get("z_noise_std", 0.0 if raw_z_noise_upper_bound is None else raw_z_noise_upper_bound))
+    z_noise_lower_bound = float(defaults_cfg.get("z_noise_lower_bound", 0.0))
+    z_noise_upper_bound = (
+        None
+        if raw_z_noise_upper_bound is None
+        else float(raw_z_noise_upper_bound)
+    )
     params = PlannerParams(
         rectangle=rectangle,
         surface=surface,
@@ -228,9 +272,13 @@ def _planner_params_from_defaults(
         action_hz_q=float(defaults_cfg["action_hz_q"]),
         step_noise_std_0=float(defaults_cfg["step_noise_std"]),
         direction_noise_std_deg_0=float(defaults_cfg["direction_noise_std_deg"]),
-        z_noise_std=float(defaults_cfg["z_noise_std"]),
+        z_noise_std=z_noise_std,
         step_noise_decay=float(defaults_cfg["step_noise_decay"]),
         direction_noise_decay=float(defaults_cfg["direction_noise_decay"]),
+        z_noise_lower_bound=z_noise_lower_bound,
+        z_noise_upper_bound=z_noise_upper_bound,
+        force_magnitude_lower_bound=float(defaults_cfg.get("force_magnitude_lower_bound", 0.0)),
+        force_magnitude_upper_bound=float(defaults_cfg.get("force_magnitude_upper_bound", 0.0)),
         goal_xy=goal_xy,
         hole_center_xy=hole_center_xy,
         hole_radius=float(hole_radius),
@@ -504,8 +552,8 @@ def plan_action_poses(
     )
 
     heights = params.surface.height(points_xy[:, 0], points_xy[:, 1])
-    z_noise = rng.normal(0.0, params.z_noise_std, size=num_points)
-    positions_xyz = np.column_stack((points_xy, heights + z_noise)).astype(float)
+    z_offset = rng.uniform(params.z_noise_lower, params.z_noise_upper, size=num_points)
+    positions_xyz = np.column_stack((points_xy, heights - z_offset)).astype(float)
 
     orientations_xyzw = np.zeros((num_points, 4), dtype=float)
     previous_x_axis = None

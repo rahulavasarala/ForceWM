@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from dataclasses import dataclass
 
 import numpy as np
 from scipy.interpolate import CubicSpline
@@ -13,22 +14,56 @@ class InterpolatorFault(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class _PlanSample:
+    pos: np.ndarray
+    quat: np.ndarray
+    force_magnitude: float
+    dx_world: np.ndarray
+
+
 class _Plan:
     def __init__(self, actions: np.ndarray, ts: np.ndarray) -> None:
         self.ts = np.asarray(ts, dtype=float).reshape(-1)
         self.pos = np.asarray(actions[:, :3], dtype=float)
         self.quat = _prepare_quaternions(actions[:, 3:7])
+        self.force_magnitudes = np.asarray(actions[:, 7], dtype=float).reshape(-1)
         self.pos_splines = [CubicSpline(self.ts, self.pos[:, axis]) for axis in range(3)]
         self.slerp = Slerp(self.ts, Rotation.from_quat(self.quat))
 
-    def sample(self, now: float) -> tuple[np.ndarray, np.ndarray]:
+    def sample(self, now: float) -> _PlanSample:
         if now <= self.ts[0]:
-            return self.pos[0].copy(), self.quat[0].copy()
+            return _PlanSample(
+                pos=self.pos[0].copy(),
+                quat=self.quat[0].copy(),
+                force_magnitude=float(self.force_magnitudes[0]),
+                dx_world=self._segment_dx(0),
+            )
         if now >= self.ts[-1]:
-            return self.pos[-1].copy(), self.quat[-1].copy()
+            return _PlanSample(
+                pos=self.pos[-1].copy(),
+                quat=self.quat[-1].copy(),
+                force_magnitude=float(self.force_magnitudes[-1]),
+                dx_world=self._segment_dx(len(self.ts) - 2),
+            )
+
+        segment_idx = self._segment_index(now)
         pos = np.asarray([float(spline(now)) for spline in self.pos_splines], dtype=float)
         quat = self.slerp([float(now)]).as_quat()[0]
-        return pos, _normalize_quat(quat)
+        force_magnitude = float(np.interp(now, self.ts, self.force_magnitudes))
+        return _PlanSample(
+            pos=pos,
+            quat=_normalize_quat(quat),
+            force_magnitude=force_magnitude,
+            dx_world=self._segment_dx(segment_idx),
+        )
+
+    def _segment_index(self, now: float) -> int:
+        return int(np.clip(np.searchsorted(self.ts, now, side="right") - 1, 0, len(self.ts) - 2))
+
+    def _segment_dx(self, segment_idx: int) -> np.ndarray:
+        idx = int(np.clip(segment_idx, 0, len(self.pos) - 2))
+        return np.asarray(self.pos[idx + 1] - self.pos[idx], dtype=float)
 
 
 class TrajectoryInterpolator:
@@ -37,6 +72,9 @@ class TrajectoryInterpolator:
         redis_client,
         desired_position_key: str,
         desired_orientation_key: str,
+        desired_force_key: str,
+        force_dimension_key: str,
+        force_or_motion_axis_key: str,
         publish_rate_hz: float = 100.0,
         blend_duration: float = 0.1,
     ) -> None:
@@ -48,6 +86,9 @@ class TrajectoryInterpolator:
         self.redis_client = redis_client
         self.desired_position_key = desired_position_key
         self.desired_orientation_key = desired_orientation_key
+        self.desired_force_key = desired_force_key
+        self.force_dimension_key = force_dimension_key
+        self.force_or_motion_axis_key = force_or_motion_axis_key
         self.publish_rate_hz = float(publish_rate_hz)
         self.blend_duration = float(blend_duration)
 
@@ -86,14 +127,16 @@ class TrajectoryInterpolator:
     def _validate_chunk(self, A_c, ts, now: float) -> tuple[np.ndarray, np.ndarray]:
         actions = np.asarray(A_c, dtype=float)
         ts = np.asarray(ts, dtype=float).reshape(-1)
-        if actions.ndim != 2 or actions.shape[1] != 7:
-            raise InterpolatorFault("A_c must have shape (N, 7).")
+        if actions.ndim != 2 or actions.shape[1] != 8:
+            raise InterpolatorFault("A_c must have shape (N, 8).")
         if ts.ndim != 1 or len(ts) != len(actions):
             raise InterpolatorFault("ts must have shape (N,) and match the chunk length.")
         if len(actions) < 2:
             raise InterpolatorFault("Chunks must contain at least 2 waypoints.")
         if not np.all(np.isfinite(actions)) or not np.all(np.isfinite(ts)):
             raise InterpolatorFault("Chunk actions and ts must be finite.")
+        if np.any(actions[:, 7] < 0.0):
+            raise InterpolatorFault("magnitude_force must be non-negative.")
         if np.any(np.diff(ts) <= 0.0):
             raise InterpolatorFault("ts must be strictly increasing.")
         if ts[-1] <= now:
@@ -107,16 +150,47 @@ class TrajectoryInterpolator:
         while not self._stop_event.is_set():
             start = time.monotonic()
             sample = self._sample(start)
-            if sample is not None:
-                pos, quat = sample
-                self.redis_client.set(self.desired_position_key, json.dumps(pos.tolist()))
-                rot = Rotation.from_quat(quat).as_matrix().tolist()
-                self.redis_client.set(self.desired_orientation_key, json.dumps(rot))
+            self._publish_sample(sample)
             sleep_time = period - (time.monotonic() - start)
             if sleep_time > 0.0:
                 self._stop_event.wait(sleep_time)
 
-    def _sample(self, now: float) -> tuple[np.ndarray, np.ndarray] | None:
+    def _publish_sample(self, sample: _PlanSample | None) -> None:
+        if sample is not None:
+            _write_vector(self.redis_client, self.desired_position_key, sample.pos)
+            _write_matrix(
+                self.redis_client,
+                self.desired_orientation_key,
+                Rotation.from_quat(sample.quat).as_matrix(),
+            )
+            desired_force = self._desired_force_from_sample(
+                sample.force_magnitude,
+                sample.dx_world,
+            )
+        else:
+            desired_force = np.zeros(3, dtype=float)
+        _write_vector(self.redis_client, self.desired_force_key, desired_force)
+
+    def _desired_force_from_sample(
+        self,
+        force_magnitude: float,
+        dx_world: np.ndarray,
+    ) -> np.ndarray:
+        force_dimension = _read_int(self.redis_client, self.force_dimension_key)
+        if force_dimension != 1:
+            return np.zeros(3, dtype=float)
+
+        force_axis = _normalize_axis(_read_vector(self.redis_client, self.force_or_motion_axis_key))
+        projected_component = float(np.dot(np.asarray(dx_world, dtype=float).reshape(3), force_axis))
+        if abs(projected_component) <= 1e-12:
+            return np.zeros(3, dtype=float)
+        desired_force = float(force_magnitude) * np.sign(projected_component) * force_axis
+        negative_z_axis = np.array([0.0, 0.0, -1.0], dtype=float)
+        if np.linalg.norm(desired_force) > 0.0 and float(np.dot(desired_force, negative_z_axis)) < 0.0:
+            desired_force = -desired_force
+        return desired_force
+
+    def _sample(self, now: float) -> _PlanSample | None:
         with self._lock:
             active = self._active
             pending = self._pending
@@ -151,16 +225,68 @@ class TrajectoryInterpolator:
 
         if blend is not None:
             old_plan, new_plan, start, end = blend
-            old_pos, old_quat = old_plan.sample(now)
-            new_pos, new_quat = new_plan.sample(now)
+            old_sample = old_plan.sample(now)
+            new_sample = new_plan.sample(now)
             alpha = _min_jerk_alpha(now, start, end)
-            pos = (1.0 - alpha) * old_pos + alpha * new_pos
-            quat = _blend_quaternions(old_quat, new_quat, alpha)
-            return pos, quat
+            pos = (1.0 - alpha) * old_sample.pos + alpha * new_sample.pos
+            quat = _blend_quaternions(old_sample.quat, new_sample.quat, alpha)
+            force_magnitude = (1.0 - alpha) * old_sample.force_magnitude + alpha * new_sample.force_magnitude
+            dx_world = (1.0 - alpha) * old_sample.dx_world + alpha * new_sample.dx_world
+            return _PlanSample(
+                pos=pos,
+                quat=quat,
+                force_magnitude=float(force_magnitude),
+                dx_world=np.asarray(dx_world, dtype=float),
+            )
 
         if active is None:
             return None
         return active.sample(now)
+
+
+def _redis_text(value: bytes | str | None) -> str:
+    if value is None:
+        raise InterpolatorFault("Requested Redis key is missing.")
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return value
+
+
+def _read_json_value(redis_client, key: str):
+    return json.loads(_redis_text(redis_client.get(key)))
+
+
+def _read_vector(redis_client, key: str) -> np.ndarray:
+    vector = np.asarray(_read_json_value(redis_client, key), dtype=float).reshape(-1)
+    if vector.size != 3:
+        raise InterpolatorFault(f"Redis key `{key}` did not contain a 3D vector.")
+    return vector.astype(float)
+
+
+def _read_int(redis_client, key: str) -> int:
+    raw_value = redis_client.get(key)
+    if raw_value is None:
+        raise InterpolatorFault(f"Requested Redis key `{key}` is missing.")
+    if isinstance(raw_value, bytes):
+        raw_value = raw_value.decode("utf-8")
+    return int(raw_value)
+
+
+def _write_vector(redis_client, key: str, value: np.ndarray) -> None:
+    redis_client.set(key, json.dumps(np.asarray(value, dtype=float).reshape(3).tolist()))
+
+
+def _write_matrix(redis_client, key: str, value: np.ndarray) -> None:
+    matrix = np.asarray(value, dtype=float).reshape(3, 3)
+    redis_client.set(key, json.dumps(matrix.tolist()))
+
+
+def _normalize_axis(axis: np.ndarray) -> np.ndarray:
+    axis = np.asarray(axis, dtype=float).reshape(3)
+    norm = float(np.linalg.norm(axis))
+    if norm <= 1e-9:
+        return np.array([0.0, 0.0, 1.0], dtype=float)
+    return axis / norm
 
 
 def _normalize_quat(quat: np.ndarray) -> np.ndarray:

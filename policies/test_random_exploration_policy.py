@@ -141,7 +141,8 @@ defaults:
   action_hz_q: 12.0
   step_noise_std: 0.02
   direction_noise_std_deg: 15.0
-  z_noise_std: 0.0008
+  z_noise_lower_bound: 0.0001
+  z_noise_upper_bound: 0.0008
   step_noise_decay: 0.91
   direction_noise_decay: 0.83
 """
@@ -158,7 +159,8 @@ defaults:
         self.assertAlmostEqual(params.rectangle.y_max, 0.5)
         self.assertAlmostEqual(params.surface.config.base_height, 0.02)
         self.assertAlmostEqual(params.surface.config.freq_y, 7.0)
-        self.assertAlmostEqual(params.z_noise_std, 0.0008)
+        self.assertAlmostEqual(params.z_noise_lower, 0.0001)
+        self.assertAlmostEqual(params.z_noise_upper, 0.0008)
 
     def test_noise_decay_is_monotonic(self) -> None:
         params = PlannerParams(
@@ -178,6 +180,49 @@ defaults:
         dir_stds = [direction_noise_std_deg(step, params) for step in range(5)]
         self.assertEqual(step_stds, sorted(step_stds, reverse=True))
         self.assertEqual(dir_stds, sorted(dir_stds, reverse=True))
+
+    def test_validate_rejects_z_noise_lower_bound_above_upper_bound(self) -> None:
+        params = PlannerParams(
+            rectangle=RectangleConfig(0.0, 1.0, 0.0, 1.0),
+            surface=build_surface_model(_surface_config()),
+            chunk_length=4,
+            step_length_k=0.1,
+            replan_every_n_chunks=1,
+            action_hz_q=10.0,
+            step_noise_std_0=0.05,
+            direction_noise_std_deg_0=30.0,
+            z_noise_std=0.0,
+            step_noise_decay=0.9,
+            direction_noise_decay=0.8,
+            z_noise_lower_bound=0.002,
+            z_noise_upper_bound=0.001,
+        )
+
+        with self.assertRaisesRegex(ValueError, "z_noise_lower_bound must be <= z_noise_upper_bound"):
+            params.validate()
+
+    def test_validate_rejects_force_magnitude_lower_bound_above_upper_bound(self) -> None:
+        params = PlannerParams(
+            rectangle=RectangleConfig(0.0, 1.0, 0.0, 1.0),
+            surface=build_surface_model(_surface_config()),
+            chunk_length=4,
+            step_length_k=0.1,
+            replan_every_n_chunks=1,
+            action_hz_q=10.0,
+            step_noise_std_0=0.05,
+            direction_noise_std_deg_0=30.0,
+            z_noise_std=0.0,
+            step_noise_decay=0.9,
+            direction_noise_decay=0.8,
+            force_magnitude_lower_bound=2.0,
+            force_magnitude_upper_bound=1.0,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "force_magnitude_lower_bound must be <= force_magnitude_upper_bound",
+        ):
+            params.validate()
 
     def test_plan_action_poses_preserves_xy_and_sets_surface_z_without_noise(self) -> None:
         params = PlannerParams(
@@ -215,6 +260,39 @@ defaults:
         np.testing.assert_allclose(positions_xyz[:, :2], points_xy, atol=1e-9)
         expected_z = params.surface.height(points_xy[:, 0], points_xy[:, 1])
         np.testing.assert_allclose(positions_xyz[:, 2], expected_z, atol=1e-9)
+
+    def test_plan_action_poses_applies_downward_uniform_z_offset(self) -> None:
+        params = PlannerParams(
+            rectangle=RectangleConfig(0.0, 2.0, -1.0, 1.0),
+            surface=build_surface_model(
+                _surface_config(base_height=0.01, amp=0.002, origin_x=1.0, origin_y=0.0)
+            ),
+            chunk_length=4,
+            step_length_k=0.5,
+            replan_every_n_chunks=1,
+            action_hz_q=10.0,
+            step_noise_std_0=0.0,
+            direction_noise_std_deg_0=0.0,
+            z_noise_std=0.0008,
+            step_noise_decay=1.0,
+            direction_noise_decay=1.0,
+            z_noise_lower_bound=0.0002,
+            z_noise_upper_bound=0.0008,
+        )
+        pose_rng = np.random.default_rng(123)
+        positions_xyz, _ = plan_action_poses(
+            start_xy=np.array([0.0, 0.0]),
+            global_step_index=0,
+            num_points=4,
+            params=params,
+            rng=pose_rng,
+        )
+
+        expected_surface_z = params.surface.height(positions_xyz[:, 0], positions_xyz[:, 1])
+        z_offsets = expected_surface_z - positions_xyz[:, 2]
+
+        self.assertTrue(np.all(z_offsets >= params.z_noise_lower - 1e-12))
+        self.assertTrue(np.all(z_offsets <= params.z_noise_upper + 1e-12))
 
     def test_load_planner_params_from_generation_metadata_uses_part_bounds(self) -> None:
         params = load_planner_params_from_generation_metadata(DEFAULT_METADATA_PATH)

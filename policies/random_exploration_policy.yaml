@@ -21,6 +21,9 @@ defaults:
   action_hz_q: 10.0
   step_noise_std: 0.015
   direction_noise_std_deg: 35.0
-  z_noise_std: 0.0005
+  z_noise_lower_bound: 0.0
+  z_noise_upper_bound: 0.0005
+  force_magnitude_lower_bound: 0.0
+  force_magnitude_upper_bound: 0.0
   step_noise_decay: 0.98
   direction_noise_decay: 0.98

@@ -242,13 +242,13 @@ void update_particle_filter(
 
   if (fdim == 0) {
     if (!queue_is_uniform) {
-      std::cout << "Particle filter update: raw_fdim=" << fdim
-                << " queue=" << queue_to_string(force_dimension_queue)
-                << " force_to_free=false"
-                << " sensed_force_world_frame="
-                << sensed_force_world_frame.transpose()
-                << " normal_force=" << normal_force
-                << " action=hold_previous_constraint" << std::endl;
+      // std::cout << "Particle filter update: raw_fdim=" << fdim
+      //           << " queue=" << queue_to_string(force_dimension_queue)
+      //           << " force_to_free=false"
+      //           << " sensed_force_world_frame="
+      //           << sensed_force_world_frame.transpose()
+      //           << " normal_force=" << normal_force
+      //           << " action=hold_previous_constraint" << std::endl;
       return;
     }
     pfilter_output.flag_force_to_free = true;
@@ -256,18 +256,18 @@ void update_particle_filter(
 
   pfilter_output.force_space_dimension = fdim;
   pfilter_output.force_or_motion_axis = motion_or_force_axis;
-  std::cout << "Particle filter update: raw_fdim=" << fdim
-            << " queue=" << queue_to_string(force_dimension_queue)
-            << " force_to_free="
-            << (pfilter_output.flag_force_to_free ? "true" : "false")
-            << " committed_fdim=" << pfilter_output.force_space_dimension
-            << " sensed_force_world_frame="
-            << sensed_force_world_frame.transpose()
-            << " normal_force=" << normal_force
-            << "dx_world=" << dx_world.transpose()
-            << "motion_control=" << motion_control.transpose()
-            << "force_control=" << force_control.transpose()
-            << std::endl;
+  // std::cout << "Particle filter update: raw_fdim=" << fdim
+  //           << " queue=" << queue_to_string(force_dimension_queue)
+  //           << " force_to_free="
+  //           << (pfilter_output.flag_force_to_free ? "true" : "false")
+  //           << " committed_fdim=" << pfilter_output.force_space_dimension
+  //           << " sensed_force_world_frame="
+  //           << sensed_force_world_frame.transpose()
+  //           << " normal_force=" << normal_force
+  //           << "dx_world=" << dx_world.transpose()
+  //           << "motion_control=" << motion_control.transpose()
+  //           << "force_control=" << force_control.transpose()
+  //           << std::endl;
 
   if (pfilter_output.force_space_dimension == 0) {
     sigma_force = Matrix3d::Zero();

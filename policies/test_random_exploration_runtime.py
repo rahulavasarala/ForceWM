@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -169,6 +171,7 @@ class _SequencedRedisClient:
         pose_keys: PoseRedisKeys,
         current_positions: list[np.ndarray],
         current_orientations: list[np.ndarray] | None = None,
+        force_dimensions: list[int] | None = None,
     ) -> None:
         self.pose_keys = pose_keys
         self.current_positions = [
@@ -180,8 +183,10 @@ class _SequencedRedisClient:
             np.asarray(orientation, dtype=float).reshape(3, 3)
             for orientation in orientations
         ]
+        self.force_dimensions = list(force_dimensions or [0])
         self.position_read_count = 0
         self.orientation_read_count = 0
+        self.force_dimension_read_count = 0
         self.ping_count = 0
 
     def ping(self) -> bool:
@@ -203,6 +208,12 @@ class _SequencedRedisClient:
             return json.dumps(
                 self.current_orientations[index].tolist()
             ).encode("utf-8")
+        if key == self.pose_keys.force_dimension:
+            index = min(
+                self.force_dimension_read_count, len(self.force_dimensions) - 1
+            )
+            self.force_dimension_read_count += 1
+            return str(int(self.force_dimensions[index])).encode("utf-8")
         return None
 
 
@@ -392,7 +403,11 @@ planner:
             np.array([0.42, 0.01, 0.33], dtype=float),
             np.array([0.44, 0.02, 0.33], dtype=float),
         ]
-        fake_redis = _SequencedRedisClient(config.pose_keys, current_positions)
+        fake_redis = _SequencedRedisClient(
+            config.pose_keys,
+            current_positions,
+            force_dimensions=[1, 0],
+        )
         fake_interpolator = _FakeInterpolator()
         fake_clock = _FakeClock(start=100.0)
         fake_event = _FakeEvent(fake_clock)
@@ -404,7 +419,9 @@ planner:
             monotonic_clock=fake_clock.monotonic,
             shutdown_event=fake_event,
         )
-        runtime.run(max_cycles=2)
+        stdout_buffer = io.StringIO()
+        with contextlib.redirect_stdout(stdout_buffer):
+            runtime.run(max_cycles=2)
 
         self.assertTrue(fake_interpolator.started)
         self.assertTrue(fake_interpolator.stopped)
@@ -434,6 +451,9 @@ planner:
         self.assertGreaterEqual(second_chunk[0, 7], config.planner_params.force_magnitude_lower)
         self.assertLessEqual(second_chunk[0, 7], config.planner_params.force_magnitude_upper)
         self.assertEqual(runtime.global_step_index, 4)
+        runtime_output = stdout_buffer.getvalue()
+        self.assertIn("Force dimension == 1: True (value=1)", runtime_output)
+        self.assertIn("Force dimension == 1: False (value=0)", runtime_output)
 
     def test_runtime_stops_and_surfaces_interpolator_fault(self) -> None:
         config = _runtime_config(planner_params=_planner_params())

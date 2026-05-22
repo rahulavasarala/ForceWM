@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import argparse
-import math
 import warnings
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+
+from extractor.point_finder import (
+    CameraCalibration,
+    ContactCylinderSpec,
+    compute_camera_intrinsics,
+    load_camera_calibration,
+    load_contact_cylinder_spec,
+    select_points_to_track,
+)
 
 
 DEFAULT_CHUNK_SIZE = 128
@@ -16,11 +23,6 @@ DEFAULT_STATIONARY_WINDOW = 1
 DEFAULT_VIDEO_CODEC = "mp4v"
 DEFAULT_PARQUET_NAME = "dataset.parquet"
 DEFAULT_CAMERA_KEY = "camera_01"
-DEFAULT_WRIST_CAMERA_NAME = "wrist_camera"
-DEFAULT_POINTCLOUD_SAMPLES = 128
-DEFAULT_POINTCLOUD_ROI_FRACTION = 0.6
-DEFAULT_POINTCLOUD_SEED = 0
-DEFAULT_FR3_XML_PATH = Path(__file__).resolve().parents[1] / "models" / "fr3.xml"
 
 
 @dataclass(frozen=True)
@@ -64,12 +66,6 @@ class EpisodeProcessingResult:
     aligned_episode: AlignedEpisode
     prune_keep_mask: np.ndarray
     processed_episode: ProcessedEpisode
-
-
-@dataclass(frozen=True)
-class CameraCalibration:
-    fovy_degrees: float
-    camera_offset_m: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -597,44 +593,6 @@ def write_chunked_videos(output_dir: Path, episodes: list[ProcessedEpisode], chu
             writer.release()
 
 
-def parse_mujoco_float_vector(raw_value: str, expected_length: int, field_name: str) -> np.ndarray:
-    values = np.fromstring(raw_value, sep=" ", dtype=np.float64)
-    if len(values) != expected_length:
-        raise ValueError(f"Expected {expected_length} values for `{field_name}`, got {len(values)} from `{raw_value}`.")
-    return values
-
-
-def load_camera_calibration(
-    camera_name: str = DEFAULT_WRIST_CAMERA_NAME,
-    model_xml_path: Path = DEFAULT_FR3_XML_PATH,
-) -> CameraCalibration:
-    if not model_xml_path.exists():
-        raise FileNotFoundError(f"Camera model XML does not exist: {model_xml_path}")
-
-    model_root = ET.parse(model_xml_path).getroot()
-    for body_element in model_root.iter("body"):
-        if body_element.attrib.get("name") != "fr3_ee":
-            continue
-        for camera_element in body_element.findall("camera"):
-            if camera_element.attrib.get("name") != camera_name:
-                continue
-
-            if "pos" not in camera_element.attrib or "fovy" not in camera_element.attrib:
-                raise ValueError(f"Camera `{camera_name}` in {model_xml_path} is missing `pos` or `fovy`.")
-            camera_offset_m = parse_mujoco_float_vector(
-                camera_element.attrib["pos"],
-                expected_length=3,
-                field_name="camera pos",
-            ).astype(np.float32)
-            fovy_degrees = float(camera_element.attrib["fovy"])
-            return CameraCalibration(
-                fovy_degrees=fovy_degrees,
-                camera_offset_m=camera_offset_m,
-            )
-
-    raise ValueError(f"Could not find camera `{camera_name}` under body `fr3_ee` in {model_xml_path}.")
-
-
 def resolve_torch_device(torch_module) -> object:
     if torch_module.cuda.is_available():
         return torch_module.device("cuda")
@@ -656,52 +614,6 @@ def load_cotracker_context() -> CoTrackerContext:
         ) from exc
     model.eval()
     return CoTrackerContext(torch_module=torch, device=device, model=model)
-
-
-def compute_camera_intrinsics(
-    frame_height: int,
-    frame_width: int,
-    fovy_degrees: float,
-) -> tuple[float, float, float, float]:
-    fovy_radians = math.radians(float(fovy_degrees))
-    fy = float(frame_height) / (2.0 * math.tan(fovy_radians / 2.0))
-    fx = fy
-    cx = (float(frame_width) - 1.0) / 2.0
-    cy = (float(frame_height) - 1.0) / 2.0
-    return fx, fy, cx, cy
-
-
-def build_center_roi_bounds(frame_height: int, frame_width: int, roi_fraction: float) -> tuple[int, int, int, int]:
-    roi_side = max(1, int(round(min(frame_height, frame_width) * float(roi_fraction))))
-    roi_side = min(roi_side, frame_height, frame_width)
-    x0 = max(0, (frame_width - roi_side) // 2)
-    y0 = max(0, (frame_height - roi_side) // 2)
-    x1 = x0 + roi_side
-    y1 = y0 + roi_side
-    return x0, y0, x1, y1
-
-
-def sample_query_pixels(
-    depth_frame_mm: np.ndarray,
-    sample_count: int,
-    roi_fraction: float,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    frame_height, frame_width = depth_frame_mm.shape
-    x0, y0, x1, y1 = build_center_roi_bounds(frame_height, frame_width, roi_fraction=roi_fraction)
-
-    roi_mask = np.zeros_like(depth_frame_mm, dtype=bool)
-    roi_mask[y0:y1, x0:x1] = True
-    valid_pixels = np.argwhere((depth_frame_mm > 0) & roi_mask)
-    if len(valid_pixels) < sample_count:
-        raise ValueError(
-            f"Requested {sample_count} point-cloud samples, but only {len(valid_pixels)} valid depth pixels were found in the ROI."
-        )
-
-    selected_indices = rng.choice(len(valid_pixels), size=sample_count, replace=False)
-    selected_yx = valid_pixels[selected_indices]
-    sampled_pixels = np.stack([selected_yx[:, 1], selected_yx[:, 0]], axis=1).astype(np.int32)
-    return sampled_pixels
 
 
 def frames_to_cotracker_tensor(torch_module, device, frames: np.ndarray):
@@ -795,8 +707,6 @@ def project_tracks_to_world_points(
     visibility: np.ndarray,
     depth_frame_paths: list[Path],
     source_frame_indices: np.ndarray,
-    positions: np.ndarray,
-    orientations: np.ndarray,
     camera_calibration: CameraCalibration,
     expected_frame_shape: tuple[int, int],
 ) -> np.ndarray:
@@ -846,16 +756,14 @@ def project_tracks_to_world_points(
         pixel_x = valid_x[valid_depth_mask].astype(np.float32)
         pixel_y = valid_y[valid_depth_mask].astype(np.float32)
 
-        camera_points = np.empty((len(valid_indices), 3), dtype=np.float32)
-        camera_points[:, 0] = (pixel_x - cx) * depth_m / fx
-        camera_points[:, 1] = (pixel_y - cy) * depth_m / fy
-        camera_points[:, 2] = depth_m
-
-        orientation = np.asarray(orientations[frame_index], dtype=np.float32)
-        position = np.asarray(positions[frame_index], dtype=np.float32)
-
-        camera_world_position = position + camera_calibration.camera_offset_m @ orientation.T
-        world_points[frame_index, valid_indices] = camera_points @ orientation.T + camera_world_position
+        camera_x = (pixel_x - cx) * depth_m / fx
+        camera_y = (pixel_y - cy) * depth_m / fy
+        world_points[frame_index, valid_indices] = (
+            camera_calibration.camera_position_world[None, :]
+            + camera_x[:, None] * camera_calibration.camera_right_world[None, :]
+            + camera_y[:, None] * camera_calibration.camera_down_world[None, :]
+            + depth_m[:, None] * camera_calibration.camera_forward_world[None, :]
+        ).astype(np.float32)
 
     return world_points
 
@@ -887,11 +795,9 @@ def create_depth_point_clouds(
     output_episode_index: int,
     processing_result: EpisodeProcessingResult,
     chunk_size: int,
-    pointcloud_samples: int,
-    pointcloud_roi_fraction: float,
-    pointcloud_seed: int,
     cotracker_context: CoTrackerContext,
     camera_calibration: CameraCalibration,
+    contact_spec: ContactCylinderSpec,
 ) -> bool:
     depth_frame_paths = discover_depth_frame_paths(processing_result.aligned_episode.source_dir)
     if depth_frame_paths is None:
@@ -915,13 +821,17 @@ def create_depth_point_clouds(
             f"Aligned RGB frame shape {rgb_frame_shape} does not match depth frame shape {first_depth_frame.shape}."
         )
 
-    rng = np.random.default_rng(int(pointcloud_seed) + int(output_episode_index))
-    sampled_pixels = sample_query_pixels(
-        first_depth_frame,
-        sample_count=pointcloud_samples,
-        roi_fraction=pointcloud_roi_fraction,
-        rng=rng,
+    sampled_pixels = select_points_to_track(
+        aligned_episode=aligned_episode,
+        camera_calibration=camera_calibration,
+        contact_spec=contact_spec,
     )
+    if len(sampled_pixels) == 0:
+        _warn(
+            f"{aligned_episode.source_name}: no end-effector seed pixels survived the first-frame geometry, color, and depth checks; "
+            "skipping point-cloud extraction."
+        )
+        return False
 
     tracks, visibility = track_sampled_pixels(
         cotracker_context=cotracker_context,
@@ -936,8 +846,6 @@ def create_depth_point_clouds(
         visibility=pruned_visibility,
         depth_frame_paths=depth_frame_paths,
         source_frame_indices=processed_episode.source_frame_indices,
-        positions=processed_episode.positions,
-        orientations=processed_episode.orientations,
         camera_calibration=camera_calibration,
         expected_frame_shape=rgb_frame_shape,
     )
@@ -960,9 +868,6 @@ def extract_dataset(
     trim_end: int,
     vel_thresh: float,
     stationary_window: int,
-    pointcloud_samples: int,
-    pointcloud_roi_fraction: float,
-    pointcloud_seed: int,
 ) -> None:
     episode_dirs = discover_episode_dirs(input_dir)
     prepare_output_dir(output_dir)
@@ -970,6 +875,7 @@ def extract_dataset(
     processed_episodes: list[ProcessedEpisode] = []
     cotracker_context: CoTrackerContext | None = None
     camera_calibration: CameraCalibration | None = None
+    contact_spec: ContactCylinderSpec | None = None
     pointcloud_episode_count = 0
 
     for episode_dir in episode_dirs:
@@ -989,16 +895,16 @@ def extract_dataset(
                 cotracker_context = load_cotracker_context()
             if camera_calibration is None:
                 camera_calibration = load_camera_calibration()
+            if contact_spec is None:
+                contact_spec = load_contact_cylinder_spec()
             if create_depth_point_clouds(
                 output_dir=output_dir,
                 output_episode_index=output_episode_index,
                 processing_result=processing_result,
                 chunk_size=chunk_size,
-                pointcloud_samples=pointcloud_samples,
-                pointcloud_roi_fraction=pointcloud_roi_fraction,
-                pointcloud_seed=pointcloud_seed,
                 cotracker_context=cotracker_context,
                 camera_calibration=camera_calibration,
+                contact_spec=contact_spec,
             ):
                 pointcloud_episode_count += 1
 
@@ -1061,24 +967,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Trailing window size used to classify stationary frames.",
     )
-    parser.add_argument(
-        "--pointcloud-samples",
-        default=DEFAULT_POINTCLOUD_SAMPLES,
-        type=int,
-        help="Number of sparse RGB pixels to sample and track for point-cloud extraction.",
-    )
-    parser.add_argument(
-        "--pointcloud-roi-fraction",
-        default=DEFAULT_POINTCLOUD_ROI_FRACTION,
-        type=float,
-        help="Side-length fraction of the centered square ROI used for sparse point-cloud sampling.",
-    )
-    parser.add_argument(
-        "--pointcloud-seed",
-        default=DEFAULT_POINTCLOUD_SEED,
-        type=int,
-        help="Base seed used to deterministically sample sparse point-cloud pixels per episode.",
-    )
     return parser.parse_args()
 
 
@@ -1091,10 +979,6 @@ def main() -> None:
         raise ValueError("--chunk-size must be positive")
     if args.stationary_window <= 0:
         raise ValueError("--stationary-window must be positive")
-    if args.pointcloud_samples <= 0:
-        raise ValueError("--pointcloud-samples must be positive")
-    if not (0.0 < float(args.pointcloud_roi_fraction) <= 1.0):
-        raise ValueError("--pointcloud-roi-fraction must be in the interval (0, 1].")
 
     extract_dataset(
         input_dir=input_dir,
@@ -1104,9 +988,6 @@ def main() -> None:
         trim_end=int(args.trim_end),
         vel_thresh=float(args.vel_thresh),
         stationary_window=int(args.stationary_window),
-        pointcloud_samples=int(args.pointcloud_samples),
-        pointcloud_roi_fraction=float(args.pointcloud_roi_fraction),
-        pointcloud_seed=int(args.pointcloud_seed),
     )
 
 

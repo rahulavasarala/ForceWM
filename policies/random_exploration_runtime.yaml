@@ -16,11 +16,11 @@ planner:
   chunk_length: 8
   replan_every_n_chunks: 4
   action_hz_q: 10.0
-  step_length_k: 0.002
-  step_noise_std: 0.001
-  direction_noise_std_deg: 35.0
-  z_noise_lower_bound: 0.0005
-  z_noise_upper_bound: 0.001
+  step_length_k: 0.001
+  step_noise_std: 0.000
+  direction_noise_std_deg: 10.0
+  z_noise_lower_bound: 0.002
+  z_noise_upper_bound: 0.002
   force_magnitude_lower_bound: 1
   force_magnitude_upper_bound: 3
   step_noise_decay: 0.98

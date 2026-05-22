@@ -18,6 +18,14 @@ DEFAULT_UPDATE_HZ = 30.0
 DEFAULT_POSITION_SPEED_MPS = 0.06
 DEFAULT_AXIS_LENGTH = 0.9
 REDIS_KEY_PREFIXES = ("sim::franka", "sai::sim::franka")
+BASE_ORIENTATION = np.array(
+    [
+        [1.0, 0.0, 0.0],
+        [0.0, -1.0, 0.0],
+        [0.0, 0.0, -1.0],
+    ],
+    dtype=float,
+)
 
 
 @dataclass(frozen=True)
@@ -26,6 +34,7 @@ class RedisKeys:
     current_orientation: str
     desired_position: str
     desired_orientation: str
+    sensed_force: str
     desired_force: str
     force_dimension: str
     force_or_motion_axis: str
@@ -41,6 +50,7 @@ def _build_key_candidates() -> tuple[RedisKeys, ...]:
                 current_orientation=f"{prefix}::current_cartesian_orientation",
                 desired_position=f"{prefix}::desired_cartesian_position",
                 desired_orientation=f"{prefix}::desired_cartesian_orientation",
+                sensed_force=f"{prefix}::sensed_force",
                 desired_force=f"{prefix}::desired_force",
                 force_dimension=f"{prefix}::force_dimension",
                 force_or_motion_axis=f"{prefix}::force_or_motion_axis",
@@ -243,12 +253,13 @@ class FspfControlTest:
         self.force_or_motion_axis = np.array([0.0, 0.0, 1.0], dtype=float)
         self.sigma_motion = np.eye(3, dtype=float)
         self.sigma_force = np.zeros((3, 3), dtype=float)
+        self.sensed_force = np.zeros(3, dtype=float)
         self.desired_force = np.zeros(3, dtype=float)
 
         self._write_desired_commands()
         self._poll_state_from_redis()
 
-        self.figure = plt.figure("FSPF Control Test", figsize=(13, 8))
+        self.figure = plt.figure("FSPF Control Test", figsize=(10.0, 6.2))
         grid = self.figure.add_gridspec(
             2,
             3,
@@ -311,6 +322,12 @@ class FspfControlTest:
         key = (event.key or "").lower()
         if key in {"escape", "x"}:
             plt.close(self.figure)
+            return
+        if key == "up":
+            self.desired_orientation = np.array(BASE_ORIENTATION, copy=True)
+            self._write_desired_commands()
+            self.last_status_message = "Reset desired orientation to the base frame."
+            self.figure.canvas.draw_idle()
             return
         if key in {"backspace", "r"}:
             _set_reset(self.redis_client, self.keys.reset)
@@ -397,6 +414,10 @@ class FspfControlTest:
         self.desired_force = self._read_vector_fallback(
             self.keys.desired_force,
             fallback_value=self.desired_force,
+        )
+        self.sensed_force = self._read_vector_fallback(
+            self.keys.sensed_force,
+            fallback_value=self.sensed_force,
         )
         self.force_dimension = _read_int(self.redis_client, self.keys.force_dimension)
         self.force_or_motion_axis = self._read_vector_fallback(
@@ -536,6 +557,7 @@ class FspfControlTest:
         info_lines = [
             "Controls",
             "  Position: W/S -> +/-X, A/D -> +/-Y, Q/E -> +/-Z",
+            "  Up arrow: reset desired orientation to [[1,0,0],[0,-1,0],[0,0,-1]]",
             "  Desired force: signed projection of dx_world onto force_or_motion_axis, scaled to 2.0 when fdim == 1",
             "  Reset sim: Backspace or R",
             "  Quit: X or Escape",
@@ -546,6 +568,7 @@ class FspfControlTest:
             f"Force dimension: {self.force_dimension}",
             f"Force/motion axis: {_format_vector(self.force_or_motion_axis)}",
             f"Desired force: {_format_vector(self.desired_force)}",
+            f"Sensed force: {_format_vector(self.sensed_force)}",
             "",
             f"Desired position: {_format_vector(self.desired_position)}",
             f"Current position: {_format_vector(self.current_position)}",

@@ -328,6 +328,15 @@ def _read_matrix(redis_client, key: str) -> np.ndarray:
     return matrix.reshape(3, 3).astype(float)
 
 
+def _read_int(redis_client, key: str) -> int:
+    raw_value = redis_client.get(key)
+    if raw_value is None:
+        raise RuntimeError(f"Requested Redis key `{key}` is missing.")
+    if isinstance(raw_value, bytes):
+        raw_value = raw_value.decode("utf-8")
+    return int(raw_value)
+
+
 class RandomExplorationRuntime:
     def __init__(
         self,
@@ -423,6 +432,11 @@ class RandomExplorationRuntime:
             cycle_start,
             self.params.chunk_length,
             self.params.action_hz_q,
+        )
+        force_dimension = _read_int(self.redis_client, self.config.pose_keys.force_dimension)
+        print(
+            f"Force dimension == 1: {force_dimension == 1} (value={force_dimension})",
+            flush=True,
         )
         self.interpolator.enqueue_chunk(world_chunk, timestamps)
         self.global_step_index += effective_replan_after(self.params)

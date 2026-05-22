@@ -11,12 +11,12 @@ robot:
       fps: 30
       keys: 
         - eef_pos:
-            redis: "haptic_commanded_position"
+            redis: "current_cartesian_position"
             obs_window: 2
             obs_dss : 3
             dim: [3]
         - eef_ori:
-            redis: "haptic_commanded_orientation"
+            redis: "current_cartesian_orientation"
             obs_window: 2
             obs_dss : 3
             dim: [3, 3]
@@ -25,7 +25,7 @@ robot:
       keys:
         - camera_01:
             type: "rgb"
-            mujoco_camera_name: "wrist_camera"
+            mujoco_camera_name: "stationary_camera"
             can: 0
             serial_number: 123456
             dim: [224, 224, 3]

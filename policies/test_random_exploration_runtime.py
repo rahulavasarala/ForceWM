@@ -107,6 +107,7 @@ def _runtime_config(
             desired_position="test::desired_cartesian_position",
             desired_orientation="test::desired_cartesian_orientation",
             desired_force="test::desired_force",
+            desired_force_magnitude="test::desired_force_magnitude",
             force_dimension="test::force_dimension",
             force_or_motion_axis="test::force_or_motion_axis",
         ),
@@ -188,6 +189,7 @@ class _SequencedRedisClient:
         self.orientation_read_count = 0
         self.force_dimension_read_count = 0
         self.ping_count = 0
+        self.values: dict[str, str] = {}
 
     def ping(self) -> bool:
         self.ping_count += 1
@@ -214,7 +216,16 @@ class _SequencedRedisClient:
             )
             self.force_dimension_read_count += 1
             return str(int(self.force_dimensions[index])).encode("utf-8")
-        return None
+        stored_value = self.values.get(key)
+        if stored_value is None:
+            return None
+        return stored_value.encode("utf-8")
+
+    def set(self, key: str, value) -> bool:
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+        self.values[key] = str(value)
+        return True
 
 
 class RandomExplorationRuntimeTests(unittest.TestCase):
@@ -328,6 +339,10 @@ planner:
             "demo::arm::tool::desired_force",
         )
         self.assertEqual(
+            config.pose_keys.desired_force_magnitude,
+            "demo::arm::tool::desired_force_magnitude",
+        )
+        self.assertEqual(
             config.pose_keys.force_dimension,
             "demo::arm::tool::force_dimension",
         )
@@ -365,6 +380,10 @@ planner:
         self.assertEqual(
             pose_keys.desired_force,
             "sai::sim::franka::desired_force",
+        )
+        self.assertEqual(
+            pose_keys.desired_force_magnitude,
+            "sai::sim::franka::desired_force_magnitude",
         )
         self.assertEqual(
             pose_keys.force_dimension,
@@ -451,6 +470,11 @@ planner:
         self.assertGreaterEqual(second_chunk[0, 7], config.planner_params.force_magnitude_lower)
         self.assertLessEqual(second_chunk[0, 7], config.planner_params.force_magnitude_upper)
         self.assertEqual(runtime.global_step_index, 4)
+        self.assertIn(config.pose_keys.desired_force_magnitude, fake_redis.values)
+        np.testing.assert_allclose(
+            np.asarray(json.loads(fake_redis.values[config.pose_keys.desired_force_magnitude]), dtype=float),
+            np.array([second_chunk[0, 7]], dtype=float),
+        )
         runtime_output = stdout_buffer.getvalue()
         self.assertIn("Force dimension == 1: True (value=1)", runtime_output)
         self.assertIn("Force dimension == 1: False (value=0)", runtime_output)

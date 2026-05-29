@@ -1,102 +1,56 @@
 from __future__ import annotations
-
 import json
 import shutil
 import threading
 import time
 from pathlib import Path
 from typing import Any
-
 import cv2
 import numpy as np
 import yaml
-
-
 class Saver:
     DEFAULT_FPS = 30.0
-
-    def __init__(
-        self,
-        save_dir,
-        robot_observer,
-        camera_observer,
-        contract_path=None,
-        video_codec="mp4v",
-    ):
-        if robot_observer is None:
-            raise ValueError("robot_observer must be provided.")
-        if camera_observer is None:
-            raise ValueError("camera_observer must be provided.")
-
+    def __init__(self, save_dir, robot_observer, camera_observer, contract_path=None, video_codec="mp4v"):
+        if robot_observer is None or camera_observer is None:
+            raise ValueError("Both robot_observer and camera_observer must be provided.")
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
-
         self.robot_observer = robot_observer
         self.camera_observer = camera_observer
         self.contract_path = Path(contract_path) if contract_path is not None else None
         self.video_codec = str(video_codec)
-
-        self.contract = getattr(self.robot_observer, "contract", None)
+        self.contract = getattr(robot_observer, "contract", None)
+        self.lowdim_specs = getattr(robot_observer, "lowdim_specs", None)
+        self.camera_specs = getattr(camera_observer, "camera_specs", None)
         if not isinstance(self.contract, dict):
             raise ValueError("robot_observer must expose a `contract` dictionary.")
-
-        self.lowdim_specs = getattr(self.robot_observer, "lowdim_specs", None)
         if not isinstance(self.lowdim_specs, dict) or not self.lowdim_specs:
             raise ValueError("robot_observer must expose non-empty `lowdim_specs`.")
-
-        self.camera_specs = getattr(self.camera_observer, "camera_specs", None)
         if not isinstance(self.camera_specs, dict) or not self.camera_specs:
             raise ValueError("camera_observer must expose non-empty `camera_specs`.")
-        self.rgb_camera_specs = {
-            camera_name: camera_spec
-            for camera_name, camera_spec in self.camera_specs.items()
-            if not self._is_depth_camera(camera_spec)
-        }
-        self.depth_camera_specs = {
-            camera_name: camera_spec
-            for camera_name, camera_spec in self.camera_specs.items()
-            if self._is_depth_camera(camera_spec)
-        }
+        self.rgb_camera_specs = {name: spec for name, spec in self.camera_specs.items() if not self._is_depth_camera(spec)}
+        self.depth_camera_specs = {name: spec for name, spec in self.camera_specs.items() if self._is_depth_camera(spec)}
         if len(self.depth_camera_specs) > 1:
             raise ValueError("Saver currently supports at most one depth camera.")
-
-        for depth_camera_name, depth_camera_spec in self.depth_camera_specs.items():
-            align_to = depth_camera_spec.get("align_to")
-            if not isinstance(align_to, str) or not align_to:
-                raise ValueError(
-                    f"Depth camera '{depth_camera_name}' must declare a non-empty `align_to` key."
-                )
-            if align_to not in self.rgb_camera_specs:
-                raise ValueError(
-                    f"Depth camera '{depth_camera_name}' aligns to '{align_to}', but no RGB camera with "
-                    "that key was found."
-                )
-
-        self.lowdim_fps = self._resolve_fps("lowdim", getattr(self.robot_observer, "obs_freq", None))
-        self.camera_fps = self._resolve_fps("visual", getattr(self.camera_observer, "camera_freq", None))
-        self.lowdim_poll_period_s = 1.0 / self.lowdim_fps
-        self.camera_poll_period_s = 1.0 / self.camera_fps
-
+        for name, spec in self.depth_camera_specs.items():
+            if spec.get("align_to") not in self.rgb_camera_specs:
+                raise ValueError(f"Depth camera '{name}' must align to a known RGB camera.")
+        self.lowdim_fps = self._resolve_fps("lowdim", getattr(robot_observer, "obs_freq", None))
+        self.camera_fps = self._resolve_fps("visual", getattr(camera_observer, "camera_freq", None))
+        if abs(self.lowdim_fps - self.camera_fps) > 1e-6:
+            raise ValueError("Saver requires matching lowdim and visual fps for unified ticking.")
+        self.poll_period_s = 1.0 / self.lowdim_fps
         self._state_lock = threading.Lock()
-        self._worker_error_lock = threading.Lock()
-        self._worker_error: Exception | None = None
         self._stop_event = threading.Event()
-
+        self._thread: threading.Thread | None = None
         self._recording = False
-        self._lowdim_thread: threading.Thread | None = None
-        self._camera_thread: threading.Thread | None = None
-
+        self._worker_error: Exception | None = None
         self._episode_id: int | None = None
         self._episode_dir: Path | None = None
         self._visual_dir: Path | None = None
         self._depth_frames_dir: Path | None = None
         self._start_timestamp_s: float | None = None
-        self._stop_timestamp_s: float | None = None
-        self._last_lowdim_timestamp_s: float | None = None
-        self._last_camera_timestamp_s: float | None = None
         self._last_completed_episode_summary: dict[str, Any] | None = None
-        self._last_camera_source_marker: dict[str, int | float | None] = {}
-
         self._lowdim_records: dict[str, list[Any]] = {}
         self._camera_timestamps: dict[str, list[float]] = {}
         self._camera_frame_counts: dict[str, int] = {}
@@ -104,20 +58,21 @@ class Saver:
         self._video_writers: dict[str, cv2.VideoWriter] = {}
         self._video_paths: dict[str, Path] = {}
         self._depth_frame_indices: dict[str, int] = {}
-
+        self._last_lowdim_marker: int | None = None
+        self._last_camera_markers: dict[str, int | None] = {}
+        self._lowdim_timestamp_domain = "sim_time_s" if getattr(robot_observer, "source_type", "") == "sim" else "wall_time_s"
+        self._camera_timestamp_domains = {
+            name: "sim_time_s" if spec.get("source_type") == "sim" else "wall_time_s"
+            for name, spec in self.camera_specs.items()
+        }
     def start(self) -> float:
         with self._state_lock:
             if self._recording:
                 raise RuntimeError("Saver is already recording an episode.")
-
             self._worker_error = None
             self._stop_event.clear()
             self._start_timestamp_s = time.time()
-            self._stop_timestamp_s = None
-            self._last_lowdim_timestamp_s = self._start_timestamp_s
-            self._last_camera_timestamp_s = self._start_timestamp_s
             self._last_completed_episode_summary = None
-
             self._episode_id = self._next_episode_id()
             self._episode_dir = self.save_dir / f"episode_{self._episode_id:06d}"
             self._visual_dir = self._episode_dir / "visual"
@@ -127,433 +82,244 @@ class Saver:
             if self.depth_camera_specs:
                 self._depth_frames_dir = self._visual_dir / "depth" / "depth_frames"
                 self._depth_frames_dir.mkdir(parents=True, exist_ok=False)
-
-            self._initialize_episode_storage()
-            self._write_contract_snapshot()
-            self._initialize_video_writers()
-
-            self._lowdim_thread = threading.Thread(
-                target=self._lowdim_worker_loop,
-                name="saver-lowdim",
-                daemon=True,
-            )
-            self._camera_thread = threading.Thread(
-                target=self._camera_worker_loop,
-                name="saver-camera",
-                daemon=True,
-            )
-
+            self._reset_episode_storage()
+            self._seed_saved_markers()
+            contract_path = self._episode_dir / "contract.yaml"
+            if self.contract_path is not None:
+                shutil.copy2(self.contract_path, contract_path)
+            else:
+                with contract_path.open("w", encoding="utf-8") as handle:
+                    yaml.safe_dump(self.contract, handle, sort_keys=False)
+            fourcc = cv2.VideoWriter_fourcc(*self.video_codec)
+            for camera_name, camera_spec in self.rgb_camera_specs.items():
+                dim = camera_spec.get("dim")
+                width, height = (640, 480) if not isinstance(dim, (list, tuple)) or len(dim) < 2 else (int(dim[0]), int(dim[1]))
+                fps = float(camera_spec.get("fps") or self.camera_fps)
+                video_path = self._visual_dir / f"{camera_name}.mp4"
+                writer = cv2.VideoWriter(str(video_path), fourcc, fps, (width, height))
+                if not writer.isOpened():
+                    raise RuntimeError(f"Failed to open video writer for '{camera_name}'.")
+                self._video_writers[camera_name] = writer
+                self._video_paths[camera_name] = video_path
+            self._thread = threading.Thread(target=self._run_loop, name="saver", daemon=True)
             self._recording = True
-            self._lowdim_thread.start()
-            self._camera_thread.start()
-
+            self._thread.start()
             return self._start_timestamp_s
-
     def stop(self):
         with self._state_lock:
             if not self._recording:
                 raise RuntimeError("Saver is not currently recording an episode.")
-
             stop_timestamp_s = time.time()
-            self._stop_timestamp_s = stop_timestamp_s
             self._stop_event.set()
-            lowdim_thread = self._lowdim_thread
-            camera_thread = self._camera_thread
-
-        if lowdim_thread is not None:
-            lowdim_thread.join(timeout=2.0)
-        if camera_thread is not None:
-            camera_thread.join(timeout=2.0)
-
-        pending_error: Exception | None = None
-
-        try:
-            self._drain_lowdim_samples(cutoff_timestamp_s=stop_timestamp_s)
-            self._drain_camera_samples(cutoff_timestamp_s=stop_timestamp_s)
-        except Exception as exc:
-            pending_error = exc
-
+            thread = self._thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+        pending_error = self._worker_error
         try:
             self._finalize_episode(stop_timestamp_s)
         except Exception as exc:
-            if pending_error is None:
-                pending_error = exc
-
-        worker_error = self._consume_worker_error()
-        if pending_error is None and worker_error is not None:
-            pending_error = worker_error
-
+            pending_error = pending_error or exc
         if pending_error is not None:
             raise pending_error
-
     def quit(self):
-        with self._state_lock:
-            is_recording = self._recording
-
-        if is_recording:
+        if self._recording:
             self.stop()
-
-    @property
-    def current_episode_name(self) -> str | None:
-        if self._episode_dir is None:
-            return None
-        return self._episode_dir.name
-
-    @property
-    def current_episode_path(self) -> Path | None:
-        return self._episode_dir
-
-    @property
-    def last_completed_episode_summary(self) -> dict[str, Any] | None:
-        if self._last_completed_episode_summary is None:
-            return None
-        return dict(self._last_completed_episode_summary)
-
-    def _lowdim_worker_loop(self) -> None:
-        self._worker_loop(
-            loop_name="lowdim",
-            period_s=self.lowdim_poll_period_s,
-            drain_fn=self._drain_lowdim_samples,
-        )
-
-    def _camera_worker_loop(self) -> None:
-        self._worker_loop(
-            loop_name="camera",
-            period_s=self.camera_poll_period_s,
-            drain_fn=self._drain_camera_samples,
-        )
-
-    def _worker_loop(self, loop_name: str, period_s: float, drain_fn) -> None:
+    current_episode_name = property(lambda self: None if self._episode_dir is None else self._episode_dir.name)
+    current_episode_path = property(lambda self: self._episode_dir)
+    last_completed_episode_summary = property(
+        lambda self: None if self._last_completed_episode_summary is None else dict(self._last_completed_episode_summary)
+    )
+    def _run_loop(self) -> None:
         next_poll_time = time.perf_counter()
-
         while not self._stop_event.is_set():
             try:
-                drain_fn()
+                self._tick_once()
             except Exception as exc:
-                self._record_worker_error(RuntimeError(f"{loop_name} saver worker failed: {exc}"))
+                self._worker_error = RuntimeError(f"saver worker failed: {exc}")
+                self._stop_event.set()
                 return
-
-            next_poll_time += period_s
+            next_poll_time += self.poll_period_s
             sleep_duration = next_poll_time - time.perf_counter()
             if sleep_duration > 0.0:
                 self._stop_event.wait(sleep_duration)
             else:
                 next_poll_time = time.perf_counter()
-
-    def _drain_lowdim_samples(self, cutoff_timestamp_s: float | None = None) -> None:
-        if self._last_lowdim_timestamp_s is None:
+    def _tick_once(self) -> None:
+        sample = self.robot_observer.get_latest_obs()
+        if sample is not None:
+            self._save_lowdim_sample(sample)
+        sample = self.camera_observer.get_latest_obs()
+        if sample is not None:
+            self._save_camera_sample(sample)
+    def _save_lowdim_sample(self, sample: dict[str, Any]) -> None:
+        key = "source_seq" if getattr(self.robot_observer, "source_type", "") == "sim" else "observer_seq"
+        if key not in sample:
+            raise KeyError(f"Lowdim observation is missing `{key}`.")
+        marker = int(sample[key])
+        if self._last_lowdim_marker is not None and marker <= self._last_lowdim_marker:
             return
-
-        snapshot = self._snapshot_observer_buffer(self.robot_observer)
-        for sample in snapshot:
-            timestamp_s = self._extract_timestamp(sample)
-            if timestamp_s <= self._last_lowdim_timestamp_s:
-                continue
-            if cutoff_timestamp_s is not None and timestamp_s > cutoff_timestamp_s:
-                continue
-
-            self._lowdim_records["timestamp_s"].append(timestamp_s)
-            for lowdim_name in self.lowdim_specs:
-                if lowdim_name not in sample:
-                    raise KeyError(f"Lowdim observation is missing key '{lowdim_name}'.")
-                self._lowdim_records[lowdim_name].append(np.asarray(sample[lowdim_name]).copy())
-
-            self._last_lowdim_timestamp_s = timestamp_s
-
-    def _drain_camera_samples(self, cutoff_timestamp_s: float | None = None) -> None:
-        if self._last_camera_timestamp_s is None:
-            return
-
-        snapshot = self._snapshot_observer_buffer(self.camera_observer)
-        for sample in snapshot:
-            timestamp_s = self._extract_timestamp(sample)
-            if timestamp_s <= self._last_camera_timestamp_s:
-                continue
-            if cutoff_timestamp_s is not None and timestamp_s > cutoff_timestamp_s:
-                continue
-
-            for camera_name, camera_spec in self.camera_specs.items():
-                if camera_name not in sample:
-                    raise KeyError(f"Camera observation is missing key '{camera_name}'.")
-
-                source_marker = self._extract_camera_source_marker(sample, camera_name)
-                last_source_marker = self._last_camera_source_marker.get(camera_name)
-                if (
-                    source_marker is not None
-                    and last_source_marker is not None
-                    and source_marker <= last_source_marker
-                ):
-                    self._camera_duplicate_frame_counts[camera_name] += 1
-                if source_marker is not None and (
-                    last_source_marker is None or source_marker > last_source_marker
-                ):
-                    self._last_camera_source_marker[camera_name] = source_marker
-
-                if self._is_depth_camera(camera_spec):
-                    self._write_depth_frame(camera_name, sample[camera_name], camera_spec)
-                else:
-                    frame = self._prepare_frame_for_video(camera_name, sample[camera_name], camera_spec)
-                    self._video_writers[camera_name].write(frame)
-                self._camera_timestamps[camera_name].append(timestamp_s)
-                self._camera_frame_counts[camera_name] += 1
-
-            self._last_camera_timestamp_s = timestamp_s
-
-    def _initialize_episode_storage(self) -> None:
-        self._lowdim_records = {"timestamp_s": []}
+        self._lowdim_records["timestamp_s"].append(float(sample["timestamp_s"]))
         for lowdim_name in self.lowdim_specs:
-            self._lowdim_records[lowdim_name] = []
-
-        self._camera_timestamps = {camera_name: [] for camera_name in self.camera_specs}
-        self._camera_frame_counts = {camera_name: 0 for camera_name in self.camera_specs}
-        self._camera_duplicate_frame_counts = {camera_name: 0 for camera_name in self.camera_specs}
-        self._last_camera_source_marker = {camera_name: None for camera_name in self.camera_specs}
+            if lowdim_name not in sample:
+                raise KeyError(f"Lowdim observation is missing key '{lowdim_name}'.")
+            self._lowdim_records[lowdim_name].append(np.asarray(sample[lowdim_name]).copy())
+        self._last_lowdim_marker = marker
+    def _save_camera_sample(self, sample: dict[str, Any]) -> None:
+        if "timestamp_s" not in sample:
+            raise KeyError("Camera observation is missing `timestamp_s`.")
+        timestamp_s = float(sample["timestamp_s"])
+        for camera_name, camera_spec in self.camera_specs.items():
+            if camera_name not in sample:
+                raise KeyError(f"Camera observation is missing key '{camera_name}'.")
+            if camera_spec.get("source_type") == "sim":
+                frame_seqs = sample.get("camera_frame_seqs")
+                if isinstance(frame_seqs, dict) and camera_name in frame_seqs:
+                    marker = int(frame_seqs[camera_name])
+                elif "camera_frame_seq" in sample:
+                    marker = int(sample["camera_frame_seq"])
+                else:
+                    raise KeyError(f"Camera observation is missing a frame seq for '{camera_name}'.")
+            else:
+                if "observer_seq" not in sample:
+                    raise KeyError("Camera observation is missing `observer_seq`.")
+                marker = int(sample["observer_seq"])
+            if self._last_camera_markers.get(camera_name) is not None and marker <= self._last_camera_markers[camera_name]:
+                continue
+            if self._is_depth_camera(camera_spec):
+                self._write_depth_frame(camera_name, sample[camera_name], camera_spec)
+            else:
+                self._video_writers[camera_name].write(self._prepare_frame_for_video(camera_name, sample[camera_name], camera_spec))
+            self._camera_timestamps[camera_name].append(timestamp_s)
+            self._camera_frame_counts[camera_name] += 1
+            self._last_camera_markers[camera_name] = marker
+    def _reset_episode_storage(self) -> None:
+        self._lowdim_records = {"timestamp_s": [], **{name: [] for name in self.lowdim_specs}}
+        self._camera_timestamps = {name: [] for name in self.camera_specs}
+        self._camera_frame_counts = {name: 0 for name in self.camera_specs}
+        self._camera_duplicate_frame_counts = {name: 0 for name in self.camera_specs}
         self._video_writers = {}
         self._video_paths = {}
-        self._depth_frame_indices = {camera_name: 0 for camera_name in self.depth_camera_specs}
-
-    def _write_contract_snapshot(self) -> None:
-        if self._episode_dir is None:
-            raise RuntimeError("Episode directory is not initialized.")
-
-        destination_path = self._episode_dir / "contract.yaml"
-        if self.contract_path is not None:
-            shutil.copy2(self.contract_path, destination_path)
+        self._depth_frame_indices = {name: 0 for name in self.depth_camera_specs}
+        self._last_lowdim_marker = None
+        self._last_camera_markers = {name: None for name in self.camera_specs}
+    def _seed_saved_markers(self) -> None:
+        sample = self.robot_observer.get_latest_obs()
+        key = "source_seq" if getattr(self.robot_observer, "source_type", "") == "sim" else "observer_seq"
+        if sample is not None and key in sample:
+            self._last_lowdim_marker = int(sample[key])
+        sample = self.camera_observer.get_latest_obs()
+        if sample is None:
             return
-
-        with destination_path.open("w", encoding="utf-8") as handle:
-            yaml.safe_dump(self.contract, handle, sort_keys=False)
-
-    def _initialize_video_writers(self) -> None:
-        if self._visual_dir is None:
-            raise RuntimeError("Visual directory is not initialized.")
-
-        fourcc = cv2.VideoWriter_fourcc(*self.video_codec)
-        for camera_name, camera_spec in self.rgb_camera_specs.items():
-            width, height = self._resolve_image_size(camera_spec.get("dim"))
-            fps = float(camera_spec.get("fps") or self.camera_fps)
-            if fps <= 0.0:
-                raise ValueError(f"Camera fps for '{camera_name}' must be positive.")
-
-            video_path = self._visual_dir / f"{camera_name}.mp4"
-            writer = cv2.VideoWriter(str(video_path), fourcc, fps, (width, height))
-            if not writer.isOpened():
-                raise RuntimeError(f"Failed to open video writer for '{camera_name}'.")
-
-            self._video_writers[camera_name] = writer
-            self._video_paths[camera_name] = video_path
-
+        for camera_name, camera_spec in self.camera_specs.items():
+            if camera_name not in sample:
+                continue
+            if camera_spec.get("source_type") == "sim":
+                frame_seqs = sample.get("camera_frame_seqs")
+                if isinstance(frame_seqs, dict) and camera_name in frame_seqs:
+                    self._last_camera_markers[camera_name] = int(frame_seqs[camera_name])
+                elif "camera_frame_seq" in sample:
+                    self._last_camera_markers[camera_name] = int(sample["camera_frame_seq"])
+            elif "observer_seq" in sample:
+                self._last_camera_markers[camera_name] = int(sample["observer_seq"])
     def _finalize_episode(self, stop_timestamp_s: float) -> None:
         try:
-            self._release_video_writers()
-            self._remove_empty_videos()
-            self._write_lowdim_archive()
-            self._write_camera_timestamps()
-            self._last_completed_episode_summary = self._write_metadata(stop_timestamp_s)
+            for writer in self._video_writers.values():
+                writer.release()
+            for camera_name, video_path in self._video_paths.items():
+                if self._camera_frame_counts[camera_name] == 0 and video_path.exists():
+                    video_path.unlink()
+            if self._episode_dir is None or self._visual_dir is None or self._episode_id is None or self._start_timestamp_s is None:
+                raise RuntimeError("Episode state is not initialized.")
+            np.savez(
+                self._episode_dir / "lowdim.npz",
+                timestamp_s=np.asarray(self._lowdim_records["timestamp_s"], dtype=np.float64),
+                **{name: self._to_numpy_array(self._lowdim_records[name], spec.get("dim")) for name, spec in self.lowdim_specs.items()},
+            )
+            for camera_name, timestamps in self._camera_timestamps.items():
+                if not self._is_depth_camera(self.camera_specs[camera_name]):
+                    np.save(self._visual_dir / f"{camera_name}_timestamps.npy", np.asarray(timestamps, dtype=np.float64))
+            metadata = {
+                "episode_id": self._episode_id,
+                "episode_name": self._episode_dir.name,
+                "episode_path": str(self._episode_dir),
+                "start_timestamp_s": self._start_timestamp_s,
+                "end_timestamp_s": stop_timestamp_s,
+                "duration_s": stop_timestamp_s - self._start_timestamp_s,
+                "num_lowdim_samples": len(self._lowdim_records["timestamp_s"]),
+                "camera_frame_counts": dict(self._camera_frame_counts),
+                "camera_duplicate_frame_counts": dict(self._camera_duplicate_frame_counts),
+                "lowdim_keys": list(self.lowdim_specs.keys()),
+                "camera_keys": list(self.camera_specs.keys()),
+                "lowdim_fps": self.lowdim_fps,
+                "camera_fps": self.camera_fps,
+                "lowdim_timestamp_domain": self._lowdim_timestamp_domain,
+                "camera_timestamp_domains": dict(self._camera_timestamp_domains),
+                "lowdim_source_time_range_s": self._timestamp_range(self._lowdim_records["timestamp_s"]),
+                "camera_source_time_ranges_s": {name: self._timestamp_range(timestamps) for name, timestamps in self._camera_timestamps.items()},
+            }
+            with (self._episode_dir / "metadata.json").open("w", encoding="utf-8") as handle:
+                json.dump(metadata, handle, indent=2)
+            self._last_completed_episode_summary = metadata
         finally:
             with self._state_lock:
                 self._recording = False
-                self._lowdim_thread = None
-                self._camera_thread = None
+                self._thread = None
                 self._stop_event.clear()
-
-    def _release_video_writers(self) -> None:
-        for writer in self._video_writers.values():
-            writer.release()
-
-    def _remove_empty_videos(self) -> None:
-        for camera_name, video_path in self._video_paths.items():
-            if self._camera_frame_counts.get(camera_name, 0) != 0:
-                continue
-            if video_path.exists():
-                video_path.unlink()
-
-    def _write_lowdim_archive(self) -> None:
-        if self._episode_dir is None:
-            raise RuntimeError("Episode directory is not initialized.")
-
-        archive_path = self._episode_dir / "lowdim.npz"
-        payload: dict[str, np.ndarray] = {
-            "timestamp_s": np.asarray(self._lowdim_records["timestamp_s"], dtype=np.float64)
-        }
-
-        for lowdim_name, lowdim_spec in self.lowdim_specs.items():
-            payload[lowdim_name] = self._to_numpy_array(
-                self._lowdim_records[lowdim_name],
-                lowdim_spec.get("dim"),
-            )
-
-        np.savez(archive_path, **payload)
-
-    def _write_camera_timestamps(self) -> None:
-        if self._visual_dir is None:
-            raise RuntimeError("Visual directory is not initialized.")
-
-        for camera_name, timestamps in self._camera_timestamps.items():
-            camera_spec = self.camera_specs.get(camera_name, {})
-            if self._is_depth_camera(camera_spec):
-                continue
-            timestamp_path = self._visual_dir / f"{camera_name}_timestamps.npy"
-            np.save(timestamp_path, np.asarray(timestamps, dtype=np.float64))
-
-    def _write_metadata(self, stop_timestamp_s: float) -> dict[str, Any]:
-        if self._episode_dir is None or self._episode_id is None or self._start_timestamp_s is None:
-            raise RuntimeError("Episode metadata cannot be written before recording starts.")
-
-        metadata = {
-            "episode_id": self._episode_id,
-            "episode_name": self._episode_dir.name,
-            "episode_path": str(self._episode_dir),
-            "start_timestamp_s": self._start_timestamp_s,
-            "end_timestamp_s": stop_timestamp_s,
-            "duration_s": stop_timestamp_s - self._start_timestamp_s,
-            "num_lowdim_samples": len(self._lowdim_records["timestamp_s"]),
-            "camera_frame_counts": dict(self._camera_frame_counts),
-            "camera_duplicate_frame_counts": dict(self._camera_duplicate_frame_counts),
-            "lowdim_keys": list(self.lowdim_specs.keys()),
-            "camera_keys": list(self.camera_specs.keys()),
-            "lowdim_fps": self.lowdim_fps,
-            "camera_fps": self.camera_fps,
-        }
-
-        metadata_path = self._episode_dir / "metadata.json"
-        with metadata_path.open("w", encoding="utf-8") as handle:
-            json.dump(metadata, handle, indent=2)
-
-        return metadata
-
-    def _record_worker_error(self, exc: Exception) -> None:
-        with self._worker_error_lock:
-            if self._worker_error is None:
-                self._worker_error = exc
-        self._stop_event.set()
-
-    def _consume_worker_error(self) -> Exception | None:
-        with self._worker_error_lock:
-            error = self._worker_error
-            self._worker_error = None
-            return error
-
-    @staticmethod
-    def _snapshot_observer_buffer(observer) -> list[dict[str, Any]]:
-        with observer._lock:
-            return list(observer.buffer)
-
-    @staticmethod
-    def _extract_timestamp(sample: dict[str, Any]) -> float:
-        if "timestamp_s" not in sample:
-            raise KeyError("Observation sample is missing `timestamp_s`.")
-        return float(sample["timestamp_s"])
-
-    @staticmethod
-    def _extract_camera_source_marker(sample: dict[str, Any], camera_name: str) -> int | float | None:
-        frame_seqs = sample.get("camera_frame_seqs")
-        if isinstance(frame_seqs, dict) and camera_name in frame_seqs:
-            return int(frame_seqs[camera_name])
-
-        source_timestamps = sample.get("camera_source_timestamps")
-        if isinstance(source_timestamps, dict) and camera_name in source_timestamps:
-            return float(source_timestamps[camera_name])
-
-        return None
-
     def _resolve_fps(self, source_name: str, fallback_fps: Any) -> float:
-        if fallback_fps is not None:
-            fps = float(fallback_fps)
-            if fps > 0.0:
-                return fps
-
-        robot_cfg = self.contract.get("robot", {})
-        source_cfg = robot_cfg.get("data_sources", {}).get(source_name, {})
-        fps = float(source_cfg.get("fps", self.DEFAULT_FPS))
+        if fallback_fps is not None and float(fallback_fps) > 0.0:
+            return float(fallback_fps)
+        fps = float(self.contract.get("robot", {}).get("data_sources", {}).get(source_name, {}).get("fps", self.DEFAULT_FPS))
         if fps <= 0.0:
             raise ValueError(f"fps for `{source_name}` must be positive.")
         return fps
-
     def _next_episode_id(self) -> int:
         largest_episode_id = 0
         for path in self.save_dir.glob("episode_*"):
-            if not path.is_dir():
-                continue
-
-            try:
-                episode_id = int(path.name.split("_", maxsplit=1)[1])
-            except (IndexError, ValueError):
-                continue
-
-            largest_episode_id = max(largest_episode_id, episode_id)
-
+            if path.is_dir():
+                try:
+                    largest_episode_id = max(largest_episode_id, int(path.name.split("_", maxsplit=1)[1]))
+                except (IndexError, ValueError):
+                    pass
         return largest_episode_id + 1
-
-    @staticmethod
-    def _resolve_image_size(dim: Any) -> tuple[int, int]:
-        if not isinstance(dim, (list, tuple)) or len(dim) < 2:
-            return 640, 480
-        return int(dim[0]), int(dim[1])
-
     @staticmethod
     def _prepare_frame_for_video(camera_name: str, frame: Any, camera_spec: dict[str, Any]) -> np.ndarray:
         frame_array = np.asarray(frame)
         if frame_array.ndim != 3 or frame_array.shape[2] != 3:
-            raise ValueError(
-                f"Camera frame for '{camera_name}' must be HxWx3, got shape {frame_array.shape}."
-            )
-
+            raise ValueError(f"Camera frame for '{camera_name}' must be HxWx3, got shape {frame_array.shape}.")
         if frame_array.dtype != np.uint8:
             frame_array = cv2.convertScaleAbs(frame_array)
-
-        expected_width, expected_height = Saver._resolve_image_size(camera_spec.get("dim"))
-        if frame_array.shape[1] != expected_width or frame_array.shape[0] != expected_height:
-            frame_array = cv2.resize(frame_array, (expected_width, expected_height))
-
+        dim = camera_spec.get("dim")
+        width, height = (640, 480) if not isinstance(dim, (list, tuple)) or len(dim) < 2 else (int(dim[0]), int(dim[1]))
+        if frame_array.shape[1] != width or frame_array.shape[0] != height:
+            frame_array = cv2.resize(frame_array, (width, height))
         return np.ascontiguousarray(frame_array)
-
     def _write_depth_frame(self, camera_name: str, frame: Any, camera_spec: dict[str, Any]) -> None:
         if self._depth_frames_dir is None:
             raise RuntimeError("Depth frame directory is not initialized.")
-
-        frame_array = self._prepare_depth_frame_for_png(camera_name, frame, camera_spec)
-        frame_index = self._depth_frame_indices[camera_name]
-        output_path = self._depth_frames_dir / f"frame_{frame_index:06d}.png"
-        if not cv2.imwrite(str(output_path), frame_array):
-            raise RuntimeError(f"Failed to write depth frame for '{camera_name}' to {output_path}.")
-        self._depth_frame_indices[camera_name] = frame_index + 1
-
-    @staticmethod
-    def _prepare_depth_frame_for_png(camera_name: str, frame: Any, camera_spec: dict[str, Any]) -> np.ndarray:
         frame_array = np.asarray(frame)
         if frame_array.ndim != 2:
-            raise ValueError(
-                f"Depth frame for '{camera_name}' must be HxW, got shape {frame_array.shape}."
-            )
-
+            raise ValueError(f"Depth frame for '{camera_name}' must be HxW, got shape {frame_array.shape}.")
         if frame_array.dtype != np.uint16:
             frame_array = np.clip(np.rint(frame_array), 0, np.iinfo(np.uint16).max).astype(np.uint16)
-
-        expected_width, expected_height = Saver._resolve_image_size(camera_spec.get("dim"))
-        if frame_array.shape[1] != expected_width or frame_array.shape[0] != expected_height:
-            frame_array = cv2.resize(
-                frame_array,
-                (expected_width, expected_height),
-                interpolation=cv2.INTER_NEAREST,
-            )
-
-        return np.ascontiguousarray(frame_array)
-
+        dim = camera_spec.get("dim")
+        width, height = (640, 480) if not isinstance(dim, (list, tuple)) or len(dim) < 2 else (int(dim[0]), int(dim[1]))
+        if frame_array.shape[1] != width or frame_array.shape[0] != height:
+            frame_array = cv2.resize(frame_array, (width, height), interpolation=cv2.INTER_NEAREST)
+        output_path = self._depth_frames_dir / f"frame_{self._depth_frame_indices[camera_name]:06d}.png"
+        if not cv2.imwrite(str(output_path), np.ascontiguousarray(frame_array)):
+            raise RuntimeError(f"Failed to write depth frame for '{camera_name}' to {output_path}.")
+        self._depth_frame_indices[camera_name] += 1
     @staticmethod
     def _is_depth_camera(camera_spec: dict[str, Any]) -> bool:
         return str(camera_spec.get("type", "rgb")).lower() == "depth"
-
     @staticmethod
     def _to_numpy_array(values: list[Any], dim: Any) -> np.ndarray:
         if not values:
-            if isinstance(dim, (list, tuple)) and dim:
-                shape = (0, *[int(axis) for axis in dim])
-                return np.empty(shape, dtype=np.float64)
-            return np.asarray([], dtype=np.float64)
-
+            return np.empty((0, *[int(axis) for axis in dim]), dtype=np.float64) if dim else np.asarray([], dtype=np.float64)
         try:
-            arrays = [np.asarray(value) for value in values]
-            return np.stack(arrays, axis=0)
+            return np.stack([np.asarray(value) for value in values], axis=0)
         except Exception:
             return np.asarray(values, dtype=object)
+    @staticmethod
+    def _timestamp_range(values: list[float]) -> dict[str, float] | None:
+        return None if not values else {"start": float(values[0]), "end": float(values[-1])}

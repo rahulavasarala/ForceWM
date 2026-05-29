@@ -1,0 +1,15 @@
+bottom_surface:
+  include_center: true
+  concentric_rings:
+    - radius_scale: 0.5
+      num_points: 6
+    - radius_scale: 1.0
+      num_points: 8
+
+middle_ring:
+  height_fraction: 0.1
+  num_points: 8
+
+upper_ring:
+  height_fraction: 0.2
+  num_points: 8

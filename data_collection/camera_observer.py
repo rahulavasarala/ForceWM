@@ -41,6 +41,7 @@ class CameraObserver:
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._next_observer_seq = 0
 
         self.redis_client = redis.Redis(host="127.0.0.1", port=6379, db=0, decode_responses=False)
         self._realsense_streams: dict[str, dict[str, Any]] = {}
@@ -67,6 +68,12 @@ class CameraObserver:
 
         return batched
 
+    def get_latest_obs(self) -> dict[str, Any] | None:
+        with self._lock:
+            if not self.buffer:
+                return None
+            return dict(self.buffer[-1])
+
     def start_adding_obs(self):
         # starts a thread that continuously adds observations at camera_freq to the ring buffer until stop_adding_obs is called
         if self._thread is not None and self._thread.is_alive():
@@ -92,7 +99,7 @@ class CameraObserver:
         while not self._stop_event.is_set():
             observation = self._read_observation()
             if observation is not None:
-                observation.setdefault("timestamp_s", time.time())
+                observation = self._finalize_observation(observation)
                 with self._lock:
                     self.buffer.append(observation)
 
@@ -108,31 +115,25 @@ class CameraObserver:
         source_timestamps: dict[str, float] = {}
         frame_seqs: dict[str, int] = {}
         sim_timestamps: list[float] = []
+        has_non_sim_source = False
 
         for visual_name, visual_spec in self.camera_specs.items():
             source_type = visual_spec["source_type"]
             if source_type == "sim":
-                redis_bytes = self.redis_client.get(visual_spec["redis_key"])
-                if redis_bytes is None:
+                sim_frame = self._read_stable_sim_frame(visual_name, visual_spec)
+                if sim_frame is None:
                     return None
 
-                frame = self._decode_sim_frame(redis_bytes, visual_name, visual_spec)
-                if frame is None:
-                    return None
+                frame, metadata = sim_frame
                 observation[visual_name] = frame
-
-                metadata_raw = self.redis_client.get(visual_spec["metadata_redis_key"])
-                if metadata_raw:
-                    metadata = json.loads(metadata_raw)
-                    if "seq" in metadata:
-                        frame_seqs[visual_name] = int(metadata["seq"])
-                    if "publish_wall_time_s" in metadata:
-                        source_timestamps[visual_name] = float(metadata["publish_wall_time_s"])
-                    if "sim_time_s" in metadata:
-                        sim_timestamps.append(float(metadata["sim_time_s"]))
+                frame_seqs[visual_name] = int(metadata["seq"])
+                source_timestamps[visual_name] = float(metadata["publish_wall_time_s"])
+                sim_timestamps.append(float(metadata["sim_time_s"]))
             elif source_type == "realsense":
+                has_non_sim_source = True
                 observation[visual_name] = self._read_realsense_frame(visual_name)
             else:
+                has_non_sim_source = True
                 observation[visual_name] = np.array(
                     json.loads(self.redis_client.get(visual_spec["redis_key"]))
                 )
@@ -145,7 +146,43 @@ class CameraObserver:
             observation["camera_frame_seqs"] = frame_seqs
         if sim_timestamps:
             observation["sim_timestamp_s"] = max(sim_timestamps)
+            if not has_non_sim_source:
+                observation["timestamp_s"] = observation["sim_timestamp_s"]
 
+        return observation
+
+    def _read_stable_sim_frame(
+        self,
+        visual_name: str,
+        visual_spec: dict[str, Any],
+    ) -> tuple[np.ndarray, dict[str, Any]] | None:
+        metadata_before_raw = self.redis_client.get(visual_spec["metadata_redis_key"])
+        if metadata_before_raw is None:
+            return None
+
+        metadata_before = self._load_metadata(metadata_before_raw)
+        if not metadata_before.get("is_complete", False):
+            return None
+
+        redis_bytes = self.redis_client.get(visual_spec["redis_key"])
+        if redis_bytes is None:
+            return None
+
+        metadata_after_raw = self.redis_client.get(visual_spec["metadata_redis_key"])
+        if metadata_after_raw != metadata_before_raw:
+            return None
+
+        frame = self._decode_sim_frame(redis_bytes, visual_name, visual_spec)
+        if frame is None:
+            return None
+        return frame, metadata_before
+
+    def _finalize_observation(self, observation: dict[str, Any]) -> dict[str, Any]:
+        observer_wall_time_s = time.time()
+        observation["observer_wall_time_s"] = observer_wall_time_s
+        observation["observer_seq"] = self._next_observer_seq
+        self._next_observer_seq += 1
+        observation.setdefault("timestamp_s", observer_wall_time_s)
         return observation
 
     @staticmethod
@@ -348,6 +385,13 @@ class CameraObserver:
         if not redis_namespace:
             return redis_key
         return f"{redis_namespace}::{redis_key}"
+
+    @staticmethod
+    def _load_metadata(metadata_raw: bytes) -> dict[str, Any]:
+        metadata = json.loads(metadata_raw)
+        if not isinstance(metadata, dict):
+            raise ValueError("Expected camera metadata to decode as a JSON object.")
+        return metadata
 
     @staticmethod
     def _stack_or_list(values: list[Any]) -> Any:

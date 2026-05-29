@@ -67,7 +67,7 @@ class ParquetDatasetReader:
             row_start += row_group_rows
 
         if not slices:
-            selected_columns = columns or self.pf.schema.names
+            selected_columns = columns or self.pf.schema_arrow.names
             return pa.table({column: pa.array([]) for column in selected_columns})
 
         slice = slices[0] if len(slices) == 1 else pa.concat_tables(slices)

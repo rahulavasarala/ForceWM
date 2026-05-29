@@ -86,6 +86,80 @@ class PointFinderTests(unittest.TestCase):
         np.testing.assert_allclose(np.linalg.norm(local_normals[:, :2], axis=1), 1.0, atol=1e-6)
         np.testing.assert_allclose(local_normals[:, 2], 0.0, atol=1e-6)
 
+    def test_generate_simple_point_template_matches_default_layout(self) -> None:
+        spec = mod.ContactCylinderSpec(radius_m=0.1, half_height_m=0.2)
+        template = mod.generate_simple_point_template(spec)
+
+        self.assertEqual(template.shape, (31, 3))
+        np.testing.assert_allclose(template[0], np.array([0.0, 0.0, 0.0], dtype=np.float32))
+        self.assertGreater(np.count_nonzero(np.isclose(template[:, 2], 0.0)), 1)
+        self.assertEqual(np.count_nonzero(np.isclose(template[:, 2], -0.2)), 8)
+        self.assertEqual(np.count_nonzero(np.isclose(template[:, 2], -0.4)), 8)
+
+    def test_generate_simple_point_template_anchors_bottom_surface_at_eef_point(self) -> None:
+        spec = mod.ContactCylinderSpec(radius_m=0.1, half_height_m=0.2)
+        template = mod.generate_simple_point_template(spec)
+
+        bottom_surface = template[:15]
+        middle_ring = template[15:23]
+        upper_ring = template[23:]
+
+        np.testing.assert_allclose(bottom_surface[:, 2], 0.0, atol=1e-6)
+        np.testing.assert_allclose(middle_ring[:, 2], -0.2, atol=1e-6)
+        np.testing.assert_allclose(upper_ring[:, 2], -0.4, atol=1e-6)
+
+    def test_generate_points_simple_rotates_template_with_orientation(self) -> None:
+        spec = mod.ContactCylinderSpec(radius_m=0.1, half_height_m=0.2)
+        positions = np.array([[1.0, 2.0, 3.0]], dtype=np.float32)
+        theta = np.pi / 2.0
+        rotation_z = np.array(
+            [
+                [np.cos(theta), -np.sin(theta), 0.0],
+                [np.sin(theta), np.cos(theta), 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )[None]
+
+        point_clouds = mod.generate_points_simple(
+            positions_world=positions,
+            orientations_world=rotation_z,
+            contact_spec=spec,
+        )
+        template = mod.generate_simple_point_template(spec)
+
+        expected_first_surface_point = template[1] @ rotation_z[0].T + positions[0]
+        self.assertEqual(point_clouds.shape, (1, 31, 3))
+        np.testing.assert_allclose(point_clouds[0, 1], expected_first_surface_point, atol=1e-6)
+
+    def test_load_point_config_parses_explicit_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "points.yaml"
+            config_path.write_text(
+                (
+                    "bottom_surface:\n"
+                    "  include_center: true\n"
+                    "  concentric_rings:\n"
+                    "    - radius_scale: 0.25\n"
+                    "      num_points: 4\n"
+                    "middle_ring:\n"
+                    "  height_fraction: 0.5\n"
+                    "  num_points: 6\n"
+                    "upper_ring:\n"
+                    "  height_fraction: 1.0\n"
+                    "  num_points: 8\n"
+                ),
+                encoding="utf-8",
+            )
+
+            point_config = mod.load_point_config(config_path)
+
+        self.assertTrue(point_config.bottom_surface.include_center)
+        self.assertEqual(len(point_config.bottom_surface.concentric_rings), 1)
+        self.assertEqual(point_config.bottom_surface.concentric_rings[0].num_points, 4)
+        self.assertEqual(point_config.middle_ring.num_points, 6)
+        self.assertEqual(point_config.upper_ring.height_fraction, 1.0)
+
     def test_project_world_points_to_pixels_projects_camera_center(self) -> None:
         calibration = self._camera_calibration()
         projected_pixels, depths = mod.project_world_points_to_pixels(

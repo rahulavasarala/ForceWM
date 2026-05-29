@@ -12,6 +12,7 @@ from high_level_controller.interpolator import InterpolatorFault, TrajectoryInte
 DESIRED_POSITION_KEY = "test::desired_cartesian_position"
 DESIRED_ORIENTATION_KEY = "test::desired_cartesian_orientation"
 DESIRED_FORCE_KEY = "test::desired_force"
+DESIRED_FORCE_MAGNITUDE_KEY = "test::desired_force_magnitude"
 FORCE_DIMENSION_KEY = "test::force_dimension"
 FORCE_OR_MOTION_AXIS_KEY = "test::force_or_motion_axis"
 
@@ -41,6 +42,7 @@ class TrajectoryInterpolatorTests(unittest.TestCase):
             DESIRED_FORCE_KEY,
             FORCE_DIMENSION_KEY,
             FORCE_OR_MOTION_AXIS_KEY,
+            desired_force_magnitude_key=DESIRED_FORCE_MAGNITUDE_KEY,
             publish_rate_hz=100.0,
             blend_duration=1.0,
         )
@@ -184,6 +186,29 @@ class TrajectoryInterpolatorTests(unittest.TestCase):
         np.testing.assert_allclose(
             np.asarray(json.loads(self.redis_client.values[DESIRED_FORCE_KEY]), dtype=float),
             np.zeros(3, dtype=float),
+        )
+        np.testing.assert_allclose(
+            np.asarray(json.loads(self.redis_client.values[DESIRED_FORCE_MAGNITUDE_KEY]), dtype=float),
+            np.array([0.0], dtype=float),
+        )
+
+    def test_publish_sample_writes_force_magnitude_scalar_key(self) -> None:
+        sample = _Plan(
+            np.array(
+                [
+                    [0.0, 0.0, 0.0, *self.identity_quat, 2.0],
+                    [1.0, 0.0, 0.0, *self.identity_quat, 4.0],
+                ],
+                dtype=float,
+            ),
+            np.array([0.0, 1.0], dtype=float),
+        ).sample(0.5)
+
+        self.interpolator._publish_sample(sample)
+
+        np.testing.assert_allclose(
+            np.asarray(json.loads(self.redis_client.values[DESIRED_FORCE_MAGNITUDE_KEY]), dtype=float),
+            np.array([3.0], dtype=float),
         )
 
 

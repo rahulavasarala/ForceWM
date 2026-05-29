@@ -35,6 +35,7 @@ CURRENT_ORIENTATION_SUFFIX = "current_cartesian_orientation"
 DESIRED_POSITION_SUFFIX = "desired_cartesian_position"
 DESIRED_ORIENTATION_SUFFIX = "desired_cartesian_orientation"
 DESIRED_FORCE_SUFFIX = "desired_force"
+DESIRED_FORCE_MAGNITUDE_SUFFIX = "desired_force_magnitude"
 FORCE_DIMENSION_SUFFIX = "force_dimension"
 FORCE_OR_MOTION_AXIS_SUFFIX = "force_or_motion_axis"
 
@@ -78,6 +79,7 @@ class PoseRedisKeys:
     desired_position: str
     desired_orientation: str
     desired_force: str
+    desired_force_magnitude: str
     force_dimension: str
     force_or_motion_axis: str
 
@@ -176,6 +178,9 @@ def resolve_pose_redis_keys_from_contract(contract: dict[str, Any]) -> PoseRedis
         ),
         desired_force=_make_redis_key(
             redis_namespace, prefix, DESIRED_FORCE_SUFFIX
+        ),
+        desired_force_magnitude=_make_redis_key(
+            redis_namespace, prefix, DESIRED_FORCE_MAGNITUDE_SUFFIX
         ),
         force_dimension=_make_redis_key(
             redis_namespace, prefix, FORCE_DIMENSION_SUFFIX
@@ -337,6 +342,10 @@ def _read_int(redis_client, key: str) -> int:
     return int(raw_value)
 
 
+def _write_scalar(redis_client, key: str, value: float) -> None:
+    redis_client.set(key, json.dumps([float(value)]))
+
+
 class RandomExplorationRuntime:
     def __init__(
         self,
@@ -364,6 +373,7 @@ class RandomExplorationRuntime:
             config.pose_keys.desired_force,
             config.pose_keys.force_dimension,
             config.pose_keys.force_or_motion_axis,
+            desired_force_magnitude_key=config.pose_keys.desired_force_magnitude,
             publish_rate_hz=config.runtime.interpolator_frequency_hz,
             blend_duration=config.runtime.blend_duration_s,
         )
@@ -428,6 +438,11 @@ class RandomExplorationRuntime:
             local_chunk,
             self.config.runtime.translation_world,
         )
+        _write_scalar(
+            self.redis_client,
+            self.config.pose_keys.desired_force_magnitude,
+            float(world_chunk[0, 7]),
+        )
         timestamps = build_chunk_timestamps(
             cycle_start,
             self.params.chunk_length,
@@ -444,6 +459,7 @@ class RandomExplorationRuntime:
 
     def run(self, max_cycles: int | None = None) -> None:
         self.redis_client.ping()
+        _write_scalar(self.redis_client, self.config.pose_keys.desired_force_magnitude, 0.0)
         self.interpolator.start()
         cycle_count = 0
         try:
@@ -493,6 +509,7 @@ def main() -> int:
         f"desired_pos=`{config.pose_keys.desired_position}` "
         f"desired_ori=`{config.pose_keys.desired_orientation}` "
         f"desired_force=`{config.pose_keys.desired_force}` "
+        f"desired_force_magnitude=`{config.pose_keys.desired_force_magnitude}` "
         f"force_dimension=`{config.pose_keys.force_dimension}` "
         f"force_axis=`{config.pose_keys.force_or_motion_axis}`",
         flush=True,

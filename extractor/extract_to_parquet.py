@@ -4,25 +4,38 @@ import argparse
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+import xml.etree.ElementTree as ET
 
 import numpy as np
+import yaml
 
 from extractor.point_finder import (
-    CameraCalibration,
     ContactCylinderSpec,
-    compute_camera_intrinsics,
-    load_camera_calibration,
+    SimplePointConfig,
+    generate_points_simple,
     load_contact_cylinder_spec,
-    select_points_to_track,
+    load_point_config,
 )
 
 
 DEFAULT_CHUNK_SIZE = 128
 DEFAULT_VEL_THRESH = -1
 DEFAULT_STATIONARY_WINDOW = 1
-DEFAULT_VIDEO_CODEC = "mp4v"
 DEFAULT_PARQUET_NAME = "dataset.parquet"
-DEFAULT_CAMERA_KEY = "camera_01"
+DEFAULT_FEMALE_PART_BODY_NAME = "task"
+
+
+@dataclass(frozen=True)
+class ActionLabelConfig:
+    current_position_key: str
+    current_orientation_key: str
+    desired_position_key: str
+    desired_orientation_key: str
+    desired_force_magnitude_key: str
+    frame: str
+    orientation_encoding: str
+    target_resample: str
 
 
 @dataclass(frozen=True)
@@ -30,23 +43,12 @@ class EpisodeData:
     source_dir: Path
     source_name: str
     timestamps: np.ndarray
-    lowdim_timestamps: np.ndarray
-    positions: np.ndarray
-    orientations: np.ndarray
-    frames: np.ndarray
-    video_fps: float
-
-
-@dataclass(frozen=True)
-class AlignedEpisode:
-    source_dir: Path
-    source_name: str
-    timestamps: np.ndarray
-    positions: np.ndarray
-    orientations: np.ndarray
-    frames: np.ndarray
-    source_frame_indices: np.ndarray
-    video_fps: float
+    current_positions: np.ndarray
+    current_orientations: np.ndarray
+    desired_positions: np.ndarray
+    desired_orientations: np.ndarray
+    desired_force_magnitudes: np.ndarray
+    passthrough_lowdim: dict[str, np.ndarray]
 
 
 @dataclass(frozen=True)
@@ -56,33 +58,16 @@ class ProcessedEpisode:
     timestamps: np.ndarray
     positions: np.ndarray
     orientations: np.ndarray
-    frames: np.ndarray
-    source_frame_indices: np.ndarray
-    video_fps: float
+    action_delta_positions: np.ndarray
+    action_delta_rotvecs: np.ndarray
+    action_force_magnitudes: np.ndarray
+    passthrough_lowdim: dict[str, np.ndarray]
 
 
 @dataclass(frozen=True)
 class EpisodeProcessingResult:
-    aligned_episode: AlignedEpisode
-    prune_keep_mask: np.ndarray
     processed_episode: ProcessedEpisode
-
-
-@dataclass(frozen=True)
-class CoTrackerContext:
-    torch_module: object
-    device: object
-    model: object
-
-
-def _require_cv2():
-    try:
-        import cv2
-    except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            "OpenCV is required for extraction. Install `opencv-python` in the active environment."
-        ) from exc
-    return cv2
+    point_clouds: np.ndarray
 
 
 def _require_pyarrow():
@@ -98,26 +83,112 @@ def _require_pyarrow():
 
 def _require_scipy_rotation():
     try:
-        from scipy.spatial.transform import Rotation, Slerp
+        from scipy.spatial.transform import Rotation
     except ModuleNotFoundError as exc:
         raise RuntimeError(
-            "SciPy is required for orientation interpolation. Install `scipy` in the active environment."
+            "SciPy is required for orientation processing. Install `scipy` in the active environment."
         ) from exc
-    return Rotation, Slerp
-
-
-def _require_torch():
-    try:
-        import torch
-    except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            "PyTorch is required for CoTracker-based point cloud extraction. Install `torch` in the active environment."
-        ) from exc
-    return torch
+    return Rotation
 
 
 def _warn(message: str) -> None:
     warnings.warn(message, stacklevel=2)
+
+
+def load_universal_contract(contract_path: Path) -> dict[str, Any]:
+    contract_path = Path(contract_path)
+    if not contract_path.exists():
+        raise FileNotFoundError(f"Universal contract does not exist: {contract_path}")
+    with contract_path.open("r", encoding="utf-8") as handle:
+        contract = yaml.safe_load(handle)
+    if not isinstance(contract, dict):
+        raise ValueError(f"Universal contract at {contract_path} must contain a top-level mapping.")
+    return contract
+
+
+def parse_action_label_config(contract: dict[str, Any]) -> ActionLabelConfig:
+    robot_cfg = contract.get("robot")
+    if not isinstance(robot_cfg, dict):
+        raise KeyError("Universal contract is missing `robot`.")
+
+    action_cfg = robot_cfg.get("action_labels")
+    if not isinstance(action_cfg, dict):
+        raise KeyError("Universal contract is missing `robot.action_labels`.")
+
+    def require_string(field_name: str) -> str:
+        value = action_cfg.get(field_name)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"`robot.action_labels.{field_name}` must be a non-empty string.")
+        return value.strip()
+
+    config = ActionLabelConfig(
+        current_position_key=require_string("current_position_key"),
+        current_orientation_key=require_string("current_orientation_key"),
+        desired_position_key=require_string("desired_position_key"),
+        desired_orientation_key=require_string("desired_orientation_key"),
+        desired_force_magnitude_key=require_string("desired_force_magnitude_key"),
+        frame=require_string("frame"),
+        orientation_encoding=require_string("orientation_encoding"),
+        target_resample=require_string("target_resample"),
+    )
+
+    if config.frame != "female_part":
+        raise ValueError("`robot.action_labels.frame` must currently be `female_part`.")
+    if config.orientation_encoding != "rotvec":
+        raise ValueError("`robot.action_labels.orientation_encoding` must currently be `rotvec`.")
+    return config
+
+
+def resolve_scene_xml_path(contract: dict[str, Any], contract_path: Path) -> Path | None:
+    robot_cfg = contract.get("robot")
+    if not isinstance(robot_cfg, dict):
+        return None
+
+    raw_xml_path = robot_cfg.get("xml_path")
+    if not isinstance(raw_xml_path, str) or not raw_xml_path.strip():
+        return None
+
+    candidate_path = Path(raw_xml_path).expanduser()
+    if candidate_path.is_absolute():
+        return candidate_path.resolve()
+    return (contract_path.parent / candidate_path).resolve()
+
+
+def load_female_part_position_world(
+    scene_xml_path: Path | None = None,
+    body_name: str = DEFAULT_FEMALE_PART_BODY_NAME,
+) -> np.ndarray:
+    if scene_xml_path is None:
+        scene_xml_path = Path(__file__).resolve().parents[1] / "models" / "parametric_scene.xml"
+
+    scene_xml_path = Path(scene_xml_path)
+    if not scene_xml_path.exists():
+        raise FileNotFoundError(f"Scene XML does not exist: {scene_xml_path}")
+
+    scene_root = ET.parse(scene_xml_path).getroot()
+    search_paths = [scene_xml_path]
+    for include_element in scene_root.iter("include"):
+        include_path = include_element.attrib.get("file")
+        if include_path is None:
+            continue
+        search_paths.append((scene_xml_path.parent / include_path).resolve())
+
+    for search_path in search_paths:
+        if not search_path.exists():
+            continue
+        xml_root = ET.parse(search_path).getroot()
+        for body_element in xml_root.iter("body"):
+            if body_element.attrib.get("name") != body_name:
+                continue
+            raw_position = body_element.attrib.get("pos", "0 0 0")
+            position = np.fromstring(raw_position, sep=" ", dtype=np.float32)
+            if position.shape != (3,):
+                raise ValueError(
+                    f"Body `{body_name}` in {search_path} must define a 3D `pos`, got `{raw_position}`."
+                )
+            return position
+
+    raise ValueError(f"Could not find body `{body_name}` in {scene_xml_path} or its included XML files.")
 
 
 def discover_episode_dirs(input_dir: Path) -> list[Path]:
@@ -146,259 +217,176 @@ def prepare_output_dir(output_dir: Path) -> None:
             f"Output directory already exists: {output_dir}. Remove it before extracting again."
         )
     output_dir.mkdir(parents=True, exist_ok=False)
-    (output_dir / "videos").mkdir(parents=True, exist_ok=False)
 
 
-def load_camera_timestamps(episode_dir: Path) -> np.ndarray:
-    visual_dir = episode_dir / "visual"
-    npy_path = visual_dir / f"{DEFAULT_CAMERA_KEY}_timestamps.npy"
-    npz_path = visual_dir / f"{DEFAULT_CAMERA_KEY}_timestamps.npz"
+def _require_lowdim_timestamp_key(lowdim_archive: Any, lowdim_path: Path) -> str:
+    timestamp_key = "timestamp_s" if "timestamp_s" in lowdim_archive else "ts" if "ts" in lowdim_archive else None
+    if timestamp_key is None:
+        raise KeyError(f"Expected `timestamp_s` or `ts` in {lowdim_path}")
+    return timestamp_key
 
-    if npy_path.exists():
-        timestamps = np.load(npy_path)
-    elif npz_path.exists():
-        npz_file = np.load(npz_path)
-        if len(npz_file.files) == 0:
-            raise ValueError(f"No arrays found in {npz_path}")
-        timestamps = npz_file[npz_file.files[0]]
-    else:
-        raise FileNotFoundError(
-            f"Missing camera timestamps for {episode_dir}. Expected {npy_path.name} or {npz_path.name}."
-        )
 
+def _validate_lowdim_timestamps(lowdim_path: Path, timestamps: Any) -> np.ndarray:
     timestamps = np.asarray(timestamps, dtype=np.float64).reshape(-1)
     if timestamps.size == 0:
-        raise ValueError(f"Camera timestamps are empty for {episode_dir}")
+        raise ValueError(f"Lowdim timestamps are empty in {lowdim_path}")
+    if not np.all(np.isfinite(timestamps)):
+        raise ValueError(f"Lowdim timestamps must be finite in {lowdim_path}")
+    if np.any(np.diff(timestamps) <= 0.0):
+        raise ValueError(f"Lowdim timestamps must be strictly increasing in {lowdim_path}")
     return timestamps
 
 
-def load_lowdim_arrays(episode_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _validate_lowdim_position_array(lowdim_path: Path, key_name: str, value: Any) -> np.ndarray:
+    array = np.asarray(value, dtype=np.float32)
+    if array.ndim != 2 or array.shape[1] != 3:
+        raise ValueError(f"`{key_name}` must have shape (T, 3) in {lowdim_path}")
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"`{key_name}` must contain only finite values in {lowdim_path}")
+    return array
+
+
+def _validate_lowdim_orientation_array(lowdim_path: Path, key_name: str, value: Any) -> np.ndarray:
+    array = np.asarray(value, dtype=np.float32)
+    if array.ndim != 3 or array.shape[1:] != (3, 3):
+        raise ValueError(f"`{key_name}` must have shape (T, 3, 3) in {lowdim_path}")
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"`{key_name}` must contain only finite values in {lowdim_path}")
+    return array
+
+
+def _validate_lowdim_force_array(lowdim_path: Path, key_name: str, value: Any) -> np.ndarray:
+    array = np.asarray(value, dtype=np.float32)
+    if array.ndim == 2 and array.shape[1] == 1:
+        array = array.reshape(-1)
+    elif array.ndim != 1:
+        raise ValueError(f"`{key_name}` must have shape (T,) or (T, 1) in {lowdim_path}")
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"`{key_name}` must contain only finite values in {lowdim_path}")
+    if np.any(array < 0.0):
+        raise ValueError(f"`{key_name}` must be non-negative in {lowdim_path}")
+    return array
+
+
+def _validate_passthrough_lowdim_array(
+    lowdim_path: Path,
+    key_name: str,
+    value: Any,
+    expected_length: int,
+) -> np.ndarray:
+    array = np.asarray(value)
+    if array.ndim == 0:
+        raise ValueError(f"`{key_name}` must have a leading time dimension in {lowdim_path}")
+    if len(array) != expected_length:
+        raise ValueError(
+            f"`{key_name}` has length {len(array)} but timestamps have length {expected_length} in {lowdim_path}."
+        )
+
+    if array.dtype.kind == "f":
+        array = np.asarray(array, dtype=np.float32)
+        if not np.all(np.isfinite(array)):
+            raise ValueError(f"`{key_name}` must contain only finite values in {lowdim_path}")
+        return array
+    if array.dtype.kind in {"i", "u"}:
+        return np.asarray(array, dtype=np.int64)
+    if array.dtype.kind == "b":
+        return np.asarray(array, dtype=bool)
+
+    raise ValueError(
+        f"`{key_name}` in {lowdim_path} must be numeric or boolean to be exported, got dtype `{array.dtype}`."
+    )
+
+
+def load_lowdim_episode(episode_dir: Path, action_label_config: ActionLabelConfig) -> EpisodeData:
     lowdim_path = episode_dir / "lowdim.npz"
     if not lowdim_path.exists():
         raise FileNotFoundError(f"Missing lowdim file: {lowdim_path}")
 
-    lowdim = np.load(lowdim_path)
-    timestamp_key = "timestamp_s" if "timestamp_s" in lowdim else "ts" if "ts" in lowdim else None
-    if timestamp_key is None:
-        raise KeyError(f"Expected `timestamp_s` or `ts` in {lowdim_path}")
-    if "eef_pos" not in lowdim or "eef_ori" not in lowdim:
-        raise KeyError(f"Expected `eef_pos` and `eef_ori` in {lowdim_path}")
+    with np.load(lowdim_path) as lowdim_archive:
+        timestamp_key = _require_lowdim_timestamp_key(lowdim_archive, lowdim_path)
+        required_keys = [
+            action_label_config.current_position_key,
+            action_label_config.current_orientation_key,
+            action_label_config.desired_position_key,
+            action_label_config.desired_orientation_key,
+            action_label_config.desired_force_magnitude_key,
+        ]
+        missing_keys = [key_name for key_name in required_keys if key_name not in lowdim_archive]
+        if missing_keys:
+            raise KeyError(
+                f"Missing required lowdim key(s) {missing_keys} in {lowdim_path}. "
+                "Update the recorded dataset so it includes the action-label fields."
+            )
 
-    timestamps = np.asarray(lowdim[timestamp_key], dtype=np.float64).reshape(-1)
-    positions = np.asarray(lowdim["eef_pos"], dtype=np.float64)
-    orientations = np.asarray(lowdim["eef_ori"], dtype=np.float64)
-
-    if positions.ndim != 2 or positions.shape[1] != 3:
-        raise ValueError(f"`eef_pos` must have shape (T, 3) in {lowdim_path}")
-    if orientations.ndim != 3 or orientations.shape[1:] != (3, 3):
-        raise ValueError(f"`eef_ori` must have shape (T, 3, 3) in {lowdim_path}")
-    if not (len(timestamps) == len(positions) == len(orientations)):
-        raise ValueError(f"Lowdim arrays in {lowdim_path} do not have matching lengths")
-
-    return timestamps, positions, orientations
-
-
-def read_video_frames(video_path: Path) -> tuple[np.ndarray, float]:
-    cv2 = _require_cv2()
-    if not video_path.exists():
-        raise FileNotFoundError(f"Missing video file: {video_path}")
-
-    capture = cv2.VideoCapture(str(video_path))
-    if not capture.isOpened():
-        raise RuntimeError(f"Failed to open video file: {video_path}")
-
-    fps = float(capture.get(cv2.CAP_PROP_FPS))
-    if fps <= 0.0:
-        fps = 30.0
-
-    frames = []
-    while True:
-        success, frame = capture.read()
-        if not success:
-            break
-        frames.append(frame)
-    capture.release()
-
-    if not frames:
-        raise ValueError(f"No frames found in {video_path}")
-
-    return np.stack(frames, axis=0), fps
-
-
-def read_depth_frame(frame_path: Path) -> np.ndarray:
-    cv2 = _require_cv2()
-    frame = cv2.imread(str(frame_path), cv2.IMREAD_UNCHANGED)
-    if frame is None:
-        raise RuntimeError(f"Failed to read depth frame: {frame_path}")
-    if frame.ndim != 2 or frame.dtype != np.uint16:
-        raise ValueError(
-            f"Depth frame `{frame_path}` must decode as HxW uint16, got shape={frame.shape} dtype={frame.dtype}."
+        timestamps = _validate_lowdim_timestamps(lowdim_path, lowdim_archive[timestamp_key])
+        current_positions = _validate_lowdim_position_array(
+            lowdim_path,
+            action_label_config.current_position_key,
+            lowdim_archive[action_label_config.current_position_key],
         )
-    return frame
-
-
-def discover_depth_frame_paths(episode_dir: Path) -> list[Path] | None:
-    depth_frames_dir = episode_dir / "visual" / "depth" / "depth_frames"
-    if not depth_frames_dir.exists():
-        return None
-    if not depth_frames_dir.is_dir():
-        raise NotADirectoryError(f"Depth frame path is not a directory: {depth_frames_dir}")
-
-    depth_paths = sorted(
-        path
-        for path in depth_frames_dir.iterdir()
-        if path.is_file() and path.suffix.lower() == ".png"
-    )
-    if not depth_paths:
-        raise FileNotFoundError(f"No depth PNG frames were found in {depth_frames_dir}")
-    return depth_paths
-
-
-def load_episode_data(episode_dir: Path) -> EpisodeData:
-    timestamps = load_camera_timestamps(episode_dir)
-    lowdim_timestamps, positions, orientations = load_lowdim_arrays(episode_dir)
-    frames, video_fps = read_video_frames(episode_dir / "visual" / f"{DEFAULT_CAMERA_KEY}.mp4")
-
-    frame_count = min(len(timestamps), len(frames))
-    if frame_count == 0:
-        raise ValueError(f"No aligned camera frames available for {episode_dir}")
-    if len(timestamps) != len(frames):
-        _warn(
-            f"{episode_dir.name}: camera timestamps ({len(timestamps)}) and video frames ({len(frames)}) "
-            f"do not match; truncating both to {frame_count}."
+        current_orientations = _validate_lowdim_orientation_array(
+            lowdim_path,
+            action_label_config.current_orientation_key,
+            lowdim_archive[action_label_config.current_orientation_key],
+        )
+        desired_positions = _validate_lowdim_position_array(
+            lowdim_path,
+            action_label_config.desired_position_key,
+            lowdim_archive[action_label_config.desired_position_key],
+        )
+        desired_orientations = _validate_lowdim_orientation_array(
+            lowdim_path,
+            action_label_config.desired_orientation_key,
+            lowdim_archive[action_label_config.desired_orientation_key],
+        )
+        desired_force_magnitudes = _validate_lowdim_force_array(
+            lowdim_path,
+            action_label_config.desired_force_magnitude_key,
+            lowdim_archive[action_label_config.desired_force_magnitude_key],
         )
 
-    timestamps = timestamps[:frame_count]
-    frames = frames[:frame_count]
+        passthrough_lowdim: dict[str, np.ndarray] = {}
+        excluded_keys = {
+            timestamp_key,
+            action_label_config.current_position_key,
+            action_label_config.current_orientation_key,
+            action_label_config.desired_position_key,
+            action_label_config.desired_orientation_key,
+            action_label_config.desired_force_magnitude_key,
+        }
+        for key_name in lowdim_archive.files:
+            if key_name in excluded_keys:
+                continue
+            passthrough_lowdim[key_name] = _validate_passthrough_lowdim_array(
+                lowdim_path,
+                key_name,
+                lowdim_archive[key_name],
+                expected_length=len(timestamps),
+            )
+
+    expected_length = len(timestamps)
+    for key_name, array in [
+        (action_label_config.current_position_key, current_positions),
+        (action_label_config.current_orientation_key, current_orientations),
+        (action_label_config.desired_position_key, desired_positions),
+        (action_label_config.desired_orientation_key, desired_orientations),
+        (action_label_config.desired_force_magnitude_key, desired_force_magnitudes),
+    ]:
+        if len(array) != expected_length:
+            raise ValueError(
+                f"`{key_name}` has length {len(array)} but timestamps have length {expected_length} in {lowdim_path}."
+            )
 
     return EpisodeData(
         source_dir=episode_dir,
         source_name=episode_dir.name,
         timestamps=timestamps,
-        lowdim_timestamps=lowdim_timestamps,
-        positions=positions,
-        orientations=orientations,
-        frames=frames,
-        video_fps=video_fps,
-    )
-
-
-def crop_lowdim_to_camera_range(
-    lowdim_timestamps: np.ndarray,
-    positions: np.ndarray,
-    orientations: np.ndarray,
-    camera_timestamps: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    start_time = float(camera_timestamps[0])
-    end_time = float(camera_timestamps[-1])
-    keep_mask = (lowdim_timestamps >= start_time) & (lowdim_timestamps <= end_time)
-
-    return (
-        lowdim_timestamps[keep_mask],
-        positions[keep_mask],
-        orientations[keep_mask],
-    )
-
-
-def sanitize_interpolation_inputs(
-    timestamps: np.ndarray,
-    positions: np.ndarray,
-    orientations: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    sort_indices = np.argsort(timestamps, kind="stable")
-    timestamps = timestamps[sort_indices]
-    positions = positions[sort_indices]
-    orientations = orientations[sort_indices]
-
-    unique_timestamps, unique_indices = np.unique(timestamps, return_index=True)
-    return (
-        unique_timestamps,
-        positions[unique_indices],
-        orientations[unique_indices],
-    )
-
-
-def interpolate_positions(
-    source_timestamps: np.ndarray,
-    source_positions: np.ndarray,
-    target_timestamps: np.ndarray,
-) -> np.ndarray:
-    interpolated = np.empty((len(target_timestamps), 3), dtype=np.float32)
-    for axis in range(3):
-        interpolated[:, axis] = np.interp(
-            target_timestamps,
-            source_timestamps,
-            source_positions[:, axis],
-        ).astype(np.float32)
-    return interpolated
-
-
-def interpolate_orientations(
-    source_timestamps: np.ndarray,
-    source_orientations: np.ndarray,
-    target_timestamps: np.ndarray,
-) -> np.ndarray:
-    Rotation, Slerp = _require_scipy_rotation()
-
-    source_rotations = Rotation.from_matrix(source_orientations)
-    slerp = Slerp(source_timestamps, source_rotations)
-    target_rotations = slerp(target_timestamps)
-    return target_rotations.as_matrix().astype(np.float32)
-
-
-def align_episode_to_lowdim(episode: EpisodeData) -> AlignedEpisode | None:
-    lowdim_timestamps, lowdim_positions, lowdim_orientations = crop_lowdim_to_camera_range(
-        episode.lowdim_timestamps,
-        episode.positions,
-        episode.orientations,
-        episode.timestamps,
-    )
-    lowdim_timestamps, lowdim_positions, lowdim_orientations = sanitize_interpolation_inputs(
-        lowdim_timestamps,
-        lowdim_positions,
-        lowdim_orientations,
-    )
-
-    if len(lowdim_timestamps) < 2:
-        _warn(
-            f"{episode.source_name}: fewer than 2 lowdim samples remain after camera-range cropping; skipping episode."
-        )
-        return None
-
-    valid_camera_mask = (
-        (episode.timestamps >= lowdim_timestamps[0]) &
-        (episode.timestamps <= lowdim_timestamps[-1])
-    )
-    if not np.any(valid_camera_mask):
-        _warn(
-            f"{episode.source_name}: no camera timestamps fall within the lowdim interpolation range; skipping episode."
-        )
-        return None
-
-    aligned_timestamps = episode.timestamps[valid_camera_mask]
-    aligned_frames = episode.frames[valid_camera_mask]
-    source_frame_indices = np.flatnonzero(valid_camera_mask).astype(np.int64)
-
-    aligned_positions = interpolate_positions(
-        lowdim_timestamps,
-        lowdim_positions,
-        aligned_timestamps,
-    )
-    aligned_orientations = interpolate_orientations(
-        lowdim_timestamps,
-        lowdim_orientations,
-        aligned_timestamps,
-    )
-
-    return AlignedEpisode(
-        source_dir=episode.source_dir,
-        source_name=episode.source_name,
-        timestamps=aligned_timestamps,
-        positions=aligned_positions,
-        orientations=aligned_orientations,
-        frames=aligned_frames,
-        source_frame_indices=source_frame_indices,
-        video_fps=float(episode.video_fps),
+        current_positions=current_positions,
+        current_orientations=current_orientations,
+        desired_positions=desired_positions,
+        desired_orientations=desired_orientations,
+        desired_force_magnitudes=desired_force_magnitudes,
+        passthrough_lowdim=passthrough_lowdim,
     )
 
 
@@ -476,46 +464,185 @@ def build_prune_keep_mask(
     return keep_mask
 
 
+def express_positions_in_female_part_frame(
+    positions_world: np.ndarray,
+    female_part_position_world: np.ndarray,
+) -> np.ndarray:
+    positions_world = np.asarray(positions_world, dtype=np.float32)
+    female_part_position_world = np.asarray(female_part_position_world, dtype=np.float32).reshape(3)
+    if positions_world.ndim != 2 or positions_world.shape[1] != 3:
+        raise ValueError(f"`positions_world` must have shape (T, 3), got {positions_world.shape}.")
+    return positions_world - female_part_position_world[None, :]
+
+
+def compute_action_labels(
+    current_positions_world: np.ndarray,
+    current_orientations_world: np.ndarray,
+    desired_positions_world: np.ndarray,
+    desired_orientations_world: np.ndarray,
+    desired_force_magnitudes: np.ndarray,
+    female_part_position_world: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    current_positions_part = express_positions_in_female_part_frame(
+        current_positions_world,
+        female_part_position_world,
+    )
+    desired_positions_part = express_positions_in_female_part_frame(
+        desired_positions_world,
+        female_part_position_world,
+    )
+    action_delta_positions = (desired_positions_part - current_positions_part).astype(np.float32)
+
+    Rotation = _require_scipy_rotation()
+    current_rotations = Rotation.from_matrix(np.asarray(current_orientations_world, dtype=np.float64))
+    desired_rotations = Rotation.from_matrix(np.asarray(desired_orientations_world, dtype=np.float64))
+    action_delta_rotvecs = (desired_rotations * current_rotations.inv()).as_rotvec().astype(np.float32)
+    action_force_magnitudes = np.asarray(desired_force_magnitudes, dtype=np.float32).reshape(-1)
+
+    if len(action_delta_positions) != len(action_delta_rotvecs) or len(action_delta_positions) != len(action_force_magnitudes):
+        raise ValueError("Computed action labels must have matching lengths.")
+
+    return action_delta_positions, action_delta_rotvecs, action_force_magnitudes
+
+
+def express_point_clouds_in_female_part_frame(
+    point_clouds_world: np.ndarray,
+    eef_positions_world: np.ndarray,
+    female_part_position_world: np.ndarray,
+) -> np.ndarray:
+    point_clouds_world = np.asarray(point_clouds_world, dtype=np.float32)
+    eef_positions_world = np.asarray(eef_positions_world, dtype=np.float32)
+    female_part_position_world = np.asarray(female_part_position_world, dtype=np.float32).reshape(3)
+
+    if point_clouds_world.ndim != 3 or point_clouds_world.shape[-1] != 3:
+        raise ValueError(f"`point_clouds_world` must have shape (T, N, 3), got {point_clouds_world.shape}.")
+    if eef_positions_world.ndim != 2 or eef_positions_world.shape[1] != 3:
+        raise ValueError(f"`eef_positions_world` must have shape (T, 3), got {eef_positions_world.shape}.")
+    if len(point_clouds_world) != len(eef_positions_world):
+        raise ValueError("Point-cloud frames and end-effector positions must have matching lengths.")
+
+    point_clouds_part_frame = point_clouds_world - female_part_position_world[None, None, :]
+    eef_positions_part_frame = eef_positions_world - female_part_position_world[None, :]
+    return np.concatenate(
+        [eef_positions_part_frame[:, None, :], point_clouds_part_frame],
+        axis=1,
+    ).astype(np.float32)
+
+
+def create_synthetic_point_clouds(
+    positions_world: np.ndarray,
+    orientations_world: np.ndarray,
+    female_part_position_world: np.ndarray,
+    contact_spec: ContactCylinderSpec,
+    point_config: SimplePointConfig,
+) -> np.ndarray:
+    point_clouds_world = generate_points_simple(
+        positions_world=positions_world,
+        orientations_world=orientations_world,
+        contact_spec=contact_spec,
+        point_config=point_config,
+    )
+    return express_point_clouds_in_female_part_frame(
+        point_clouds_world=point_clouds_world,
+        eef_positions_world=positions_world,
+        female_part_position_world=female_part_position_world,
+    )
+
+
 def process_episode(
     episode_dir: Path,
     trim_start: int,
     trim_end: int,
     vel_thresh: float,
     stationary_window: int,
+    action_label_config: ActionLabelConfig,
+    female_part_position_world: np.ndarray,
+    contact_spec: ContactCylinderSpec,
+    point_config: SimplePointConfig,
 ) -> EpisodeProcessingResult | None:
-    episode = load_episode_data(episode_dir)
-    aligned_episode = align_episode_to_lowdim(episode)
-    if aligned_episode is None:
-        return None
+    episode = load_lowdim_episode(episode_dir, action_label_config)
 
     prune_keep_mask = build_prune_keep_mask(
-        timestamps=aligned_episode.timestamps,
-        positions=aligned_episode.positions,
+        timestamps=episode.timestamps,
+        positions=episode.current_positions,
         trim_start=trim_start,
         trim_end=trim_end,
         vel_thresh=vel_thresh,
         stationary_window=stationary_window,
     )
-
     if not np.any(prune_keep_mask):
-        _warn(f"{aligned_episode.source_name}: pruning removed every frame; skipping episode.")
+        _warn(f"{episode.source_name}: pruning removed every frame; skipping episode.")
         return None
 
-    processed_episode = ProcessedEpisode(
-        source_dir=aligned_episode.source_dir,
-        source_name=aligned_episode.source_name,
-        timestamps=aligned_episode.timestamps[prune_keep_mask].astype(np.float64),
-        positions=aligned_episode.positions[prune_keep_mask].astype(np.float32),
-        orientations=aligned_episode.orientations[prune_keep_mask].astype(np.float32),
-        frames=aligned_episode.frames[prune_keep_mask],
-        source_frame_indices=aligned_episode.source_frame_indices[prune_keep_mask].astype(np.int64),
-        video_fps=float(aligned_episode.video_fps),
+    pruned_timestamps = episode.timestamps[prune_keep_mask].astype(np.float64)
+    pruned_positions = episode.current_positions[prune_keep_mask].astype(np.float32)
+    pruned_orientations = episode.current_orientations[prune_keep_mask].astype(np.float32)
+    pruned_desired_positions = episode.desired_positions[prune_keep_mask].astype(np.float32)
+    pruned_desired_orientations = episode.desired_orientations[prune_keep_mask].astype(np.float32)
+    pruned_desired_force_magnitudes = episode.desired_force_magnitudes[prune_keep_mask].astype(np.float32)
+    pruned_passthrough_lowdim = {
+        key_name: values[prune_keep_mask]
+        for key_name, values in episode.passthrough_lowdim.items()
+    }
+
+    action_delta_positions, action_delta_rotvecs, action_force_magnitudes = compute_action_labels(
+        current_positions_world=pruned_positions,
+        current_orientations_world=pruned_orientations,
+        desired_positions_world=pruned_desired_positions,
+        desired_orientations_world=pruned_desired_orientations,
+        desired_force_magnitudes=pruned_desired_force_magnitudes,
+        female_part_position_world=female_part_position_world,
+    )
+    point_clouds = create_synthetic_point_clouds(
+        positions_world=pruned_positions,
+        orientations_world=pruned_orientations,
+        female_part_position_world=female_part_position_world,
+        contact_spec=contact_spec,
+        point_config=point_config,
     )
 
     return EpisodeProcessingResult(
-        aligned_episode=aligned_episode,
-        prune_keep_mask=prune_keep_mask,
-        processed_episode=processed_episode,
+        processed_episode=ProcessedEpisode(
+            source_dir=episode.source_dir,
+            source_name=episode.source_name,
+            timestamps=pruned_timestamps,
+            positions=pruned_positions,
+            orientations=pruned_orientations,
+            action_delta_positions=action_delta_positions,
+            action_delta_rotvecs=action_delta_rotvecs,
+            action_force_magnitudes=action_force_magnitudes,
+            passthrough_lowdim=pruned_passthrough_lowdim,
+        ),
+        point_clouds=point_clouds,
+    )
+
+
+def _numpy_dtype_to_pyarrow_type(pa: Any, array: np.ndarray) -> Any:
+    if array.dtype.kind == "f":
+        return pa.float32()
+    if array.dtype.kind == "i":
+        return pa.int64()
+    if array.dtype.kind == "u":
+        return pa.uint64()
+    if array.dtype.kind == "b":
+        return pa.bool_()
+    raise ValueError(f"Unsupported dtype for parquet export: {array.dtype}")
+
+
+def _numpy_array_to_parquet_column(pa: Any, key_name: str, array: np.ndarray) -> Any:
+    array = np.asarray(array)
+    if array.ndim == 0:
+        raise ValueError(f"Parquet column `{key_name}` must include a row dimension.")
+
+    element_type = _numpy_dtype_to_pyarrow_type(pa, array)
+    if array.ndim == 1:
+        return pa.array(array, type=element_type)
+
+    list_size = int(np.prod(array.shape[1:], dtype=np.int64))
+    flattened = np.ascontiguousarray(array.reshape(len(array), list_size))
+    return pa.FixedSizeListArray.from_arrays(
+        pa.array(flattened.reshape(-1), type=element_type),
+        list_size,
     )
 
 
@@ -524,22 +651,44 @@ def write_parquet(output_dir: Path, episodes: list[ProcessedEpisode]) -> int:
 
     all_positions = np.concatenate([episode.positions for episode in episodes], axis=0)
     all_orientations = np.concatenate([episode.orientations for episode in episodes], axis=0).reshape(-1, 9)
+    all_action_delta_positions = np.concatenate([episode.action_delta_positions for episode in episodes], axis=0)
+    all_action_delta_rotvecs = np.concatenate([episode.action_delta_rotvecs for episode in episodes], axis=0)
+    all_action_force_magnitudes = np.concatenate([episode.action_force_magnitudes for episode in episodes], axis=0)
 
-    eef_pos_array = pa.FixedSizeListArray.from_arrays(
-        pa.array(all_positions.reshape(-1), type=pa.float32()),
-        3,
-    )
-    eef_ori_array = pa.FixedSizeListArray.from_arrays(
-        pa.array(all_orientations.reshape(-1), type=pa.float32()),
-        9,
-    )
+    passthrough_keys = list(episodes[0].passthrough_lowdim.keys())
+    passthrough_columns: dict[str, Any] = {}
+    for episode in episodes[1:]:
+        if list(episode.passthrough_lowdim.keys()) != passthrough_keys:
+            raise ValueError("All processed episodes must have the same passthrough lowdim keys.")
 
-    table = pa.table(
-        {
-            "eef_pos": eef_pos_array,
-            "eef_ori": eef_ori_array,
-        }
-    )
+    for key_name in passthrough_keys:
+        try:
+            concatenated = np.concatenate([episode.passthrough_lowdim[key_name] for episode in episodes], axis=0)
+        except ValueError as exc:
+            raise ValueError(f"Passthrough lowdim key `{key_name}` has inconsistent shapes across episodes.") from exc
+        passthrough_columns[key_name] = _numpy_array_to_parquet_column(pa, key_name, concatenated)
+
+    table_columns = {
+        "eef_pos": pa.FixedSizeListArray.from_arrays(
+            pa.array(all_positions.reshape(-1), type=pa.float32()),
+            3,
+        ),
+        "eef_ori": pa.FixedSizeListArray.from_arrays(
+            pa.array(all_orientations.reshape(-1), type=pa.float32()),
+            9,
+        ),
+        "action_delta_pos": pa.FixedSizeListArray.from_arrays(
+            pa.array(all_action_delta_positions.reshape(-1), type=pa.float32()),
+            3,
+        ),
+        "action_delta_rotvec": pa.FixedSizeListArray.from_arrays(
+            pa.array(all_action_delta_rotvecs.reshape(-1), type=pa.float32()),
+            3,
+        ),
+        "action_force_magnitude": pa.array(all_action_force_magnitudes, type=pa.float32()),
+    }
+    table_columns.update(passthrough_columns)
+    table = pa.table(table_columns)
     parquet_path = output_dir / DEFAULT_PARQUET_NAME
     pq.write_table(table, parquet_path)
     return int(len(all_positions))
@@ -552,226 +701,18 @@ def write_metadata(output_dir: Path, episodes: list[ProcessedEpisode], chunk_siz
         running_total += len(episode.positions)
         episode_ends.append(running_total - 1)
 
-    metadata_path = output_dir / "metadata.npz"
+    episode_ends_array = np.asarray(episode_ends, dtype=np.int64)
     np.savez(
-        metadata_path,
-        episode_ends=np.asarray(episode_ends, dtype=np.int64),
+        output_dir / "metadata.npz",
+        episode_ends=episode_ends_array,
         chunk_size=np.asarray(chunk_size, dtype=np.int64),
     )
-    return np.asarray(episode_ends, dtype=np.int64)
-
-
-def write_chunked_videos(output_dir: Path, episodes: list[ProcessedEpisode], chunk_size: int) -> None:
-    cv2 = _require_cv2()
-    fourcc = cv2.VideoWriter_fourcc(*DEFAULT_VIDEO_CODEC)
-    videos_dir = output_dir / "videos"
-
-    for output_episode_index, episode in enumerate(episodes, start=1):
-        episode_dir = videos_dir / f"episode_{output_episode_index:04d}"
-        episode_dir.mkdir(parents=True, exist_ok=False)
-
-        frame_height, frame_width = episode.frames.shape[1:3]
-        num_chunks = (len(episode.frames) + chunk_size - 1) // chunk_size
-
-        for chunk_index in range(num_chunks):
-            chunk_start = chunk_index * chunk_size
-            chunk_end = min(chunk_start + chunk_size, len(episode.frames))
-            chunk_frames = episode.frames[chunk_start:chunk_end]
-
-            chunk_path = episode_dir / f"chunk_{chunk_index + 1:04d}.mp4"
-            writer = cv2.VideoWriter(
-                str(chunk_path),
-                fourcc,
-                episode.video_fps,
-                (frame_width, frame_height),
-            )
-            if not writer.isOpened():
-                raise RuntimeError(f"Failed to open video writer for {chunk_path}")
-
-            for frame in chunk_frames:
-                writer.write(frame)
-            writer.release()
-
-
-def resolve_torch_device(torch_module) -> object:
-    if torch_module.cuda.is_available():
-        return torch_module.device("cuda")
-    mps_backend = getattr(torch_module.backends, "mps", None)
-    if mps_backend is not None and mps_backend.is_available():
-        return torch_module.device("mps")
-    return torch_module.device("cpu")
-
-
-def load_cotracker_context() -> CoTrackerContext:
-    torch = _require_torch()
-    device = resolve_torch_device(torch)
-    try:
-        model = torch.hub.load("facebookresearch/co-tracker", "cotracker3_online").to(device)
-    except Exception as exc:
-        raise RuntimeError(
-            "Failed to load `facebookresearch/co-tracker:cotracker3_online`. "
-            "Ensure the model is cached locally or that the runtime can access torch hub."
-        ) from exc
-    model.eval()
-    return CoTrackerContext(torch_module=torch, device=device, model=model)
-
-
-def frames_to_cotracker_tensor(torch_module, device, frames: np.ndarray):
-    rgb_frames = np.ascontiguousarray(frames[..., ::-1])
-    return (
-        torch_module.from_numpy(rgb_frames)
-        .to(device=device, dtype=torch_module.float32)
-        .permute(0, 3, 1, 2)[None]
-    )
-
-
-def track_sampled_pixels(
-    cotracker_context: CoTrackerContext,
-    frames: np.ndarray,
-    sampled_pixels: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    torch = cotracker_context.torch_module
-    cotracker = cotracker_context.model
-    device = cotracker_context.device
-
-    queries = np.concatenate(
-        [
-            np.zeros((len(sampled_pixels), 1), dtype=np.float32),
-            sampled_pixels.astype(np.float32),
-        ],
-        axis=1,
-    )[None]
-    query_tensor = torch.from_numpy(queries).to(device=device, dtype=torch.float32)
-
-    step = int(getattr(cotracker, "step", 8))
-    if len(frames) <= step:
-        init_chunk = frames_to_cotracker_tensor(torch, device, frames)
-        cotracker(
-            video_chunk=init_chunk,
-            is_first_step=True,
-            queries=query_tensor,
-            grid_size=0,
-        )
-        pred_tracks, pred_visibility = cotracker(video_chunk=init_chunk)
-    else:
-        window_frames: list[np.ndarray] = []
-        is_first_step = True
-        pred_tracks = None
-        pred_visibility = None
-
-        for frame_index, frame in enumerate(frames):
-            if frame_index % step == 0 and frame_index != 0:
-                chunk_frames = np.stack(window_frames[-step * 2 :], axis=0)
-                video_chunk = frames_to_cotracker_tensor(torch, device, chunk_frames)
-                pred_tracks, pred_visibility = cotracker(
-                    video_chunk=video_chunk,
-                    is_first_step=is_first_step,
-                    queries=query_tensor if is_first_step else None,
-                    grid_size=0,
-                )
-                is_first_step = False
-            window_frames.append(frame)
-
-        if window_frames:
-            remainder = (len(window_frames) - 1) % step
-            tail_length = remainder + step + 1
-            chunk_frames = np.stack(window_frames[-tail_length:], axis=0)
-            video_chunk = frames_to_cotracker_tensor(torch, device, chunk_frames)
-            pred_tracks, pred_visibility = cotracker(
-                video_chunk=video_chunk,
-                is_first_step=is_first_step,
-                queries=query_tensor if is_first_step else None,
-                grid_size=0,
-            )
-            if pred_tracks is None or pred_visibility is None:
-                pred_tracks, pred_visibility = cotracker(video_chunk=video_chunk)
-
-    if pred_tracks is None or pred_visibility is None:
-        raise RuntimeError("CoTracker did not produce any tracks for the sampled pixels.")
-
-    tracks = pred_tracks[0].detach().cpu().numpy().astype(np.float32)
-    visibility = pred_visibility[0].detach().cpu().numpy().astype(bool)
-    if tracks.shape[0] != len(frames):
-        raise ValueError(
-            f"Expected CoTracker to return {len(frames)} frames of tracks, but received {tracks.shape[0]}."
-        )
-    if tracks.shape[1] != len(sampled_pixels):
-        raise ValueError(
-            f"Expected {len(sampled_pixels)} sampled tracks, but received {tracks.shape[1]}."
-        )
-    return tracks, visibility
-
-
-def project_tracks_to_world_points(
-    tracks: np.ndarray,
-    visibility: np.ndarray,
-    depth_frame_paths: list[Path],
-    source_frame_indices: np.ndarray,
-    camera_calibration: CameraCalibration,
-    expected_frame_shape: tuple[int, int],
-) -> np.ndarray:
-    frame_height, frame_width = expected_frame_shape
-    fx, fy, cx, cy = compute_camera_intrinsics(
-        frame_height=frame_height,
-        frame_width=frame_width,
-        fovy_degrees=camera_calibration.fovy_degrees,
-    )
-    world_points = np.full((len(tracks), tracks.shape[1], 3), np.nan, dtype=np.float32)
-
-    for frame_index in range(len(tracks)):
-        source_frame_index = int(source_frame_indices[frame_index])
-        if source_frame_index < 0 or source_frame_index >= len(depth_frame_paths):
-            raise IndexError(
-                f"Source frame index {source_frame_index} is out of range for {len(depth_frame_paths)} depth frames."
-            )
-
-        depth_frame_mm = read_depth_frame(depth_frame_paths[source_frame_index])
-        if depth_frame_mm.shape != expected_frame_shape:
-            raise ValueError(
-                f"Depth frame shape mismatch for {depth_frame_paths[source_frame_index]}: "
-                f"expected {expected_frame_shape}, got {depth_frame_mm.shape}."
-            )
-
-        rounded_xy = np.rint(tracks[frame_index]).astype(np.int64)
-        x_coords = rounded_xy[:, 0]
-        y_coords = rounded_xy[:, 1]
-        valid_mask = visibility[frame_index].astype(bool)
-        valid_mask &= x_coords >= 0
-        valid_mask &= x_coords < frame_width
-        valid_mask &= y_coords >= 0
-        valid_mask &= y_coords < frame_height
-
-        if not np.any(valid_mask):
-            continue
-
-        valid_x = x_coords[valid_mask]
-        valid_y = y_coords[valid_mask]
-        depth_values_mm = depth_frame_mm[valid_y, valid_x]
-        valid_depth_mask = depth_values_mm > 0
-        if not np.any(valid_depth_mask):
-            continue
-
-        valid_indices = np.flatnonzero(valid_mask)[valid_depth_mask]
-        depth_m = depth_values_mm[valid_depth_mask].astype(np.float32) / 1000.0
-        pixel_x = valid_x[valid_depth_mask].astype(np.float32)
-        pixel_y = valid_y[valid_depth_mask].astype(np.float32)
-
-        camera_x = (pixel_x - cx) * depth_m / fx
-        camera_y = (pixel_y - cy) * depth_m / fy
-        world_points[frame_index, valid_indices] = (
-            camera_calibration.camera_position_world[None, :]
-            + camera_x[:, None] * camera_calibration.camera_right_world[None, :]
-            + camera_y[:, None] * camera_calibration.camera_down_world[None, :]
-            + depth_m[:, None] * camera_calibration.camera_forward_world[None, :]
-        ).astype(np.float32)
-
-    return world_points
+    return episode_ends_array
 
 
 def write_chunked_point_clouds(
     output_dir: Path,
     output_episode_index: int,
-    sampled_pixels: np.ndarray,
     point_clouds: np.ndarray,
     chunk_size: int,
 ) -> None:
@@ -780,7 +721,6 @@ def write_chunked_point_clouds(
 
     episode_dir = point_clouds_dir / f"episode_{output_episode_index:04d}"
     episode_dir.mkdir(parents=True, exist_ok=False)
-    np.save(episode_dir / "sampled_pixels.npy", sampled_pixels.astype(np.int32))
 
     num_chunks = (len(point_clouds) + chunk_size - 1) // chunk_size
     for chunk_index in range(num_chunks):
@@ -790,124 +730,52 @@ def write_chunked_point_clouds(
         np.save(chunk_path, point_clouds[chunk_start:chunk_end].astype(np.float32))
 
 
-def create_depth_point_clouds(
-    output_dir: Path,
-    output_episode_index: int,
-    processing_result: EpisodeProcessingResult,
-    chunk_size: int,
-    cotracker_context: CoTrackerContext,
-    camera_calibration: CameraCalibration,
-    contact_spec: ContactCylinderSpec,
-) -> bool:
-    depth_frame_paths = discover_depth_frame_paths(processing_result.aligned_episode.source_dir)
-    if depth_frame_paths is None:
-        return False
-
-    aligned_episode = processing_result.aligned_episode
-    processed_episode = processing_result.processed_episode
-    if len(aligned_episode.frames) == 0:
-        return False
-
-    first_source_frame_index = int(aligned_episode.source_frame_indices[0])
-    if first_source_frame_index >= len(depth_frame_paths):
-        raise IndexError(
-            f"First aligned frame index {first_source_frame_index} exceeds the available depth frames ({len(depth_frame_paths)})."
-        )
-
-    first_depth_frame = read_depth_frame(depth_frame_paths[first_source_frame_index])
-    rgb_frame_shape = tuple(aligned_episode.frames[0].shape[:2])
-    if first_depth_frame.shape != rgb_frame_shape:
-        raise ValueError(
-            f"Aligned RGB frame shape {rgb_frame_shape} does not match depth frame shape {first_depth_frame.shape}."
-        )
-
-    sampled_pixels = select_points_to_track(
-        aligned_episode=aligned_episode,
-        camera_calibration=camera_calibration,
-        contact_spec=contact_spec,
-    )
-    if len(sampled_pixels) == 0:
-        _warn(
-            f"{aligned_episode.source_name}: no end-effector seed pixels survived the first-frame geometry, color, and depth checks; "
-            "skipping point-cloud extraction."
-        )
-        return False
-
-    tracks, visibility = track_sampled_pixels(
-        cotracker_context=cotracker_context,
-        frames=aligned_episode.frames,
-        sampled_pixels=sampled_pixels,
-    )
-    pruned_tracks = tracks[processing_result.prune_keep_mask]
-    pruned_visibility = visibility[processing_result.prune_keep_mask]
-
-    point_clouds = project_tracks_to_world_points(
-        tracks=pruned_tracks,
-        visibility=pruned_visibility,
-        depth_frame_paths=depth_frame_paths,
-        source_frame_indices=processed_episode.source_frame_indices,
-        camera_calibration=camera_calibration,
-        expected_frame_shape=rgb_frame_shape,
-    )
-
-    write_chunked_point_clouds(
-        output_dir=output_dir,
-        output_episode_index=output_episode_index,
-        sampled_pixels=sampled_pixels,
-        point_clouds=point_clouds,
-        chunk_size=chunk_size,
-    )
-    return True
-
-
 def extract_dataset(
     input_dir: Path,
     output_dir: Path,
+    universal_contract_path: Path,
+    point_config_path: Path | None,
     chunk_size: int,
     trim_start: int,
     trim_end: int,
     vel_thresh: float,
     stationary_window: int,
 ) -> None:
+    contract = load_universal_contract(universal_contract_path)
+    action_label_config = parse_action_label_config(contract)
+    point_config = load_point_config(point_config_path)
+    contact_spec = load_contact_cylinder_spec()
+    scene_xml_path = resolve_scene_xml_path(contract, universal_contract_path)
+    female_part_position_world = load_female_part_position_world(scene_xml_path=scene_xml_path)
+
     episode_dirs = discover_episode_dirs(input_dir)
     prepare_output_dir(output_dir)
 
     processed_episodes: list[ProcessedEpisode] = []
-    cotracker_context: CoTrackerContext | None = None
-    camera_calibration: CameraCalibration | None = None
-    contact_spec: ContactCylinderSpec | None = None
-    pointcloud_episode_count = 0
-
+    point_cloud_episode_count = 0
     for episode_dir in episode_dirs:
         processing_result = process_episode(
-            episode_dir,
+            episode_dir=episode_dir,
             trim_start=trim_start,
             trim_end=trim_end,
             vel_thresh=vel_thresh,
             stationary_window=stationary_window,
+            action_label_config=action_label_config,
+            female_part_position_world=female_part_position_world,
+            contact_spec=contact_spec,
+            point_config=point_config,
         )
         if processing_result is None:
             continue
 
         output_episode_index = len(processed_episodes) + 1
-        if discover_depth_frame_paths(processing_result.aligned_episode.source_dir) is not None:
-            if cotracker_context is None:
-                cotracker_context = load_cotracker_context()
-            if camera_calibration is None:
-                camera_calibration = load_camera_calibration()
-            if contact_spec is None:
-                contact_spec = load_contact_cylinder_spec()
-            if create_depth_point_clouds(
-                output_dir=output_dir,
-                output_episode_index=output_episode_index,
-                processing_result=processing_result,
-                chunk_size=chunk_size,
-                cotracker_context=cotracker_context,
-                camera_calibration=camera_calibration,
-                contact_spec=contact_spec,
-            ):
-                pointcloud_episode_count += 1
-
+        write_chunked_point_clouds(
+            output_dir=output_dir,
+            output_episode_index=output_episode_index,
+            point_clouds=processing_result.point_clouds,
+            chunk_size=chunk_size,
+        )
+        point_cloud_episode_count += 1
         processed_episodes.append(processing_result.processed_episode)
 
     if not processed_episodes:
@@ -915,16 +783,25 @@ def extract_dataset(
 
     total_rows = write_parquet(output_dir, processed_episodes)
     episode_ends = write_metadata(output_dir, processed_episodes, chunk_size=chunk_size)
-    write_chunked_videos(output_dir, processed_episodes, chunk_size=chunk_size)
-
     print(f"Wrote {len(processed_episodes)} episodes and {total_rows} rows to {output_dir}")
     print(f"episode_ends={episode_ends.tolist()}")
-    if pointcloud_episode_count:
-        print(f"Wrote chunked point clouds for {pointcloud_episode_count} depth-enabled episodes.")
+    print(f"Wrote chunked synthetic point clouds for {point_cloud_episode_count} episodes.")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Extract a lightweight parquet/video dataset.")
+    parser = argparse.ArgumentParser(description="Extract a lowdim-only parquet and point-cloud dataset.")
+    parser.add_argument(
+        "--universal-contract",
+        required=True,
+        type=str,
+        help="Path to the universal contract file that defines the action-label mapping.",
+    )
+    parser.add_argument(
+        "--point-config",
+        default=None,
+        type=str,
+        help="Optional YAML file that configures synthetic end-effector point sampling.",
+    )
     parser.add_argument(
         "--input-dir",
         required=True,
@@ -941,19 +818,19 @@ def parse_args() -> argparse.Namespace:
         "--chunk-size",
         default=DEFAULT_CHUNK_SIZE,
         type=int,
-        help="Number of frames per output MP4 chunk.",
+        help="Number of frames per output point-cloud chunk.",
     )
     parser.add_argument(
         "--trim-start",
         default=0,
         type=int,
-        help="Number of aligned frames to drop from the start of each episode.",
+        help="Number of lowdim frames to drop from the start of each episode.",
     )
     parser.add_argument(
         "--trim-end",
         default=0,
         type=int,
-        help="Number of aligned frames to drop from the end of each episode.",
+        help="Number of lowdim frames to drop from the end of each episode.",
     )
     parser.add_argument(
         "--vel-thresh",
@@ -972,6 +849,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    universal_contract_path = Path(args.universal_contract).expanduser().resolve()
+    point_config_path = Path(args.point_config).expanduser().resolve() if args.point_config is not None else None
     input_dir = Path(args.input_dir).expanduser().resolve()
     output_dir = resolve_output_dir(input_dir, args.output_dir)
 
@@ -983,6 +862,8 @@ def main() -> None:
     extract_dataset(
         input_dir=input_dir,
         output_dir=output_dir,
+        universal_contract_path=universal_contract_path,
+        point_config_path=point_config_path,
         chunk_size=int(args.chunk_size),
         trim_start=int(args.trim_start),
         trim_end=int(args.trim_end),

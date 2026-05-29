@@ -75,6 +75,7 @@ class TrajectoryInterpolator:
         desired_force_key: str,
         force_dimension_key: str,
         force_or_motion_axis_key: str,
+        desired_force_magnitude_key: str | None = None,
         publish_rate_hz: float = 100.0,
         blend_duration: float = 0.1,
     ) -> None:
@@ -89,6 +90,9 @@ class TrajectoryInterpolator:
         self.desired_force_key = desired_force_key
         self.force_dimension_key = force_dimension_key
         self.force_or_motion_axis_key = force_or_motion_axis_key
+        self.desired_force_magnitude_key = (
+            None if desired_force_magnitude_key is None else str(desired_force_magnitude_key)
+        )
         self.publish_rate_hz = float(publish_rate_hz)
         self.blend_duration = float(blend_duration)
 
@@ -167,9 +171,13 @@ class TrajectoryInterpolator:
                 sample.force_magnitude,
                 sample.dx_world,
             )
+            desired_force_magnitude = float(sample.force_magnitude)
         else:
             desired_force = np.zeros(3, dtype=float)
+            desired_force_magnitude = 0.0
         _write_vector(self.redis_client, self.desired_force_key, desired_force)
+        if self.desired_force_magnitude_key is not None:
+            _write_scalar(self.redis_client, self.desired_force_magnitude_key, desired_force_magnitude)
 
     def _desired_force_from_sample(
         self,
@@ -279,6 +287,10 @@ def _write_vector(redis_client, key: str, value: np.ndarray) -> None:
 def _write_matrix(redis_client, key: str, value: np.ndarray) -> None:
     matrix = np.asarray(value, dtype=float).reshape(3, 3)
     redis_client.set(key, json.dumps(matrix.tolist()))
+
+
+def _write_scalar(redis_client, key: str, value: float) -> None:
+    redis_client.set(key, json.dumps([float(value)]))
 
 
 def _normalize_axis(axis: np.ndarray) -> np.ndarray:

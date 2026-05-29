@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import select
+import shutil
 import sys
 import threading
 import time
@@ -33,11 +34,18 @@ class DataCollection:
         self.contract = self._load_contract(self.contract_path)
         self.lowdim_cfg = self._require_source_cfg("lowdim")
         self.visual_cfg = self._require_source_cfg("visual")
+        self.loader_key_cfgs = self._load_data_loader_key_cfgs()
 
         self.lowdim_fps = self._resolve_fps(self.lowdim_cfg, "lowdim")
         self.camera_fps = self._resolve_fps(self.visual_cfg, "visual")
-        self.lowdim_buffer_size = self._resolve_buffer_size(self.lowdim_cfg, "lowdim")
-        self.camera_buffer_size = self._resolve_buffer_size(self.visual_cfg, "visual")
+        self.lowdim_buffer_size = self._resolve_buffer_size(
+            source_cfg=self.lowdim_cfg,
+            source_name="lowdim",
+        )
+        self.camera_buffer_size = self._resolve_buffer_size(
+            source_cfg=self.visual_cfg,
+            source_name="visual",
+        )
 
         self.robot_observer: RobotObserver | None = None
         self.camera_observer: CameraObserver | None = None
@@ -137,6 +145,20 @@ class DataCollection:
             print(f"Saved {episode_name} in {episode_path}", flush=True)
             print(self._format_save_summary(summary), flush=True)
 
+    def delete_latest_episode(self) -> None:
+        with self._recording_lock:
+            if self._recording_event.is_set():
+                print("Stop the active recording before deleting an episode.", flush=True)
+                return
+
+            latest_episode_dir = self._find_latest_episode_dir()
+            if latest_episode_dir is None:
+                print(f"No saved episodes found under {self.buffer_dir}.", flush=True)
+                return
+
+            shutil.rmtree(latest_episode_dir)
+            print(f"Deleted {latest_episode_dir.name} from {latest_episode_dir}", flush=True)
+
     def run(self) -> None:
         self.buffer_dir.mkdir(parents=True, exist_ok=True)
 
@@ -147,7 +169,7 @@ class DataCollection:
             self._start_saving_indicator()
 
             print(f"Data collection ready. Episodes will be saved under {self.buffer_dir}", flush=True)
-            print("Press `k` to start recording, `l` to stop recording, Ctrl-C to exit.", flush=True)
+            print("Press `k` to start recording, `l` to stop recording, `d` to delete the latest episode, Ctrl-C to exit.", flush=True)
 
             while not self._shutdown_event.is_set():
                 time.sleep(0.2)
@@ -177,7 +199,7 @@ class DataCollection:
         if os.name != "posix":
             raise RuntimeError("The data collection keyboard listener currently supports POSIX terminals only.")
         if not sys.stdin.isatty():
-            raise RuntimeError("data_collection.py must be run from a real terminal to capture `k`/`l` input.")
+            raise RuntimeError("data_collection.py must be run from a real terminal to capture `k`/`l`/`d` input.")
         if self._keyboard_thread is not None and self._keyboard_thread.is_alive():
             return
 
@@ -211,6 +233,8 @@ class DataCollection:
                     self.start_recording()
                 elif key.lower() == "l":
                     self.stop_recording()
+                elif key.lower() == "d":
+                    self.delete_latest_episode()
             except Exception as exc:
                 print(f"Keyboard command failed: {exc}", flush=True)
 
@@ -251,6 +275,28 @@ class DataCollection:
         termios.tcsetattr(self._stdin_fd, termios.TCSADRAIN, self._terminal_settings)
         self._stdin_fd = None
         self._terminal_settings = None
+
+    def _find_latest_episode_dir(self) -> Path | None:
+        latest_episode_dir: Path | None = None
+        latest_episode_id = -1
+
+        if not self.buffer_dir.exists():
+            return None
+
+        for path in self.buffer_dir.iterdir():
+            if not path.is_dir() or not path.name.startswith("episode_"):
+                continue
+
+            try:
+                episode_id = int(path.name.split("_", maxsplit=1)[1])
+            except (IndexError, ValueError):
+                continue
+
+            if episode_id > latest_episode_id:
+                latest_episode_id = episode_id
+                latest_episode_dir = path
+
+        return latest_episode_dir
 
     @staticmethod
     def _format_save_summary(summary: dict[str, Any]) -> str:
@@ -304,8 +350,65 @@ class DataCollection:
             raise ValueError(f"`robot.data_sources.{source_name}.fps` must be positive.")
         return fps
 
-    def _resolve_buffer_size(self, source_cfg: dict[str, Any], source_name: str) -> int:
-        max_obs_window = 0
+    def _load_data_loader_key_cfgs(self) -> dict[str, dict[str, Any]]:
+        robot_cfg = self.contract.get("robot")
+        if not isinstance(robot_cfg, dict):
+            raise ValueError("The universal contract must contain a top-level `robot` mapping.")
+
+        data_loader_cfg = robot_cfg.get("data_loader")
+        if not isinstance(data_loader_cfg, dict):
+            raise ValueError("The universal contract must contain `robot.data_loader`.")
+
+        key_entries = data_loader_cfg.get("keys")
+        if not isinstance(key_entries, list) or not key_entries:
+            raise ValueError("`robot.data_loader.keys` must be a non-empty list.")
+
+        loader_key_cfgs: dict[str, dict[str, Any]] = {}
+        for key_entry in key_entries:
+            if not isinstance(key_entry, dict) or len(key_entry) != 1:
+                raise ValueError("Each entry in `robot.data_loader.keys` must be a single-key mapping.")
+
+            key_name, key_cfg = next(iter(key_entry.items()))
+            if not isinstance(key_cfg, dict):
+                raise ValueError(f"`robot.data_loader.keys.{key_name}` must map to a dictionary.")
+
+            loader_key_cfgs[str(key_name)] = key_cfg
+
+        return loader_key_cfgs
+
+    def _resolve_buffer_size(
+        self,
+        source_cfg: dict[str, Any],
+        source_name: str,
+    ) -> int:
+        source_key_names = self._source_key_names(source_cfg, source_name)
+        matching_spans = []
+        fallback_spans = []
+
+        for key_name, key_cfg in self.loader_key_cfgs.items():
+            obs_window = self._require_positive_int_field(
+                key_cfg,
+                f"robot.data_loader.keys.{key_name}.obs_window",
+            )
+            obs_dss = self._require_positive_int_field(
+                key_cfg,
+                f"robot.data_loader.keys.{key_name}.obs_dss",
+            )
+            observation_span = 1 + (obs_window - 1) * obs_dss
+            fallback_spans.append(observation_span)
+
+            if key_name in source_key_names:
+                matching_spans.append(observation_span)
+
+        spans = matching_spans if matching_spans else fallback_spans
+        if not spans:
+            raise ValueError("`robot.data_loader.keys` must define at least one observation key.")
+
+        return max(1, 3 * max(spans))
+
+    @staticmethod
+    def _source_key_names(source_cfg: dict[str, Any], source_name: str) -> set[str]:
+        source_keys: set[str] = set()
         for key_entry in source_cfg["keys"]:
             if not isinstance(key_entry, dict) or len(key_entry) != 1:
                 raise ValueError(
@@ -317,69 +420,21 @@ class DataCollection:
                 raise ValueError(
                     f"`robot.data_sources.{source_name}.keys.{key_name}` must map to a dictionary."
                 )
+            source_keys.add(str(key_name))
 
-            obs_window = self._resolve_source_key_int_field(
-                source_cfg,
-                source_name,
-                key_name,
-                key_cfg,
-                "obs_window",
-            )
-            max_obs_window = max(max_obs_window, obs_window)
-
-        return max(1, 3 * max_obs_window)
+        return source_keys
 
     @staticmethod
-    def _resolve_source_key_int_field(
-        source_cfg: dict[str, Any],
-        source_name: str,
-        key_name: str,
-        key_cfg: dict[str, Any],
-        field_name: str,
-    ) -> int:
-        field_value = key_cfg.get(field_name)
-        if field_value is not None:
-            return int(field_value)
+    def _require_positive_int_field(mapping: dict[str, Any], field_name: str) -> int:
+        leaf_name = field_name.rsplit(".", maxsplit=1)[-1]
+        if leaf_name not in mapping:
+            raise ValueError(f"`{field_name}` is required.")
 
-        align_to = key_cfg.get("align_to")
-        if align_to is None:
-            raise ValueError(
-                f"`robot.data_sources.{source_name}.keys.{key_name}.{field_name}` is required "
-                "to size the observer buffer."
-            )
+        value = int(mapping[leaf_name])
+        if value <= 0:
+            raise ValueError(f"`{field_name}` must be positive.")
 
-        aligned_key_cfg = DataCollection._lookup_source_key_cfg(source_cfg, source_name, str(align_to))
-        aligned_field_value = aligned_key_cfg.get(field_name)
-        if aligned_field_value is None:
-            raise ValueError(
-                f"`robot.data_sources.{source_name}.keys.{key_name}` aligns to '{align_to}', "
-                f"but `{field_name}` is missing there as well."
-            )
-
-        return int(aligned_field_value)
-
-    @staticmethod
-    def _lookup_source_key_cfg(
-        source_cfg: dict[str, Any],
-        source_name: str,
-        key_name: str,
-    ) -> dict[str, Any]:
-        for key_entry in source_cfg["keys"]:
-            if not isinstance(key_entry, dict) or len(key_entry) != 1:
-                continue
-
-            candidate_key_name, candidate_key_cfg = next(iter(key_entry.items()))
-            if candidate_key_name != key_name:
-                continue
-            if not isinstance(candidate_key_cfg, dict):
-                raise ValueError(
-                    f"`robot.data_sources.{source_name}.keys.{candidate_key_name}` must map to a dictionary."
-                )
-            return candidate_key_cfg
-
-        raise ValueError(
-            f"`robot.data_sources.{source_name}.keys.{key_name}` was not found in the universal contract."
-        )
+        return value
 
     @staticmethod
     def _load_contract(contract_path: Path) -> dict[str, Any]:

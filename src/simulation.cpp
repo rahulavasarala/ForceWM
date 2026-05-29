@@ -245,6 +245,8 @@ struct SnapshotBroker {
 
 SimulationContractConfig simulation_contract;
 std::unique_ptr<SnapshotBroker> snapshot_broker;
+std::string lowdim_metadata_redis_key;
+std::uint64_t lowdim_publish_seq = 0;
 
 // Initialization variables for robot control ---------------------
 
@@ -475,7 +477,8 @@ void convert_mujoco_depth_to_millimeters(
 }
 
 std::string make_rgb_camera_metadata_json(const CameraStreamConfig& camera,
-                                          const RenderSnapshot& snapshot) {
+                                          const RenderSnapshot& snapshot,
+                                          const bool is_complete) {
   std::ostringstream metadata_stream;
   metadata_stream << std::fixed << std::setprecision(17);
   metadata_stream << '{';
@@ -502,6 +505,8 @@ std::string make_rgb_camera_metadata_json(const CameraStreamConfig& camera,
   if (camera.encoding == "jpeg") {
     metadata_stream << ',' << '"' << "jpeg_quality" << '"' << ':' << 90;
   }
+  metadata_stream << ',' << '"' << "is_complete" << '"' << ':'
+                  << (is_complete ? "true" : "false");
   metadata_stream << ',' << '"' << "dropped_slots_total" << '"' << ':'
                   << camera.dropped_publish_slots;
   metadata_stream << '}';
@@ -510,7 +515,8 @@ std::string make_rgb_camera_metadata_json(const CameraStreamConfig& camera,
 
 std::string make_depth_camera_metadata_json(const CameraStreamConfig& camera,
                                             const DepthStreamConfig& depth_stream,
-                                            const RenderSnapshot& snapshot) {
+                                            const RenderSnapshot& snapshot,
+                                            const bool is_complete) {
   std::ostringstream metadata_stream;
   metadata_stream << std::fixed << std::setprecision(17);
   metadata_stream << '{';
@@ -538,10 +544,52 @@ std::string make_depth_camera_metadata_json(const CameraStreamConfig& camera,
                   << depth_stream.encoding << '"';
   metadata_stream << ',' << '"' << "unit" << '"' << ':' << '"'
                   << depth_stream.unit << '"';
+  metadata_stream << ',' << '"' << "is_complete" << '"' << ':'
+                  << (is_complete ? "true" : "false");
   metadata_stream << ',' << '"' << "dropped_slots_total" << '"' << ':'
                   << camera.dropped_publish_slots;
   metadata_stream << '}';
   return metadata_stream.str();
+}
+
+std::string make_lowdim_metadata_json(const std::uint64_t seq,
+                                      const mjtNum sim_time,
+                                      const double publish_wall_time_s) {
+  std::ostringstream metadata_stream;
+  metadata_stream << std::fixed << std::setprecision(17);
+  metadata_stream << '{';
+  metadata_stream << '"' << "seq" << '"' << ':' << seq;
+  metadata_stream << ',' << '"' << "type" << '"' << ':' << '"'
+                  << "lowdim" << '"';
+  metadata_stream << ',' << '"' << "sim_time_s" << '"' << ':'
+                  << sim_time;
+  metadata_stream << ',' << '"' << "publish_wall_time_s" << '"' << ':'
+                  << publish_wall_time_s;
+  metadata_stream << '}';
+  return metadata_stream.str();
+}
+
+void publish_lowdim_metadata(const std::uint64_t seq,
+                             const mjtNum sim_time,
+                             const double publish_wall_time_s) {
+  if (lowdim_metadata_redis_key.empty()) {
+    return;
+  }
+
+  redis_client.set(lowdim_metadata_redis_key,
+                   make_lowdim_metadata_json(seq, sim_time, publish_wall_time_s));
+}
+
+void publish_lowdim_state_to_redis(const mjModel* m, const mjData* d) {
+  const std::uint64_t seq = ++lowdim_publish_seq;
+  const double publish_wall_time_s = wall_time_now_seconds();
+  update_redis(redis_client, motion_force_task, force_space_particle_filter,
+               pfilter_output, m, d, kRobotDof, ee_force_sensor_id,
+               ee_torque_sensor_id, ee_sensor_site_id,
+               filtered_sensed_force_sensor_frame,
+               filtered_sensed_moment_sensor_frame,
+               sensed_wrench_filter_initialized);
+  publish_lowdim_metadata(seq, d->time, publish_wall_time_s);
 }
 
 void preflight_camera_publishers() {
@@ -726,12 +774,7 @@ void inference_time_callback(const mjModel* m, mjData* d) {
       m, d, ee_force_sensor_id, ee_torque_sensor_id, ee_sensor_site_id,
       kSensedWrenchLowPassAlpha, filtered_sensed_force_sensor_frame,
       filtered_sensed_moment_sensor_frame, sensed_wrench_filter_initialized);
-  update_redis(redis_client, motion_force_task, force_space_particle_filter,
-               pfilter_output, m,
-               d, kRobotDof, ee_force_sensor_id, ee_torque_sensor_id,
-               ee_sensor_site_id, filtered_sensed_force_sensor_frame,
-               filtered_sensed_moment_sensor_frame,
-               sensed_wrench_filter_initialized);
+  publish_lowdim_state_to_redis(m, d);
   query_redis_for_desired_state(redis_client, motion_force_task,
                                 pfilter_output.force_space_dimension,
                                 pfilter_output.force_or_motion_axis);
@@ -757,12 +800,7 @@ void data_collection_time_callback(const mjModel* m, mjData* d) {
       m, d, ee_force_sensor_id, ee_torque_sensor_id, ee_sensor_site_id,
       kSensedWrenchLowPassAlpha, filtered_sensed_force_sensor_frame,
       filtered_sensed_moment_sensor_frame, sensed_wrench_filter_initialized);
-  update_redis(redis_client, motion_force_task, force_space_particle_filter,
-               pfilter_output, m,
-               d, kRobotDof, ee_force_sensor_id, ee_torque_sensor_id,
-               ee_sensor_site_id, filtered_sensed_force_sensor_frame,
-               filtered_sensed_moment_sensor_frame,
-               sensed_wrench_filter_initialized);
+  publish_lowdim_state_to_redis(m, d);
   update_haptic_information(robot, control_link, redis_client, m, d,
                             ee_force_sensor_id, ee_torque_sensor_id,
                             ee_sensor_site_id,
@@ -1073,12 +1111,20 @@ void camera_thread_main(GLFWwindow* hidden_camera_window) {
 
         const auto redis_start_time = encode_end_time;
         camera_redis_client.set(
+            camera.metadata_redis_key,
+            make_rgb_camera_metadata_json(camera, snapshot, false));
+        if (camera.aligned_depth) {
+          const auto& depth_stream = *camera.aligned_depth;
+          camera_redis_client.set(
+              depth_stream.metadata_redis_key,
+              make_depth_camera_metadata_json(camera, depth_stream, snapshot,
+                                              false));
+        }
+        camera_redis_client.set(
             camera.redis_key,
             std::string(
                 reinterpret_cast<const char*>(camera.encoded_image_buffer.data()),
                 camera.encoded_image_buffer.size()));
-        camera_redis_client.set(camera.metadata_redis_key,
-                                make_rgb_camera_metadata_json(camera, snapshot));
         if (camera.aligned_depth) {
           const auto& depth_stream = *camera.aligned_depth;
           camera_redis_client.set(
@@ -1086,9 +1132,16 @@ void camera_thread_main(GLFWwindow* hidden_camera_window) {
               std::string(reinterpret_cast<const char*>(
                               depth_stream.encoded_depth_buffer.data()),
                           depth_stream.encoded_depth_buffer.size()));
+        }
+        camera_redis_client.set(camera.metadata_redis_key,
+                                make_rgb_camera_metadata_json(camera, snapshot,
+                                                              true));
+        if (camera.aligned_depth) {
+          const auto& depth_stream = *camera.aligned_depth;
           camera_redis_client.set(
               depth_stream.metadata_redis_key,
-              make_depth_camera_metadata_json(camera, depth_stream, snapshot));
+              make_depth_camera_metadata_json(camera, depth_stream, snapshot,
+                                              true));
         }
         const auto publish_end_time = std::chrono::steady_clock::now();
 
@@ -1170,6 +1223,8 @@ int main(int argc, char** argv) {
   const fs::path contract_path = startup_options->contract_path;
   try {
     simulation_contract = load_simulation_contract(contract_path);
+    lowdim_metadata_redis_key =
+        make_redis_key(simulation_contract.prefix, "lowdim::meta");
   } catch (const std::exception& exception) {
     std::cerr << "Failed to load simulation contract from "
               << contract_path.string() << ": " << exception.what() << "\n";

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Protocol
 
 import numpy as np
+import yaml
 
 
 DEFAULT_FR3_XML_PATH = Path(__file__).resolve().parents[1] / "models" / "fr3.xml"
@@ -38,6 +39,31 @@ class CameraCalibration:
 class ContactCylinderSpec:
     radius_m: float
     half_height_m: float
+
+
+@dataclass(frozen=True)
+class BottomSurfaceRingConfig:
+    radius_scale: float
+    num_points: int
+
+
+@dataclass(frozen=True)
+class BottomSurfaceConfig:
+    include_center: bool
+    concentric_rings: tuple[BottomSurfaceRingConfig, ...]
+
+
+@dataclass(frozen=True)
+class RingPointConfig:
+    height_fraction: float
+    num_points: int
+
+
+@dataclass(frozen=True)
+class SimplePointConfig:
+    bottom_surface: BottomSurfaceConfig
+    middle_ring: RingPointConfig
+    upper_ring: RingPointConfig
 
 
 @dataclass(frozen=True)
@@ -81,6 +107,128 @@ def _normalize(vector: np.ndarray) -> np.ndarray:
     if norm <= 1e-9:
         raise ValueError("Cannot normalize a near-zero vector.")
     return vector / norm
+
+
+def default_simple_point_config() -> SimplePointConfig:
+    return SimplePointConfig(
+        bottom_surface=BottomSurfaceConfig(
+            include_center=True,
+            concentric_rings=(
+                BottomSurfaceRingConfig(radius_scale=0.5, num_points=6),
+                BottomSurfaceRingConfig(radius_scale=1.0, num_points=8),
+            ),
+        ),
+        middle_ring=RingPointConfig(height_fraction=0.5, num_points=8),
+        upper_ring=RingPointConfig(height_fraction=1.0, num_points=8),
+    )
+
+
+def _validate_simple_point_config(point_config: SimplePointConfig) -> SimplePointConfig:
+    if not isinstance(point_config, SimplePointConfig):
+        raise TypeError("point_config must be a SimplePointConfig instance.")
+
+    bottom_surface = point_config.bottom_surface
+    if not isinstance(bottom_surface.include_center, bool):
+        raise ValueError("bottom_surface.include_center must be a boolean.")
+
+    total_surface_points = 1 if bottom_surface.include_center else 0
+    for ring_config in bottom_surface.concentric_rings:
+        if not 0.0 <= float(ring_config.radius_scale) <= 1.0:
+            raise ValueError("bottom_surface.concentric_rings[*].radius_scale must be in [0.0, 1.0].")
+        if int(ring_config.num_points) <= 0:
+            raise ValueError("bottom_surface.concentric_rings[*].num_points must be positive.")
+        total_surface_points += int(ring_config.num_points)
+
+    if total_surface_points <= 0:
+        raise ValueError("bottom_surface must define at least one point.")
+
+    for name, ring_config in (
+        ("middle_ring", point_config.middle_ring),
+        ("upper_ring", point_config.upper_ring),
+    ):
+        if not 0.0 <= float(ring_config.height_fraction) <= 1.0:
+            raise ValueError(f"{name}.height_fraction must be in [0.0, 1.0].")
+        if int(ring_config.num_points) <= 0:
+            raise ValueError(f"{name}.num_points must be positive.")
+
+    return point_config
+
+
+def load_point_config(point_config_path: str | Path | None = None) -> SimplePointConfig:
+    if point_config_path is None:
+        return default_simple_point_config()
+
+    point_config_path = Path(point_config_path).expanduser().resolve()
+    if not point_config_path.exists():
+        raise FileNotFoundError(f"Point-config file does not exist: {point_config_path}")
+
+    with point_config_path.open("r", encoding="utf-8") as handle:
+        raw_config = yaml.safe_load(handle) or {}
+
+    if not isinstance(raw_config, dict):
+        raise ValueError(f"Point-config at {point_config_path} must contain a top-level mapping.")
+
+    def require_mapping(parent: dict, field_name: str) -> dict:
+        value = parent.get(field_name)
+        if not isinstance(value, dict):
+            raise ValueError(f"`{field_name}` must be a mapping in {point_config_path}.")
+        return value
+
+    def require_bool(parent: dict, field_name: str) -> bool:
+        value = parent.get(field_name)
+        if not isinstance(value, bool):
+            raise ValueError(f"`{field_name}` must be a boolean in {point_config_path}.")
+        return value
+
+    def require_positive_int(parent: dict, field_name: str) -> int:
+        if field_name not in parent:
+            raise ValueError(f"`{field_name}` is required in {point_config_path}.")
+        value = int(parent[field_name])
+        if value <= 0:
+            raise ValueError(f"`{field_name}` must be positive in {point_config_path}.")
+        return value
+
+    def require_fraction(parent: dict, field_name: str) -> float:
+        if field_name not in parent:
+            raise ValueError(f"`{field_name}` is required in {point_config_path}.")
+        value = float(parent[field_name])
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"`{field_name}` must be in [0.0, 1.0] in {point_config_path}.")
+        return value
+
+    bottom_surface_raw = require_mapping(raw_config, "bottom_surface")
+    ring_entries = bottom_surface_raw.get("concentric_rings")
+    if not isinstance(ring_entries, list):
+        raise ValueError(f"`bottom_surface.concentric_rings` must be a list in {point_config_path}.")
+
+    bottom_surface = BottomSurfaceConfig(
+        include_center=require_bool(bottom_surface_raw, "include_center"),
+        concentric_rings=tuple(
+            BottomSurfaceRingConfig(
+                radius_scale=require_fraction(ring_raw, "radius_scale"),
+                num_points=require_positive_int(ring_raw, "num_points"),
+            )
+            for ring_raw in ring_entries
+            if isinstance(ring_raw, dict)
+        ),
+    )
+    if len(bottom_surface.concentric_rings) != len(ring_entries):
+        raise ValueError(f"Each entry in `bottom_surface.concentric_rings` must be a mapping in {point_config_path}.")
+
+    middle_ring_raw = require_mapping(raw_config, "middle_ring")
+    upper_ring_raw = require_mapping(raw_config, "upper_ring")
+    point_config = SimplePointConfig(
+        bottom_surface=bottom_surface,
+        middle_ring=RingPointConfig(
+            height_fraction=require_fraction(middle_ring_raw, "height_fraction"),
+            num_points=require_positive_int(middle_ring_raw, "num_points"),
+        ),
+        upper_ring=RingPointConfig(
+            height_fraction=require_fraction(upper_ring_raw, "height_fraction"),
+            num_points=require_positive_int(upper_ring_raw, "num_points"),
+        ),
+    )
+    return _validate_simple_point_config(point_config)
 
 
 def parse_mujoco_float_vector(raw_value: str, expected_length: int, field_name: str) -> np.ndarray:
@@ -200,6 +348,100 @@ def generate_contact_candidate_points(
             point_index += 1
 
     return local_points, local_normals
+
+
+def _sample_circle_points(radius_m: float, z_height_m: float, num_points: int) -> np.ndarray:
+    if num_points <= 0:
+        raise ValueError("num_points must be positive when sampling a circle.")
+
+    thetas = np.linspace(0.0, 2.0 * math.pi, int(num_points), endpoint=False, dtype=np.float64)
+    circle_points = np.empty((int(num_points), 3), dtype=np.float32)
+    for point_index, theta in enumerate(thetas):
+        circle_points[point_index] = np.array(
+            [
+                float(radius_m) * float(math.cos(theta)),
+                float(radius_m) * float(math.sin(theta)),
+                float(z_height_m),
+            ],
+            dtype=np.float32,
+        )
+    return circle_points
+
+
+def generate_simple_point_template(
+    contact_spec: ContactCylinderSpec,
+    point_config: SimplePointConfig | None = None,
+) -> np.ndarray:
+    point_config = _validate_simple_point_config(
+        default_simple_point_config() if point_config is None else point_config
+    )
+
+    local_points: list[np.ndarray] = []
+    # The recorded eef_pos comes from the motion-force task control point,
+    # which is placed on the contact face of the EE cylinder. Anchor the
+    # synthetic template at that face so the bottom surface sits at z=0 and
+    # the side rings span the full cylinder height away from the anchor.
+    bottom_z = 0.0
+    full_height = 2.0 * float(contact_spec.half_height_m)
+
+    if point_config.bottom_surface.include_center:
+        local_points.append(np.array([0.0, 0.0, bottom_z], dtype=np.float32))
+
+    for ring_config in point_config.bottom_surface.concentric_rings:
+        local_points.append(
+            _sample_circle_points(
+                radius_m=float(ring_config.radius_scale) * float(contact_spec.radius_m),
+                z_height_m=bottom_z,
+                num_points=int(ring_config.num_points),
+            )
+        )
+
+    for ring_config in (point_config.middle_ring, point_config.upper_ring):
+        ring_z = -float(ring_config.height_fraction) * full_height
+        local_points.append(
+            _sample_circle_points(
+                radius_m=float(contact_spec.radius_m),
+                z_height_m=ring_z,
+                num_points=int(ring_config.num_points),
+            )
+        )
+
+    if not local_points:
+        raise ValueError("Synthetic point template must contain at least one point.")
+
+    return np.concatenate(
+        [
+            point_block[None, :]
+            if isinstance(point_block, np.ndarray) and point_block.ndim == 1
+            else np.asarray(point_block, dtype=np.float32)
+            for point_block in local_points
+        ],
+        axis=0,
+    ).astype(np.float32)
+
+
+def generate_points_simple(
+    positions_world: np.ndarray,
+    orientations_world: np.ndarray,
+    contact_spec: ContactCylinderSpec,
+    point_config: SimplePointConfig | None = None,
+) -> np.ndarray:
+    positions_world = np.asarray(positions_world, dtype=np.float32)
+    orientations_world = np.asarray(orientations_world, dtype=np.float32)
+    if positions_world.ndim != 2 or positions_world.shape[1] != 3:
+        raise ValueError(f"`positions_world` must have shape (T, 3), got {positions_world.shape}.")
+    if orientations_world.ndim != 3 or orientations_world.shape[1:] != (3, 3):
+        raise ValueError(f"`orientations_world` must have shape (T, 3, 3), got {orientations_world.shape}.")
+    if len(positions_world) != len(orientations_world):
+        raise ValueError("positions_world and orientations_world must have matching lengths.")
+
+    local_template = generate_simple_point_template(contact_spec, point_config=point_config)
+    if not np.all(np.isfinite(positions_world)) or not np.all(np.isfinite(orientations_world)):
+        raise ValueError("Synthetic point generation expects finite positions and orientations.")
+
+    world_points = np.einsum("pj,tij->tpi", local_template.astype(np.float64), orientations_world.astype(np.float64))
+    world_points = world_points + positions_world[:, None, :].astype(np.float64)
+    return world_points.astype(np.float32)
 
 
 def project_world_points_to_pixels(

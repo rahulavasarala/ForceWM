@@ -12,25 +12,31 @@ robot:
       keys: 
         - eef_pos:
             redis: "current_cartesian_position"
-            obs_window: 2
-            obs_dss : 3
-            dim: [3]
         - eef_ori:
             redis: "current_cartesian_orientation"
-            obs_window: 2
-            obs_dss : 3
-            dim: [3, 3]
+        - desired_eef_pos:
+            redis: "desired_cartesian_position"
+        - desired_eef_ori:
+            redis: "desired_cartesian_orientation"
+        - desired_force_magnitude:
+            redis: "desired_force_magnitude"
+        - force_dimension:
+            redis: "force_dimension"
+        - motion_or_force_axis:
+            redis: "force_or_motion_axis"
+        - sensed_force:
+            redis: "sensed_force"
+        - sensed_moment:
+            redis: "sensed_moment"
     visual: #This could contain rgb and depth data 
       fps: 30
       keys:
         - camera_01:
             type: "rgb"
             mujoco_camera_name: "stationary_camera"
+            dim: [224, 224, 3]
             can: 0
             serial_number: 123456
-            dim: [224, 224, 3]
-            obs_window: 2
-            obs_dss: 3
         - camera_01_depth:
             type: "depth"
             source: "sim"
@@ -38,12 +44,56 @@ robot:
             unit: "mm"
             dim: [224, 224, 1]
             align_to: "camera_01"
-  action:
-    dss: 3
-    window: 8
+  action_labels:
+    current_position_key: "eef_pos"
+    current_orientation_key: "eef_ori"
+    desired_position_key: "desired_eef_pos"
+    desired_orientation_key: "desired_eef_ori"
+    desired_force_magnitude_key: "desired_force_magnitude"
+    frame: "female_part"
+    orientation_encoding: "rotvec"
+    target_resample: "hold_last"
+  data_loader:
     keys:
-      robot_pos:
-        source: eef_pos
-      robot_ori:
-        source: eef_ori
-    mode: "relative"
+      - camera_01_depth:
+          obs_window: 3
+          obs_dss: 1
+          # dim: [10, 3]
+      - force_dimension:
+          obs_window: 3
+          obs_dss: 1
+          # dim: [10, 3]
+      - motion_or_force_axis:
+          obs_window: 3
+          obs_dss: 1
+          # dim: [10, 3]  
+      - force_dimension:
+          obs_window: 3
+          obs_dss: 1
+          # dim: [10, 3]
+      - motion_or_force_axis:
+          obs_window: 3
+          obs_dss: 1
+      - action_delta_pos:
+          obs_window: 3
+          obs_dss: 1
+      - action_delta_rotvec:
+          obs_window: 3
+          obs_dss: 1
+      - action_force_magnitude:
+          obs_window: 3
+          obs_dss: 1
+      - sensed_force:
+          obs_window: 3
+          obs_dss: 1
+      - sensed_moment:
+          obs_window: 3
+          obs_dss: 1
+  
+    prediction:
+      mode: relative # absolute or relative
+      window: 3
+      dss: 1
+      dim: [10, 3]
+
+    

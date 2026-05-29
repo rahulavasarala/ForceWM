@@ -1,7 +1,23 @@
+from __future__ import annotations
+
 import argparse
-import numpy as np
+
 import matplotlib.pyplot as plt
-from dataset import MultiModalDataset
+import numpy as np
+from matplotlib.lines import Line2D
+
+from dataset import MultiModalDataset, POINT_CLOUD_MASK_SUFFIX
+
+FIXED_AXIS_LIMIT = 0.2
+AXIS_PANEL_LIMIT = 1.15
+FORCE_VECTOR_SCALE_M_PER_N = 0.01
+MAX_FORCE_VECTOR_LENGTH = 0.12
+MAX_ACTION_VECTOR_LENGTH = 0.16
+
+FORCE_DIMENSION_KEY = "force_dimension"
+MOTION_OR_FORCE_AXIS_KEYS = ("motion_or_force_axis", "force_or_motion_axis")
+SENSED_FORCE_KEY = "sensed_force"
+ACTION_DELTA_POS_KEY = "action_delta_pos"
 
 
 def _to_numpy(value):
@@ -14,210 +30,507 @@ def _to_numpy(value):
     return np.asarray(value)
 
 
-def _quat_to_direction(quaternions):
-    quaternions = np.asarray(quaternions, dtype=np.float32)
-    if quaternions.ndim != 2 or quaternions.shape[-1] != 4:
-        raise ValueError(
-            f"Expected quaternions with shape (T, 4), got {quaternions.shape}."
-        )
-
-    norms = np.linalg.norm(quaternions, axis=-1, keepdims=True)
-    norms = np.clip(norms, a_min=1e-8, a_max=None)
-    quaternions = quaternions / norms
-
-    x = quaternions[:, 0]
-    y = quaternions[:, 1]
-    z = quaternions[:, 2]
-    w = quaternions[:, 3]
-
-    # Rotate the unit x-axis by each quaternion so orientation can be shown as a 3D arrow.
-    direction = np.stack(
-        [
-            1.0 - 2.0 * (y * y + z * z),
-            2.0 * (x * y + z * w),
-            2.0 * (x * z - y * w),
-        ],
-        axis=-1,
-    )
-    return direction
-
-
-def _episode_bounds(episode_ends):
-    starts = np.concatenate(([0], episode_ends[:-1] + 1))
-    return list(zip(starts.tolist(), episode_ends.tolist()))
-
-
-def _build_samples_by_episode(test_dataset, num_samples, rng):
-    samples_by_episode = []
-    for episode_index, (start, end) in enumerate(_episode_bounds(test_dataset.episode_ends)):
-        frame_indices = np.arange(start, end + 1)
-        sample_count = min(num_samples, len(frame_indices))
-        chosen_indices = rng.choice(frame_indices, size=sample_count, replace=False)
-        chosen_indices = np.sort(chosen_indices)
-
-        episode_samples = []
-        for dataset_index in chosen_indices:
-            sample = test_dataset[int(dataset_index)]
-            episode_samples.append(
-                {
-                    "dataset_index": int(dataset_index),
-                    "episode_index": episode_index,
-                    "episode_start": int(start),
-                    "episode_end": int(end),
-                    "obs_pos": _to_numpy(sample["obs"]["eef_pos"]),
-                    "obs_ori": _to_numpy(sample["obs"]["eef_ori"]),
-                    "action_pos": _to_numpy(sample["actions"]["eef_pos"]),
-                    "action_ori": _to_numpy(sample["actions"]["eef_ori"]),
-                }
-            )
-
-        samples_by_episode.append(episode_samples)
-
-    return samples_by_episode
-
-
-def _compute_plot_limits(sample):
-    points = np.concatenate([sample["obs_pos"], sample["action_pos"]], axis=0)
-    mins = points.min(axis=0)
-    maxs = points.max(axis=0)
-    center = (mins + maxs) / 2.0
-    extent = np.max(maxs - mins)
-    half_range = max(extent / 2.0, 0.05) * 1.2
-    return center, half_range
-
-
-def _draw_sample(ax, sample, sample_index, total_samples):
-    obs_pos = sample["obs_pos"]
-    action_pos = sample["action_pos"]
-    obs_dir = _quat_to_direction(sample["obs_ori"])
-    action_dir = _quat_to_direction(sample["action_ori"])
-
-    ax.clear()
-    ax.plot(
-        obs_pos[:, 0],
-        obs_pos[:, 1],
-        obs_pos[:, 2],
-        color="tab:blue",
-        marker="o",
-        linewidth=2,
-        label="Observation positions",
-    )
-    ax.plot(
-        action_pos[:, 0],
-        action_pos[:, 1],
-        action_pos[:, 2],
-        color="tab:orange",
-        marker="^",
-        linewidth=2,
-        linestyle="--",
-        label="Action positions",
-    )
-
-    ax.quiver(
-        obs_pos[:, 0],
-        obs_pos[:, 1],
-        obs_pos[:, 2],
-        obs_dir[:, 0],
-        obs_dir[:, 1],
-        obs_dir[:, 2],
-        length=0.03,
-        color="tab:blue",
-        normalize=True,
-    )
-    ax.quiver(
-        action_pos[:, 0],
-        action_pos[:, 1],
-        action_pos[:, 2],
-        action_dir[:, 0],
-        action_dir[:, 1],
-        action_dir[:, 2],
-        length=0.03,
-        color="tab:orange",
-        normalize=True,
-    )
-
-    center, half_range = _compute_plot_limits(sample)
-    ax.set_xlim(center[0] - half_range, center[0] + half_range)
-    ax.set_ylim(center[1] - half_range, center[1] + half_range)
-    ax.set_zlim(center[2] - half_range, center[2] + half_range)
-    ax.set_box_aspect((1, 1, 1))
-    ax.set_xlabel("X")
-    ax.set_ylabel("Y")
-    ax.set_zlabel("Z")
-    ax.legend(loc="upper right")
-    ax.set_title(
-        "Dataset Visualization\n"
-        f"Episode {sample['episode_index']} | Frame {sample['dataset_index']} "
-        f"({sample['episode_start']}-{sample['episode_end']}) | "
-        f"Sample {sample_index + 1}/{total_samples}"
-    )
-    ax.text2D(
-        0.02,
-        0.02,
-        "Press space for next sample, left/right to navigate, q to quit.",
-        transform=ax.transAxes,
-    )
-
-
-def visualize_dataset(test_dataset, num_samples):
-    # test_dataset is of the form -------
-    # test_dataset = MultiModalDataset(dataset_path, universal_contract= contract_path)
-
-    # sample random frames from each episode and then visualize the points, orientations, and
-    # actions (orientations and positions) in matplotlib as a 3D graph.
-    if num_samples <= 0:
-        raise ValueError("`num_samples` must be a positive integer.")
-
-    episode_ends = test_dataset.episode_ends
-
-    if len(episode_ends) == 0:
-        raise ValueError("The dataset has no episodes to visualize.")
+def _resolve_dataset_index(dataset: MultiModalDataset, requested_index: int | None) -> int:
+    if requested_index is not None:
+        dataset_index = int(requested_index)
+        if dataset_index < 0 or dataset_index >= len(dataset):
+            raise IndexError(f"Index {dataset_index} is out of bounds for dataset with {len(dataset)} rows")
+        return dataset_index
 
     rng = np.random.default_rng()
-    samples_by_episode = _build_samples_by_episode(test_dataset, num_samples, rng)
-    non_empty_samples = [episode_samples for episode_samples in samples_by_episode if episode_samples]
-    if not non_empty_samples:
-        raise ValueError("Unable to collect any samples from the dataset.")
+    return int(rng.integers(0, len(dataset)))
 
-    ordered_samples = [sample for episode_samples in non_empty_samples for sample in episode_samples]
 
-    figure = plt.figure(figsize=(10, 8))
-    axis = figure.add_subplot(111, projection="3d")
-    state = {"index": 0}
+def _select_point_cloud_key(dataset: MultiModalDataset) -> str:
+    if not dataset.point_cloud_keys:
+        raise ValueError("The dataset does not expose any point-cloud observation keys.")
+    return dataset.point_cloud_keys[0]
 
-    def redraw():
-        sample = ordered_samples[state["index"]]
-        _draw_sample(axis, sample, state["index"], len(ordered_samples))
+
+def _split_depth_and_ee_points(valid_points: np.ndarray) -> tuple[np.ndarray | None, np.ndarray]:
+    if len(valid_points) == 0:
+        return None, np.empty((0, 3), dtype=np.float32)
+
+    ee_point = np.asarray(valid_points[0], dtype=np.float32)
+    depth_points = np.asarray(valid_points[1:], dtype=np.float32)
+    return ee_point, depth_points
+
+
+def _format_vector(vector: np.ndarray | None) -> str:
+    if vector is None:
+        return "n/a"
+    return np.array2string(
+        np.asarray(vector, dtype=np.float32).reshape(3),
+        precision=4,
+        suppress_small=True,
+        floatmode="fixed",
+    )
+
+
+def _normalize_axis(vector: np.ndarray) -> np.ndarray:
+    axis = np.asarray(vector, dtype=np.float64).reshape(3)
+    norm = float(np.linalg.norm(axis))
+    if norm <= 1e-9:
+        return np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    return axis / norm
+
+
+def _orthonormal_complement(axis: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    axis = _normalize_axis(axis)
+    reference = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    if abs(float(np.dot(axis, reference))) > 0.9:
+        reference = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+
+    basis_1 = reference - float(np.dot(reference, axis)) * axis
+    basis_1 = _normalize_axis(basis_1)
+    basis_2 = _normalize_axis(np.cross(axis, basis_1))
+    return basis_1, basis_2
+
+
+def _axis_visualization(force_dimension: int, axis: np.ndarray) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    world_axes = [
+        np.array([1.0, 0.0, 0.0], dtype=np.float64),
+        np.array([0.0, 1.0, 0.0], dtype=np.float64),
+        np.array([0.0, 0.0, 1.0], dtype=np.float64),
+    ]
+
+    if force_dimension <= 0:
+        return world_axes, []
+    if force_dimension >= 3:
+        return [], world_axes
+
+    axis = _normalize_axis(axis)
+    orthogonal_1, orthogonal_2 = _orthonormal_complement(axis)
+    if force_dimension == 1:
+        return [orthogonal_1, orthogonal_2], [axis]
+    return [axis], [orthogonal_1, orthogonal_2]
+
+
+def _extract_latest_obs_value(sample: dict, key_candidates: str | tuple[str, ...]) -> np.ndarray | None:
+    obs_dict = sample["obs_dict"]
+    candidate_names = (key_candidates,) if isinstance(key_candidates, str) else tuple(key_candidates)
+
+    for key_name in candidate_names:
+        if key_name not in obs_dict:
+            continue
+
+        value = _to_numpy(obs_dict[key_name])
+        value = np.asarray(value)
+        if value.ndim == 0:
+            return value
+        if value.shape[0] == 0:
+            return None
+        return np.asarray(value[-1])
+
+    return None
+
+
+def _extract_latest_scalar(sample: dict, key_candidates: str | tuple[str, ...]) -> int | None:
+    value = _extract_latest_obs_value(sample, key_candidates)
+    if value is None:
+        return None
+
+    flat_value = np.asarray(value).reshape(-1)
+    if flat_value.size != 1:
+        raise ValueError(f"Expected scalar value for {key_candidates}, got shape {np.asarray(value).shape}.")
+    return int(flat_value[0])
+
+
+def _extract_latest_vector(
+    sample: dict,
+    key_candidates: str | tuple[str, ...],
+    *,
+    length: int = 3,
+) -> np.ndarray | None:
+    value = _extract_latest_obs_value(sample, key_candidates)
+    if value is None:
+        return None
+
+    flat_value = np.asarray(value, dtype=np.float32).reshape(-1)
+    if flat_value.size != length:
+        raise ValueError(
+            f"Expected {length} values for {key_candidates}, got shape {np.asarray(value).shape}."
+        )
+    return flat_value
+
+
+def _scaled_force_vector(force_vector: np.ndarray | None) -> np.ndarray | None:
+    if force_vector is None:
+        return None
+
+    scaled_force = np.asarray(force_vector, dtype=np.float32) * np.float32(FORCE_VECTOR_SCALE_M_PER_N)
+    norm = float(np.linalg.norm(scaled_force))
+    if norm <= 1e-9:
+        return scaled_force
+    if norm > MAX_FORCE_VECTOR_LENGTH:
+        scaled_force = scaled_force / norm * np.float32(MAX_FORCE_VECTOR_LENGTH)
+    return scaled_force.astype(np.float32, copy=False)
+
+
+def _clamp_vector_length(vector: np.ndarray | None, max_length: float) -> np.ndarray | None:
+    if vector is None:
+        return None
+
+    clipped = np.asarray(vector, dtype=np.float32)
+    norm = float(np.linalg.norm(clipped))
+    if norm <= 1e-9 or norm <= max_length:
+        return clipped
+    return (clipped / norm * np.float32(max_length)).astype(np.float32, copy=False)
+
+
+def _load_point_cloud_sample(
+    dataset: MultiModalDataset,
+    dataset_index: int,
+) -> tuple[dict, str, np.ndarray, np.ndarray, int, int, int, np.ndarray]:
+    point_cloud_key = _select_point_cloud_key(dataset)
+    sample = dataset[dataset_index]
+    point_clouds = _to_numpy(sample["obs_dict"][point_cloud_key]).astype(np.float32, copy=False)
+    point_cloud_mask = _to_numpy(
+        sample["obs_dict"][f"{point_cloud_key}{POINT_CLOUD_MASK_SUFFIX}"]
+    ).astype(bool, copy=False)
+
+    if point_clouds.ndim != 3 or point_clouds.shape[-1] != 3:
+        raise ValueError(
+            f"Expected `{point_cloud_key}` to have shape (T, P, 3), got {point_clouds.shape}."
+        )
+    if point_cloud_mask.shape != point_clouds.shape[:2]:
+        raise ValueError(
+            f"Expected `{point_cloud_key}{POINT_CLOUD_MASK_SUFFIX}` to have shape {point_clouds.shape[:2]}, "
+            f"got {point_cloud_mask.shape}."
+        )
+
+    episode_index, episode_start, episode_end = dataset.get_episode_bounds(dataset_index)
+    point_counts = point_cloud_mask.sum(axis=1).astype(np.int64)
+
+    return (
+        sample,
+        point_cloud_key,
+        point_clouds,
+        point_cloud_mask,
+        episode_index,
+        episode_start,
+        episode_end,
+        point_counts,
+    )
+
+
+def _draw_vector(
+    axis,
+    *,
+    origin: np.ndarray,
+    vector: np.ndarray | None,
+    color: str,
+    label: str,
+    linewidth: float = 2.4,
+) -> None:
+    if vector is None:
+        return
+
+    vector = np.asarray(vector, dtype=np.float32).reshape(3)
+    if float(np.linalg.norm(vector)) <= 1e-9:
+        return
+
+    axis.quiver(
+        float(origin[0]),
+        float(origin[1]),
+        float(origin[2]),
+        float(vector[0]),
+        float(vector[1]),
+        float(vector[2]),
+        color=color,
+        linewidth=linewidth,
+        arrow_length_ratio=0.18,
+        label=label,
+    )
+
+
+def _draw_force_motion_axis_panel(
+    axis,
+    *,
+    force_dimension: int | None,
+    motion_or_force_axis: np.ndarray | None,
+    sensed_force: np.ndarray | None,
+    action_delta_pos: np.ndarray | None,
+) -> None:
+    axis.clear()
+
+    world_axes = [
+        np.array([1.0, 0.0, 0.0], dtype=np.float64),
+        np.array([0.0, 1.0, 0.0], dtype=np.float64),
+        np.array([0.0, 0.0, 1.0], dtype=np.float64),
+    ]
+    for axis_index, basis_axis in enumerate(world_axes):
+        axis.plot(
+            [-basis_axis[0], basis_axis[0]],
+            [-basis_axis[1], basis_axis[1]],
+            [-basis_axis[2], basis_axis[2]],
+            linestyle="--",
+            linewidth=1.2,
+            color="0.7",
+        )
+        axis.text(
+            1.08 * basis_axis[0],
+            1.08 * basis_axis[1],
+            1.08 * basis_axis[2],
+            f"e{axis_index + 1}",
+            color="0.45",
+        )
+
+    if force_dimension is not None and motion_or_force_axis is not None:
+        motion_axes, force_axes = _axis_visualization(force_dimension, motion_or_force_axis)
+    else:
+        motion_axes, force_axes = [], []
+
+    for basis_axis in motion_axes:
+        axis.quiver(
+            0.0,
+            0.0,
+            0.0,
+            basis_axis[0],
+            basis_axis[1],
+            basis_axis[2],
+            length=0.95,
+            normalize=True,
+            color="royalblue",
+            linewidth=2.8,
+        )
+        axis.quiver(
+            0.0,
+            0.0,
+            0.0,
+            -basis_axis[0],
+            -basis_axis[1],
+            -basis_axis[2],
+            length=0.95,
+            normalize=True,
+            color="royalblue",
+            linewidth=1.6,
+            alpha=0.45,
+        )
+
+    for basis_axis in force_axes:
+        axis.quiver(
+            0.0,
+            0.0,
+            0.0,
+            basis_axis[0],
+            basis_axis[1],
+            basis_axis[2],
+            length=0.95,
+            normalize=True,
+            color="crimson",
+            linewidth=2.8,
+        )
+        axis.quiver(
+            0.0,
+            0.0,
+            0.0,
+            -basis_axis[0],
+            -basis_axis[1],
+            -basis_axis[2],
+            length=0.95,
+            normalize=True,
+            color="crimson",
+            linewidth=1.6,
+            alpha=0.45,
+        )
+
+    axis.set_xlim(-AXIS_PANEL_LIMIT, AXIS_PANEL_LIMIT)
+    axis.set_ylim(-AXIS_PANEL_LIMIT, AXIS_PANEL_LIMIT)
+    axis.set_zlim(-AXIS_PANEL_LIMIT, AXIS_PANEL_LIMIT)
+    axis.set_box_aspect((1, 1, 1))
+    axis.set_xticks([])
+    axis.set_yticks([])
+    axis.set_zticks([])
+    axis.set_title("Force / Motion Axes", fontsize=11)
+    axis.legend(
+        handles=[
+            Line2D([0], [0], color="0.7", linestyle="--", linewidth=1.4, label="World basis"),
+            Line2D([0], [0], color="royalblue", linewidth=2.8, label="Motion axis"),
+            Line2D([0], [0], color="crimson", linewidth=2.8, label="Force axis"),
+        ],
+        loc="upper left",
+        fontsize=8,
+        frameon=True,
+    )
+
+    info_lines = [
+        f"fdim: {force_dimension if force_dimension is not None else 'n/a'}",
+        f"axis: {_format_vector(motion_or_force_axis)}",
+        f"sensed_force: {_format_vector(sensed_force)}",
+        f"action_dpos: {_format_vector(action_delta_pos)}",
+        f"force scale: {FORCE_VECTOR_SCALE_M_PER_N:.3f} m/N",
+    ]
+    axis.text2D(
+        0.02,
+        0.02,
+        "\n".join(info_lines),
+        transform=axis.transAxes,
+        va="bottom",
+        ha="left",
+        family="monospace",
+        fontsize=8,
+    )
+
+
+def _draw_point_cloud_sample(
+    point_cloud_axis,
+    side_axis,
+    dataset: MultiModalDataset,
+    dataset_index: int,
+    *,
+    show_history: bool,
+) -> None:
+    (
+        sample,
+        point_cloud_key,
+        point_clouds,
+        point_cloud_mask,
+        episode_index,
+        episode_start,
+        episode_end,
+        point_counts,
+    ) = _load_point_cloud_sample(dataset, dataset_index)
+    force_dimension = _extract_latest_scalar(sample, FORCE_DIMENSION_KEY)
+    motion_or_force_axis = _extract_latest_vector(sample, MOTION_OR_FORCE_AXIS_KEYS)
+    sensed_force = _extract_latest_vector(sample, SENSED_FORCE_KEY)
+    action_delta_pos = _extract_latest_vector(sample, ACTION_DELTA_POS_KEY)
+
+    timesteps_to_draw = list(range(point_clouds.shape[0])) if show_history else [point_clouds.shape[0] - 1]
+    mode_name = "history" if show_history else "latest-only"
+
+    print(
+        f"Visualizing dataset index {dataset_index} | "
+        f"episode {episode_index} ({episode_start}-{episode_end}) | "
+        f"mode={mode_name} | obs steps={point_clouds.shape[0]} | point counts={point_counts.tolist()}",
+        flush=True,
+    )
+
+    point_cloud_axis.clear()
+    color_map = plt.get_cmap("viridis", point_clouds.shape[0])
+    latest_valid_points = point_clouds[-1][point_cloud_mask[-1]]
+    latest_ee_point, _ = _split_depth_and_ee_points(latest_valid_points)
+
+    ee_label_drawn = False
+    for timestep in timesteps_to_draw:
+        valid_points = point_clouds[timestep][point_cloud_mask[timestep]]
+        if len(valid_points) == 0:
+            continue
+        ee_point, depth_points = _split_depth_and_ee_points(valid_points)
+
+        if len(depth_points) != 0:
+            point_cloud_axis.scatter(
+                depth_points[:, 0],
+                depth_points[:, 1],
+                depth_points[:, 2],
+                s=18,
+                alpha=0.85,
+                color=color_map(timestep),
+                label=f"t={timestep} depth ({len(depth_points)} pts)",
+            )
+
+        if ee_point is not None:
+            point_cloud_axis.scatter(
+                [ee_point[0]],
+                [ee_point[1]],
+                [ee_point[2]],
+                s=85,
+                alpha=1.0 if timestep == timesteps_to_draw[-1] else 0.55,
+                color="red",
+                edgecolors="black",
+                linewidths=0.8,
+                label="End effector" if not ee_label_drawn else None,
+            )
+            ee_label_drawn = True
+
+    if latest_ee_point is not None:
+        _draw_vector(
+            point_cloud_axis,
+            origin=latest_ee_point,
+            vector=_scaled_force_vector(sensed_force),
+            color="darkorange",
+            label="Sensed force",
+        )
+        _draw_vector(
+            point_cloud_axis,
+            origin=latest_ee_point,
+            vector=_clamp_vector_length(action_delta_pos, MAX_ACTION_VECTOR_LENGTH),
+            color="limegreen",
+            label="Action delta pos",
+        )
+
+    point_cloud_axis.set_xlim(-FIXED_AXIS_LIMIT, FIXED_AXIS_LIMIT)
+    point_cloud_axis.set_ylim(-FIXED_AXIS_LIMIT, FIXED_AXIS_LIMIT)
+    point_cloud_axis.set_zlim(-FIXED_AXIS_LIMIT, FIXED_AXIS_LIMIT)
+    point_cloud_axis.set_box_aspect((1, 1, 1))
+    point_cloud_axis.set_xlabel("X")
+    point_cloud_axis.set_ylabel("Y")
+    point_cloud_axis.set_zlabel("Z")
+    point_cloud_axis.legend(loc="upper right", fontsize=8)
+    point_cloud_axis.set_title(
+        "Depth Point-Cloud Observation Stack\n"
+        f"Key: {point_cloud_key} | Mode: {mode_name} | Index: {dataset_index} | "
+        f"Episode: {episode_index} ({episode_start}-{episode_end})"
+    )
+    point_cloud_axis.text2D(
+        0.02,
+        0.02,
+        "Space/right: next | left/backspace: previous | h: toggle history | q/esc: quit",
+        transform=point_cloud_axis.transAxes,
+    )
+    _draw_force_motion_axis_panel(
+        side_axis,
+        force_dimension=force_dimension,
+        motion_or_force_axis=motion_or_force_axis,
+        sensed_force=sensed_force,
+        action_delta_pos=action_delta_pos,
+    )
+
+
+def visualize_dataset_browser(dataset: MultiModalDataset, start_index: int, *, show_history: bool) -> None:
+    figure = plt.figure(figsize=(13, 8), constrained_layout=True)
+    grid_spec = figure.add_gridspec(1, 2, width_ratios=[4.5, 1.7])
+    point_cloud_axis = figure.add_subplot(grid_spec[0, 0], projection="3d")
+    side_axis = figure.add_subplot(grid_spec[0, 1], projection="3d")
+    state = {"dataset_index": int(start_index), "show_history": bool(show_history)}
+
+    def redraw() -> None:
+        _draw_point_cloud_sample(
+            point_cloud_axis,
+            side_axis,
+            dataset,
+            state["dataset_index"],
+            show_history=bool(state["show_history"]),
+        )
         figure.canvas.draw_idle()
 
-    def on_key(event):
+    def on_key(event) -> None:
         if event.key in (" ", "right"):
-            state["index"] = (state["index"] + 1) % len(ordered_samples)
+            state["dataset_index"] = (state["dataset_index"] + 1) % len(dataset)
             redraw()
-        elif event.key == "left":
-            state["index"] = (state["index"] - 1) % len(ordered_samples)
+        elif event.key in ("left", "backspace"):
+            state["dataset_index"] = (state["dataset_index"] - 1) % len(dataset)
+            redraw()
+        elif event.key == "h":
+            state["show_history"] = not bool(state["show_history"])
             redraw()
         elif event.key in ("q", "escape"):
             plt.close(figure)
 
     figure.canvas.mpl_connect("key_press_event", on_key)
     redraw()
-    plt.tight_layout()
     plt.show()
 
 
 if __name__ == "__main__":
-
-    parser = argparse.ArgumentParser(description= "Argument Parser for the dataset")
-
+    parser = argparse.ArgumentParser(description="Visualize a point-cloud observation stack from the dataset.")
     parser.add_argument(
         "--dataset-path",
         dest="dataset_path",
         required=True,
         type=str,
-        help="Directory that contains the named recording buffers.",
+        help="Directory that contains the extracted dataset artifacts.",
     )
-   
     parser.add_argument(
         "--universal-contract",
         dest="universal_contract",
@@ -225,13 +538,18 @@ if __name__ == "__main__":
         type=str,
         help="Path to the universal contract file.",
     )
-
     parser.add_argument(
-        "--num-samples",
-        dest="num_samples",
-        default=1,
+        "--index",
+        dest="dataset_index",
+        default=None,
         type=int,
-        help="Number of random anchor frames to sample per episode.",
+        help="Optional dataset index to visualize. If omitted, a random sample is chosen.",
+    )
+    parser.add_argument(
+        "--show-history",
+        dest="show_history",
+        action="store_true",
+        help="Show the full observation history instead of only the most recent depth points.",
     )
 
     args = parser.parse_args()
@@ -239,7 +557,5 @@ if __name__ == "__main__":
         args.dataset_path,
         universal_contract=args.universal_contract,
     )
-    dataset.apply_normalizer = False
-    dataset.action_type = "absolute"
-    visualize_dataset(dataset, args.num_samples)
-
+    dataset_index = _resolve_dataset_index(dataset, args.dataset_index)
+    visualize_dataset_browser(dataset, dataset_index, show_history=bool(args.show_history))

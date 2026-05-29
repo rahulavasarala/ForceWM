@@ -25,7 +25,9 @@ class RobotObserver:
         self.buffer_size = int(buffer_size)
         self.example_obs = example_obs
         self.contract = self._load_contract(robot_data)
+        self.source_type = self._resolve_source_type(self.contract)
         self.lowdim_specs = self._parse_lowdim_specs(self.contract)
+        self.lowdim_metadata_redis_key = self._make_lowdim_metadata_key(self.contract)
 
         if len(self.lowdim_specs) == 0:
             raise ValueError("No lowdim keys were found in the contract.")
@@ -40,6 +42,7 @@ class RobotObserver:
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._next_observer_seq = 0
 
         self.redis_client = redis.Redis(host="127.0.0.1", port=6379, db=0, decode_responses=False)
 
@@ -65,6 +68,12 @@ class RobotObserver:
 
         return batched
 
+    def get_latest_obs(self) -> dict[str, Any] | None:
+        with self._lock:
+            if not self.buffer:
+                return None
+            return dict(self.buffer[-1])
+
     def start_adding_obs(self):
         # starts a thread that continuously adds observations at obs_freq to the ring buffer until stop_adding_obs is called
         if self._thread is not None and self._thread.is_alive():
@@ -88,7 +97,7 @@ class RobotObserver:
         while not self._stop_event.is_set():
             observation = self._read_observation_from_redis()
             if observation is not None:
-                observation["timestamp_s"] = time.time()
+                observation = self._finalize_observation(observation)
                 with self._lock:
                     self.buffer.append(observation)
 
@@ -100,6 +109,9 @@ class RobotObserver:
                 next_poll_time = time.perf_counter()
 
     def _read_observation_from_redis(self) -> dict[str, Any] | None:
+        if self.source_type == "sim":
+            return self._read_sim_observation_from_redis()
+
         observation: dict[str, Any] = {}
         for lowdim_name, lowdim_spec in self.lowdim_specs.items():
             redis_value = self.redis_client.get(lowdim_spec["redis_key"])
@@ -110,6 +122,34 @@ class RobotObserver:
                 json.loads(redis_value)
             )
 
+        return observation
+
+    def _read_sim_observation_from_redis(self) -> dict[str, Any] | None:
+        metadata_before_raw = self.redis_client.get(self.lowdim_metadata_redis_key)
+        if metadata_before_raw is None:
+            return None
+
+        metadata_before = self._load_metadata(metadata_before_raw)
+
+        observation: dict[str, Any] = {}
+        for lowdim_name, lowdim_spec in self.lowdim_specs.items():
+            redis_value = self.redis_client.get(lowdim_spec["redis_key"])
+            if redis_value is None:
+                return None
+
+            observation[lowdim_name] = np.array(json.loads(redis_value))
+
+        observation["timestamp_s"] = float(metadata_before["sim_time_s"])
+        observation["source_seq"] = int(metadata_before["seq"])
+        observation["source_publish_wall_time_s"] = float(metadata_before["publish_wall_time_s"])
+        return observation
+
+    def _finalize_observation(self, observation: dict[str, Any]) -> dict[str, Any]:
+        observer_wall_time_s = time.time()
+        observation["observer_wall_time_s"] = observer_wall_time_s
+        observation["observer_seq"] = self._next_observer_seq
+        self._next_observer_seq += 1
+        observation.setdefault("timestamp_s", observer_wall_time_s)
         return observation
 
     def _resolve_default_obs_freq(self) -> float:
@@ -175,6 +215,36 @@ class RobotObserver:
             }
 
         return parsed_lowdim
+
+    @staticmethod
+    def _resolve_source_type(contract: dict[str, Any]) -> str:
+        robot_cfg = contract.get("robot", {})
+        return "sim" if str(robot_cfg.get("type", "")).lower() == "sim" else "redis"
+
+    @staticmethod
+    def _make_lowdim_metadata_key(contract: dict[str, Any]) -> str | None:
+        robot_cfg = contract.get("robot")
+        if not isinstance(robot_cfg, dict):
+            return None
+
+        if str(robot_cfg.get("type", "")).lower() != "sim":
+            return None
+
+        prefix = robot_cfg.get("prefix")
+        if prefix is None:
+            return None
+
+        redis_namespace = RobotObserver._normalize_redis_namespace(
+            robot_cfg.get("redis_namespace", "sai")
+        )
+        return RobotObserver._make_redis_key(redis_namespace, prefix, "lowdim::meta")
+
+    @staticmethod
+    def _load_metadata(metadata_raw: bytes) -> dict[str, Any]:
+        metadata = json.loads(metadata_raw)
+        if not isinstance(metadata, dict):
+            raise ValueError("Expected lowdim metadata to decode as a JSON object.")
+        return metadata
 
     @staticmethod
     def _normalize_redis_namespace(redis_namespace: Any) -> str:

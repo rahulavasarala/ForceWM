@@ -59,10 +59,6 @@ robot:
           obs_window: 3
           obs_dss: 1
           # dim: [10, 3]
-      - force_dimension:
-          obs_window: 3
-          obs_dss: 1
-          # dim: [10, 3]
       - motion_or_force_axis:
           obs_window: 3
           obs_dss: 1
@@ -71,9 +67,6 @@ robot:
           obs_window: 3
           obs_dss: 1
           # dim: [10, 3]
-      - motion_or_force_axis:
-          obs_window: 3
-          obs_dss: 1
       - action_delta_pos:
           obs_window: 3
           obs_dss: 1
@@ -86,13 +79,15 @@ robot:
       - sensed_force:
           obs_window: 3
           obs_dss: 1
+          normalize: true
       - sensed_moment:
           obs_window: 3
           obs_dss: 1
+          normalize: true
   
     prediction:
-      mode: relative # absolute or relative
-      window: 3
+      mode: absolute # absolute or relative
+      window: 1
       dss: 1
       dim: [10, 3]
 

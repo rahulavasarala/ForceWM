@@ -8,7 +8,7 @@ from matplotlib.lines import Line2D
 
 from dataset import MultiModalDataset, POINT_CLOUD_MASK_SUFFIX
 
-FIXED_AXIS_LIMIT = 0.2
+FIXED_AXIS_LIMIT = 0.1
 AXIS_PANEL_LIMIT = 1.15
 FORCE_VECTOR_SCALE_M_PER_N = 0.01
 MAX_FORCE_VECTOR_LENGTH = 0.12
@@ -17,6 +17,7 @@ MAX_ACTION_VECTOR_LENGTH = 0.16
 FORCE_DIMENSION_KEY = "force_dimension"
 MOTION_OR_FORCE_AXIS_KEYS = ("motion_or_force_axis", "force_or_motion_axis")
 SENSED_FORCE_KEY = "sensed_force"
+SENSED_MOMENT_KEY = "sensed_moment"
 ACTION_DELTA_POS_KEY = "action_delta_pos"
 
 
@@ -106,27 +107,35 @@ def _axis_visualization(force_dimension: int, axis: np.ndarray) -> tuple[list[np
     return [axis], [orthogonal_1, orthogonal_2]
 
 
-def _extract_latest_obs_value(sample: dict, key_candidates: str | tuple[str, ...]) -> np.ndarray | None:
-    obs_dict = sample["obs_dict"]
+def _extract_modal_series(
+    modal_dict: dict,
+    key_candidates: str | tuple[str, ...],
+) -> np.ndarray | None:
     candidate_names = (key_candidates,) if isinstance(key_candidates, str) else tuple(key_candidates)
 
     for key_name in candidate_names:
-        if key_name not in obs_dict:
+        if key_name not in modal_dict:
             continue
 
-        value = _to_numpy(obs_dict[key_name])
-        value = np.asarray(value)
+        value = np.asarray(_to_numpy(modal_dict[key_name]))
         if value.ndim == 0:
-            return value
+            return value.reshape(1)
         if value.shape[0] == 0:
             return None
-        return np.asarray(value[-1])
+        return value
 
     return None
 
 
-def _extract_latest_scalar(sample: dict, key_candidates: str | tuple[str, ...]) -> int | None:
-    value = _extract_latest_obs_value(sample, key_candidates)
+def _extract_latest_modal_value(modal_dict: dict, key_candidates: str | tuple[str, ...]) -> np.ndarray | None:
+    value = _extract_modal_series(modal_dict, key_candidates)
+    if value is None:
+        return None
+    return np.asarray(value[-1])
+
+
+def _extract_latest_scalar(modal_dict: dict, key_candidates: str | tuple[str, ...]) -> int | None:
+    value = _extract_latest_modal_value(modal_dict, key_candidates)
     if value is None:
         return None
 
@@ -137,12 +146,12 @@ def _extract_latest_scalar(sample: dict, key_candidates: str | tuple[str, ...]) 
 
 
 def _extract_latest_vector(
-    sample: dict,
+    modal_dict: dict,
     key_candidates: str | tuple[str, ...],
     *,
     length: int = 3,
 ) -> np.ndarray | None:
-    value = _extract_latest_obs_value(sample, key_candidates)
+    value = _extract_latest_modal_value(modal_dict, key_candidates)
     if value is None:
         return None
 
@@ -152,6 +161,41 @@ def _extract_latest_vector(
             f"Expected {length} values for {key_candidates}, got shape {np.asarray(value).shape}."
         )
     return flat_value
+
+
+def _extract_vector_sequence(
+    modal_dict: dict,
+    key_candidates: str | tuple[str, ...],
+    *,
+    length: int = 3,
+) -> np.ndarray | None:
+    values = _extract_modal_series(modal_dict, key_candidates)
+    if values is None:
+        return None
+
+    values = np.asarray(values, dtype=np.float32)
+    if values.ndim == 1:
+        values = values.reshape(1, -1)
+    if values.ndim != 2 or values.shape[1] != length:
+        raise ValueError(
+            f"Expected shape (T, {length}) for {key_candidates}, got {values.shape}."
+        )
+    return values
+
+
+def _extract_scalar_sequence(modal_dict: dict, key_candidates: str | tuple[str, ...]) -> np.ndarray | None:
+    values = _extract_modal_series(modal_dict, key_candidates)
+    if values is None:
+        return None
+
+    values = np.asarray(values)
+    if values.ndim == 0:
+        values = values.reshape(1)
+    elif values.ndim == 2 and values.shape[1] == 1:
+        values = values.reshape(-1)
+    elif values.ndim != 1:
+        raise ValueError(f"Expected shape (T,) for {key_candidates}, got {values.shape}.")
+    return values.astype(np.int64, copy=False)
 
 
 def _scaled_force_vector(force_vector: np.ndarray | None) -> np.ndarray | None:
@@ -214,6 +258,32 @@ def _load_point_cloud_sample(
     )
 
 
+def _load_prediction_point_cloud_sample(
+    sample: dict,
+    point_cloud_key: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    prediction_dict = sample["prediction"]
+    if point_cloud_key not in prediction_dict:
+        raise KeyError(f"Prediction dictionary is missing point-cloud key `{point_cloud_key}`.")
+
+    point_clouds = _to_numpy(prediction_dict[point_cloud_key]).astype(np.float32, copy=False)
+    point_cloud_mask = _to_numpy(
+        prediction_dict[f"{point_cloud_key}{POINT_CLOUD_MASK_SUFFIX}"]
+    ).astype(bool, copy=False)
+    if point_clouds.ndim != 3 or point_clouds.shape[-1] != 3:
+        raise ValueError(
+            f"Expected prediction `{point_cloud_key}` to have shape (T, P, 3), got {point_clouds.shape}."
+        )
+    if point_cloud_mask.shape != point_clouds.shape[:2]:
+        raise ValueError(
+            f"Expected prediction `{point_cloud_key}{POINT_CLOUD_MASK_SUFFIX}` to have shape {point_clouds.shape[:2]}, "
+            f"got {point_cloud_mask.shape}."
+        )
+
+    point_counts = point_cloud_mask.sum(axis=1).astype(np.int64)
+    return point_clouds, point_cloud_mask, point_counts
+
+
 def _draw_vector(
     axis,
     *,
@@ -222,6 +292,7 @@ def _draw_vector(
     color: str,
     label: str,
     linewidth: float = 2.4,
+    alpha: float = 1.0,
 ) -> None:
     if vector is None:
         return
@@ -241,6 +312,7 @@ def _draw_vector(
         linewidth=linewidth,
         arrow_length_ratio=0.18,
         label=label,
+        alpha=alpha,
     )
 
 
@@ -251,6 +323,10 @@ def _draw_force_motion_axis_panel(
     motion_or_force_axis: np.ndarray | None,
     sensed_force: np.ndarray | None,
     action_delta_pos: np.ndarray | None,
+    predicted_force_dimensions: np.ndarray | None,
+    predicted_axes: np.ndarray | None,
+    predicted_sensed_forces: np.ndarray | None,
+    predicted_sensed_moments: np.ndarray | None,
 ) -> None:
     axis.clear()
 
@@ -335,6 +411,42 @@ def _draw_force_motion_axis_panel(
             alpha=0.45,
         )
 
+    if predicted_force_dimensions is not None and predicted_axes is not None:
+        for timestep, (pred_force_dimension, pred_axis) in enumerate(
+            zip(predicted_force_dimensions, predicted_axes, strict=True)
+        ):
+            pred_motion_axes, pred_force_axes = _axis_visualization(int(pred_force_dimension), pred_axis)
+            alpha = min(0.35 + 0.18 * timestep, 0.9)
+
+            for basis_axis in pred_motion_axes:
+                axis.quiver(
+                    0.0,
+                    0.0,
+                    0.0,
+                    basis_axis[0],
+                    basis_axis[1],
+                    basis_axis[2],
+                    length=0.72,
+                    normalize=True,
+                    color="deepskyblue",
+                    linewidth=1.6,
+                    alpha=alpha,
+                )
+            for basis_axis in pred_force_axes:
+                axis.quiver(
+                    0.0,
+                    0.0,
+                    0.0,
+                    basis_axis[0],
+                    basis_axis[1],
+                    basis_axis[2],
+                    length=0.72,
+                    normalize=True,
+                    color="lightcoral",
+                    linewidth=1.6,
+                    alpha=alpha,
+                )
+
     axis.set_xlim(-AXIS_PANEL_LIMIT, AXIS_PANEL_LIMIT)
     axis.set_ylim(-AXIS_PANEL_LIMIT, AXIS_PANEL_LIMIT)
     axis.set_zlim(-AXIS_PANEL_LIMIT, AXIS_PANEL_LIMIT)
@@ -348,6 +460,8 @@ def _draw_force_motion_axis_panel(
             Line2D([0], [0], color="0.7", linestyle="--", linewidth=1.4, label="World basis"),
             Line2D([0], [0], color="royalblue", linewidth=2.8, label="Motion axis"),
             Line2D([0], [0], color="crimson", linewidth=2.8, label="Force axis"),
+            Line2D([0], [0], color="deepskyblue", linewidth=1.8, label="Pred motion axis"),
+            Line2D([0], [0], color="lightcoral", linewidth=1.8, label="Pred force axis"),
         ],
         loc="upper left",
         fontsize=8,
@@ -361,6 +475,15 @@ def _draw_force_motion_axis_panel(
         f"action_dpos: {_format_vector(action_delta_pos)}",
         f"force scale: {FORCE_VECTOR_SCALE_M_PER_N:.3f} m/N",
     ]
+    if predicted_force_dimensions is not None:
+        for timestep, pred_force_dimension in enumerate(predicted_force_dimensions):
+            pred_axis = None if predicted_axes is None else predicted_axes[timestep]
+            pred_force = None if predicted_sensed_forces is None else predicted_sensed_forces[timestep]
+            pred_moment = None if predicted_sensed_moments is None else predicted_sensed_moments[timestep]
+            info_lines.append(f"pred[{timestep}] fdim: {int(pred_force_dimension)}")
+            info_lines.append(f"pred[{timestep}] axis: {_format_vector(pred_axis)}")
+            info_lines.append(f"pred[{timestep}] F: {_format_vector(pred_force)}")
+            info_lines.append(f"pred[{timestep}] M: {_format_vector(pred_moment)}")
     axis.text2D(
         0.02,
         0.02,
@@ -369,7 +492,7 @@ def _draw_force_motion_axis_panel(
         va="bottom",
         ha="left",
         family="monospace",
-        fontsize=8,
+        fontsize=7.2,
     )
 
 
@@ -391,10 +514,20 @@ def _draw_point_cloud_sample(
         episode_end,
         point_counts,
     ) = _load_point_cloud_sample(dataset, dataset_index)
-    force_dimension = _extract_latest_scalar(sample, FORCE_DIMENSION_KEY)
-    motion_or_force_axis = _extract_latest_vector(sample, MOTION_OR_FORCE_AXIS_KEYS)
-    sensed_force = _extract_latest_vector(sample, SENSED_FORCE_KEY)
-    action_delta_pos = _extract_latest_vector(sample, ACTION_DELTA_POS_KEY)
+    obs_dict = sample["obs_dict"]
+    prediction_dict = sample["prediction"]
+    prediction_point_clouds, prediction_point_cloud_mask, prediction_point_counts = _load_prediction_point_cloud_sample(
+        sample,
+        point_cloud_key,
+    )
+    force_dimension = _extract_latest_scalar(obs_dict, FORCE_DIMENSION_KEY)
+    motion_or_force_axis = _extract_latest_vector(obs_dict, MOTION_OR_FORCE_AXIS_KEYS)
+    sensed_force = _extract_latest_vector(obs_dict, SENSED_FORCE_KEY)
+    action_delta_pos = _extract_latest_vector(obs_dict, ACTION_DELTA_POS_KEY)
+    predicted_force_dimensions = _extract_scalar_sequence(prediction_dict, FORCE_DIMENSION_KEY)
+    predicted_axes = _extract_vector_sequence(prediction_dict, MOTION_OR_FORCE_AXIS_KEYS)
+    predicted_sensed_forces = _extract_vector_sequence(prediction_dict, SENSED_FORCE_KEY)
+    predicted_sensed_moments = _extract_vector_sequence(prediction_dict, SENSED_MOMENT_KEY)
 
     timesteps_to_draw = list(range(point_clouds.shape[0])) if show_history else [point_clouds.shape[0] - 1]
     mode_name = "history" if show_history else "latest-only"
@@ -402,12 +535,14 @@ def _draw_point_cloud_sample(
     print(
         f"Visualizing dataset index {dataset_index} | "
         f"episode {episode_index} ({episode_start}-{episode_end}) | "
-        f"mode={mode_name} | obs steps={point_clouds.shape[0]} | point counts={point_counts.tolist()}",
+        f"mode={mode_name} | obs steps={point_clouds.shape[0]} | obs point counts={point_counts.tolist()} | "
+        f"pred steps={prediction_point_clouds.shape[0]} | pred point counts={prediction_point_counts.tolist()}",
         flush=True,
     )
 
     point_cloud_axis.clear()
-    color_map = plt.get_cmap("viridis", point_clouds.shape[0])
+    obs_color_map = plt.get_cmap("viridis", point_clouds.shape[0])
+    pred_color_map = plt.get_cmap("plasma", prediction_point_clouds.shape[0])
     latest_valid_points = point_clouds[-1][point_cloud_mask[-1]]
     latest_ee_point, _ = _split_depth_and_ee_points(latest_valid_points)
 
@@ -425,8 +560,8 @@ def _draw_point_cloud_sample(
                 depth_points[:, 2],
                 s=18,
                 alpha=0.85,
-                color=color_map(timestep),
-                label=f"t={timestep} depth ({len(depth_points)} pts)",
+                color=obs_color_map(timestep),
+                label=f"obs t={timestep} depth ({len(depth_points)} pts)",
             )
 
         if ee_point is not None:
@@ -439,9 +574,59 @@ def _draw_point_cloud_sample(
                 color="red",
                 edgecolors="black",
                 linewidths=0.8,
-                label="End effector" if not ee_label_drawn else None,
+                label="Obs end effector" if not ee_label_drawn else None,
             )
             ee_label_drawn = True
+
+    pred_ee_label_drawn = False
+    pred_force_label_drawn = False
+    for timestep in range(prediction_point_clouds.shape[0]):
+        valid_points = prediction_point_clouds[timestep][prediction_point_cloud_mask[timestep]]
+        if len(valid_points) == 0:
+            continue
+        ee_point, depth_points = _split_depth_and_ee_points(valid_points)
+        pred_color = pred_color_map(timestep)
+
+        if len(depth_points) != 0:
+            point_cloud_axis.scatter(
+                depth_points[:, 0],
+                depth_points[:, 1],
+                depth_points[:, 2],
+                s=14,
+                alpha=0.65,
+                marker="^",
+                color=pred_color,
+                label=f"pred t+{timestep + 1} depth ({len(depth_points)} pts)",
+            )
+
+        if ee_point is not None:
+            point_cloud_axis.scatter(
+                [ee_point[0]],
+                [ee_point[1]],
+                [ee_point[2]],
+                s=70,
+                alpha=min(0.45 + 0.15 * timestep, 0.9),
+                marker="s",
+                color=pred_color,
+                edgecolors="black",
+                linewidths=0.7,
+                label="Pred end effector" if not pred_ee_label_drawn else None,
+            )
+            pred_ee_label_drawn = True
+
+            pred_force_vector = None
+            if predicted_sensed_forces is not None and timestep < len(predicted_sensed_forces):
+                pred_force_vector = _scaled_force_vector(predicted_sensed_forces[timestep])
+            _draw_vector(
+                point_cloud_axis,
+                origin=ee_point,
+                vector=pred_force_vector,
+                color="goldenrod",
+                label="Pred sensed force" if not pred_force_label_drawn else None,
+                linewidth=1.8,
+                alpha=min(0.35 + 0.18 * timestep, 0.85),
+            )
+            pred_force_label_drawn = pred_force_label_drawn or pred_force_vector is not None
 
     if latest_ee_point is not None:
         _draw_vector(
@@ -468,14 +653,14 @@ def _draw_point_cloud_sample(
     point_cloud_axis.set_zlabel("Z")
     point_cloud_axis.legend(loc="upper right", fontsize=8)
     point_cloud_axis.set_title(
-        "Depth Point-Cloud Observation Stack\n"
-        f"Key: {point_cloud_key} | Mode: {mode_name} | Index: {dataset_index} | "
+        "Depth Point Clouds And Future Prediction Targets\n"
+        f"Key: {point_cloud_key} | Obs mode: {mode_name} | Index: {dataset_index} | "
         f"Episode: {episode_index} ({episode_start}-{episode_end})"
     )
     point_cloud_axis.text2D(
         0.02,
         0.02,
-        "Space/right: next | left/backspace: previous | h: toggle history | q/esc: quit",
+        "Space/right: next | left/backspace: previous | h: toggle obs history | q/esc: quit",
         transform=point_cloud_axis.transAxes,
     )
     _draw_force_motion_axis_panel(
@@ -484,6 +669,10 @@ def _draw_point_cloud_sample(
         motion_or_force_axis=motion_or_force_axis,
         sensed_force=sensed_force,
         action_delta_pos=action_delta_pos,
+        predicted_force_dimensions=predicted_force_dimensions,
+        predicted_axes=predicted_axes,
+        predicted_sensed_forces=predicted_sensed_forces,
+        predicted_sensed_moments=predicted_sensed_moments,
     )
 
 

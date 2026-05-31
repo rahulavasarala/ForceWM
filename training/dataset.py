@@ -10,10 +10,25 @@ import torch
 import yaml
 from torch.utils.data import Dataset
 
-from parquet_utils import ParquetDatasetReader
+if __package__:
+    from .normalizer import (
+        DEFAULT_NORMALIZATION_REPRESENTATION,
+        DatasetNormalizer,
+        resolve_normalization_config,
+    )
+    from .parquet_utils import ParquetDatasetReader
+else:
+    from normalizer import (
+        DEFAULT_NORMALIZATION_REPRESENTATION,
+        DatasetNormalizer,
+        resolve_normalization_config,
+    )
+    from parquet_utils import ParquetDatasetReader
 
 
 POINT_CLOUD_MASK_SUFFIX = "_mask"
+ACTION_LOW_DIM_KEYS = {"action_delta_pos", "action_delta_rotvec", "action_force_magnitude"}
+CONTACT_PREDICTION_KEYS = {"sensed_force", "sensed_moment", "motion_or_force_axis", "force_or_motion_axis", "force_dimension"}
 
 
 def _to_tensor(value: Any, *, dtype: np.dtype[Any] | None = None) -> torch.Tensor:
@@ -176,14 +191,19 @@ class MultiModalDataset(Dataset):
         self.lowdim_keys: list[str] = []
         self.point_cloud_keys: list[str] = []
         self._parse_loader_keys()
+        self.normalized_lowdim_keys = [
+            key_name
+            for key_name, key_cfg in self.key_configs.items()
+            if key_cfg["kind"] == "lowdim" and bool(key_cfg["normalize"])
+        ]
+        self.normalizer = self._load_normalizer()
 
         self.point_cloud_readers = self._build_point_cloud_readers(pointcloud_cache_size)
         self.prediction_cfg = self._parse_prediction_cfg()
-        self.prediction_shape = (
-            self.prediction_cfg["window"],
-            *self.prediction_cfg["dim"],
-        )
-        self._prediction_template = torch.zeros(self.prediction_shape, dtype=torch.float32)
+        (
+            self.prediction_key_order,
+            self.prediction_key_configs,
+        ) = self._resolve_prediction_keys()
 
     def _resolve_depth_keys(self) -> set[str]:
         visual_cfg = self.contract.get("robot", {}).get("data_sources", {}).get("visual", {})
@@ -222,26 +242,83 @@ class MultiModalDataset(Dataset):
                 key_cfg,
                 f"robot.data_loader.keys.{key_name}.obs_dss",
             )
+            normalize, normalization_representation = resolve_normalization_config(
+                key_cfg,
+                key_name=str(key_name),
+                field_prefix=f"robot.data_loader.keys.{key_name}",
+            )
 
             key_name = str(key_name)
             if key_name in self.depth_keys:
                 key_kind = "point_cloud"
-                self.point_cloud_keys.append(key_name)
             elif key_name in self.parquet_columns:
                 key_kind = "lowdim"
-                self.lowdim_keys.append(key_name)
             else:
                 raise KeyError(
                     f"Data-loader key `{key_name}` is neither a configured depth stream nor a parquet column. "
                     f"Available parquet columns: {sorted(self.parquet_columns)}"
                 )
 
+            if key_kind == "point_cloud" and normalize:
+                raise ValueError(
+                    f"Normalization is currently supported only for lowdim parquet keys. "
+                    f"`{key_name}` is configured as a depth/point-cloud key."
+                )
+
+            existing_cfg = self.key_configs.get(key_name)
+            if existing_cfg is not None:
+                if (
+                    existing_cfg["kind"] != key_kind
+                    or int(existing_cfg["obs_window"]) != obs_window
+                    or int(existing_cfg["obs_dss"]) != obs_dss
+                    or bool(existing_cfg["normalize"]) != normalize
+                    or str(existing_cfg["normalization_representation"]) != normalization_representation
+                ):
+                    raise ValueError(
+                        f"Duplicate data-loader key `{key_name}` has conflicting configs: "
+                        f"{existing_cfg} vs obs_window={obs_window}, obs_dss={obs_dss}, kind={key_kind}, "
+                        f"normalize={normalize}, normalization_representation={normalization_representation}."
+                    )
+                continue
+
+            if key_kind == "point_cloud":
+                self.point_cloud_keys.append(key_name)
+            else:
+                self.lowdim_keys.append(key_name)
+
             self.key_order.append(key_name)
             self.key_configs[key_name] = {
                 "kind": key_kind,
                 "obs_window": obs_window,
                 "obs_dss": obs_dss,
+                "normalize": normalize,
+                "normalization_representation": normalization_representation,
             }
+
+    def _load_normalizer(self) -> DatasetNormalizer | None:
+        if not self.normalized_lowdim_keys:
+            return None
+
+        normalizer_path = self.dataset_path / "normalizer.npy"
+        normalizer = DatasetNormalizer.load(normalizer_path)
+        for key_name in self.normalized_lowdim_keys:
+            if not normalizer.has_key(key_name):
+                raise KeyError(
+                    f"Normalizer `{normalizer_path}` does not contain stats for normalized key `{key_name}`."
+                )
+
+            key_cfg = self.key_configs[key_name]
+            expected_representation = str(
+                key_cfg.get("normalization_representation", DEFAULT_NORMALIZATION_REPRESENTATION)
+            )
+            actual_representation = str(normalizer.require_key(key_name)["representation"])
+            if actual_representation != expected_representation:
+                raise ValueError(
+                    f"Normalizer stats for `{key_name}` use representation `{actual_representation}`, "
+                    f"but the contract expects `{expected_representation}`."
+                )
+
+        return normalizer
 
     def _build_point_cloud_readers(self, cache_size: int) -> dict[str, PointCloudChunkReader]:
         if not self.point_cloud_keys:
@@ -294,20 +371,35 @@ class MultiModalDataset(Dataset):
 
         window = self._require_positive_int(prediction_cfg, "robot.data_loader.prediction.window")
         dss = self._require_positive_int(prediction_cfg, "robot.data_loader.prediction.dss")
-        dim = prediction_cfg.get("dim")
-        if not isinstance(dim, (list, tuple)) or not dim:
-            raise ValueError("`robot.data_loader.prediction.dim` must be a non-empty list.")
+        return {"window": window, "dss": dss}
 
-        prediction_dim = tuple(int(axis) for axis in dim)
-        if any(axis <= 0 for axis in prediction_dim):
-            raise ValueError("All entries in `robot.data_loader.prediction.dim` must be positive.")
+    def _resolve_prediction_keys(self) -> tuple[list[str], dict[str, dict[str, Any]]]:
+        prediction_key_order: list[str] = []
+        prediction_key_configs: dict[str, dict[str, Any]] = {}
 
-        return {
-            "window": window,
-            "dss": dss,
-            "dim": prediction_dim,
-            "mode": prediction_cfg.get("mode"),
-        }
+        for key_name in self.point_cloud_keys:
+            if key_name in prediction_key_configs:
+                continue
+            prediction_key_order.append(key_name)
+            prediction_key_configs[key_name] = {"kind": "point_cloud"}
+
+        for key_name in self.lowdim_keys:
+            if key_name in prediction_key_configs:
+                continue
+            if key_name not in CONTACT_PREDICTION_KEYS:
+                continue
+            if key_name in ACTION_LOW_DIM_KEYS:
+                continue
+            prediction_key_order.append(key_name)
+            prediction_key_configs[key_name] = {"kind": "lowdim"}
+
+        if not prediction_key_order:
+            raise ValueError(
+                "No prediction keys were resolved. The dataset currently predicts depth point clouds and contact "
+                "signals only, so include at least one depth stream or contact key in `robot.data_loader.keys`."
+            )
+
+        return prediction_key_order, prediction_key_configs
 
     @staticmethod
     def _require_positive_int(mapping: dict[str, Any], field_name: str) -> int:
@@ -345,6 +437,12 @@ class MultiModalDataset(Dataset):
         indices[indices < episode_start] = episode_start
         return indices
 
+    @staticmethod
+    def _build_prediction_indices(idx: int, episode_end: int, prediction_window: int, prediction_dss: int) -> np.ndarray:
+        indices = idx + prediction_dss * np.arange(1, prediction_window + 1, dtype=np.int64)
+        indices[indices > episode_end] = episode_end
+        return indices
+
     def _load_lowdim_window(self, key_name: str, obs_indices: np.ndarray) -> torch.Tensor:
         first_index = int(obs_indices[0])
         last_index = int(obs_indices[-1])
@@ -354,6 +452,12 @@ class MultiModalDataset(Dataset):
 
         values = np.asarray(frame[key_name])
         selected_values = values[obs_indices - first_index]
+        key_cfg = self.key_configs[key_name]
+        if bool(key_cfg["normalize"]):
+            if self.normalizer is None:
+                raise RuntimeError(f"Normalization is enabled for `{key_name}` but no normalizer is loaded.")
+            selected_values = self.normalizer.normalize_key(key_name, selected_values)
+            return _to_tensor(selected_values, dtype=np.float32)
         return _to_tensor(selected_values)
 
     def _load_point_cloud_window(self, key_name: str, obs_indices: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
@@ -374,7 +478,7 @@ class MultiModalDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, Any]:
         idx = int(idx)
         self._check_idx_oob(idx)
-        _, episode_start, _ = self.get_episode_bounds(idx)
+        _, episode_start, episode_end = self.get_episode_bounds(idx)
 
         obs_dict: dict[str, torch.Tensor] = {}
         for key_name in self.key_order:
@@ -393,10 +497,36 @@ class MultiModalDataset(Dataset):
             else:
                 obs_dict[key_name] = self._load_lowdim_window(key_name, obs_indices)
 
+        prediction_dict: dict[str, torch.Tensor] = {}
+        prediction_indices = self._build_prediction_indices(
+            idx=idx,
+            episode_end=episode_end,
+            prediction_window=int(self.prediction_cfg["window"]),
+            prediction_dss=int(self.prediction_cfg["dss"]),
+        )
+        for key_name in self.prediction_key_order:
+            key_cfg = self.prediction_key_configs[key_name]
+            if key_cfg["kind"] == "point_cloud":
+                point_cloud, point_cloud_mask = self._load_point_cloud_window(key_name, prediction_indices)
+                prediction_dict[key_name] = point_cloud
+                prediction_dict[f"{key_name}{POINT_CLOUD_MASK_SUFFIX}"] = point_cloud_mask
+            else:
+                prediction_dict[key_name] = self._load_lowdim_window(key_name, prediction_indices)
+
         return {
             "obs_dict": obs_dict,
-            "prediction": self._prediction_template.clone(),
+            "prediction": prediction_dict,
         }
+
+    def normalize_sample(self, sample: dict[str, Any]) -> dict[str, Any]:
+        if self.normalizer is None:
+            return sample
+        return self.normalizer.normalize_sample(sample)
+
+    def denormalize_sample(self, sample: dict[str, Any]) -> dict[str, Any]:
+        if self.normalizer is None:
+            return sample
+        return self.normalizer.denormalize_sample(sample)
 
     def collate_fn(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
         return multimodal_collate_fn(batch)
@@ -406,36 +536,44 @@ def multimodal_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     if not batch:
         raise ValueError("`batch` must be non-empty.")
 
-    obs_dicts = [sample["obs_dict"] for sample in batch]
-    first_obs_dict = obs_dicts[0]
-    expected_keys = list(first_obs_dict.keys())
-    for obs_dict in obs_dicts[1:]:
-        if list(obs_dict.keys()) != expected_keys:
+    obs_dict_batch = _collate_modal_dicts([sample["obs_dict"] for sample in batch])
+    prediction_batch = _collate_modal_dicts([sample["prediction"] for sample in batch])
+    return {
+        "obs_dict": obs_dict_batch,
+        "prediction": prediction_batch,
+    }
+
+
+def _collate_modal_dicts(modal_dicts: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    first_modal_dict = modal_dicts[0]
+    expected_keys = list(first_modal_dict.keys())
+    for modal_dict in modal_dicts[1:]:
+        if list(modal_dict.keys()) != expected_keys:
             raise ValueError("All samples in a batch must expose the same observation keys.")
 
-    collated_obs: dict[str, torch.Tensor] = {}
+    collated_modal_dict: dict[str, torch.Tensor] = {}
     handled_keys: set[str] = set()
     point_cloud_keys = [
         key[: -len(POINT_CLOUD_MASK_SUFFIX)]
         for key in expected_keys
         if key.endswith(POINT_CLOUD_MASK_SUFFIX)
-        and key[: -len(POINT_CLOUD_MASK_SUFFIX)] in first_obs_dict
+        and key[: -len(POINT_CLOUD_MASK_SUFFIX)] in first_modal_dict
     ]
 
     for key_name in point_cloud_keys:
         mask_key = f"{key_name}{POINT_CLOUD_MASK_SUFFIX}"
-        point_cloud_tensors = [sample[key_name] for sample in obs_dicts]
-        point_cloud_masks = [sample[mask_key] for sample in obs_dicts]
+        point_cloud_tensors = [sample[key_name] for sample in modal_dicts]
+        point_cloud_masks = [sample[mask_key] for sample in modal_dicts]
 
         max_points = max(int(point_cloud.shape[1]) for point_cloud in point_cloud_tensors)
         time_steps = int(point_cloud_tensors[0].shape[0])
         channel_dim = int(point_cloud_tensors[0].shape[2])
 
         padded_point_clouds = torch.zeros(
-            (len(batch), time_steps, max_points, channel_dim),
+            (len(modal_dicts), time_steps, max_points, channel_dim),
             dtype=point_cloud_tensors[0].dtype,
         )
-        padded_masks = torch.zeros((len(batch), time_steps, max_points), dtype=torch.bool)
+        padded_masks = torch.zeros((len(modal_dicts), time_steps, max_points), dtype=torch.bool)
 
         for batch_index, (point_cloud, mask) in enumerate(zip(point_cloud_tensors, point_cloud_masks, strict=True)):
             if point_cloud.ndim != 3 or point_cloud.shape[0] != time_steps or point_cloud.shape[2] != channel_dim:
@@ -453,18 +591,14 @@ def multimodal_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
             padded_point_clouds[batch_index, :, :num_points, :] = point_cloud
             padded_masks[batch_index, :, :num_points] = mask
 
-        collated_obs[key_name] = padded_point_clouds
-        collated_obs[mask_key] = padded_masks
+        collated_modal_dict[key_name] = padded_point_clouds
+        collated_modal_dict[mask_key] = padded_masks
         handled_keys.add(key_name)
         handled_keys.add(mask_key)
 
     for key_name in expected_keys:
         if key_name in handled_keys:
             continue
-        collated_obs[key_name] = torch.stack([sample[key_name] for sample in obs_dicts], dim=0)
+        collated_modal_dict[key_name] = torch.stack([sample[key_name] for sample in modal_dicts], dim=0)
 
-    prediction_batch = torch.stack([sample["prediction"] for sample in batch], dim=0)
-    return {
-        "obs_dict": collated_obs,
-        "prediction": prediction_batch,
-    }
+    return collated_modal_dict

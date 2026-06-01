@@ -5,14 +5,26 @@ import unittest
 from pathlib import Path
 
 import numpy as np
-import pyarrow as pa
-import pyarrow.parquet as pq
 import torch
 import yaml
 from scipy.spatial.transform import Rotation as R
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+except ModuleNotFoundError:
+    pa = None
+    pq = None
 
-from training.dataset import MultiModalDataset
-from training.normalizer import DatasetNormalizer, build_normalizer
+
+PYARROW_AVAILABLE = pa is not None and pq is not None
+
+if PYARROW_AVAILABLE:
+    from training.dataset import MultiModalDataset
+    from training.normalizer import DatasetNormalizer, build_normalizer
+else:
+    MultiModalDataset = None
+    DatasetNormalizer = None
+    build_normalizer = None
 
 
 def _fixed_size_list_column(array: np.ndarray, value_type) -> pa.Array:
@@ -108,11 +120,119 @@ def _write_dataset(dataset_path: Path) -> dict[str, np.ndarray]:
     return columns
 
 
+def _write_multiepisode_dataset(dataset_path: Path) -> dict[str, np.ndarray]:
+    dataset_path.mkdir(parents=True, exist_ok=True)
+
+    num_rows = 6
+    columns = {
+        "action_delta_pos": np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [0.1, 0.0, 0.0],
+                [0.2, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.1, 0.0, 0.0],
+                [1.2, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        "action_delta_rotvec": np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.1],
+                [0.0, 0.0, 0.2],
+                [0.0, 0.1, 0.0],
+                [0.0, 0.2, 0.0],
+                [0.0, 0.3, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        "action_force_magnitude": np.linspace(1.0, 2.0, num_rows, dtype=np.float32),
+        "force_dimension": np.array([0, 1, 2, 1, 2, 3], dtype=np.int64),
+        "motion_or_force_axis": np.array(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 1.0],
+                [1.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        ),
+        "sensed_force": np.array(
+            [
+                [1.0, 0.0, 0.0],
+                [1.5, 0.5, 0.0],
+                [2.0, 1.0, 0.0],
+                [2.5, 1.0, 0.5],
+                [3.0, 1.5, 0.5],
+                [3.5, 2.0, 1.0],
+            ],
+            dtype=np.float32,
+        ),
+        "sensed_moment": np.array(
+            [
+                [0.0, 0.1, 0.2],
+                [0.1, 0.2, 0.3],
+                [0.2, 0.3, 0.4],
+                [0.3, 0.4, 0.5],
+                [0.4, 0.5, 0.6],
+                [0.5, 0.6, 0.7],
+            ],
+            dtype=np.float32,
+        ),
+    }
+    table = pa.table(
+        {
+            "action_delta_pos": _fixed_size_list_column(columns["action_delta_pos"], pa.float32()),
+            "action_delta_rotvec": _fixed_size_list_column(columns["action_delta_rotvec"], pa.float32()),
+            "action_force_magnitude": pa.array(columns["action_force_magnitude"], type=pa.float32()),
+            "force_dimension": pa.array(columns["force_dimension"], type=pa.int64()),
+            "motion_or_force_axis": _fixed_size_list_column(columns["motion_or_force_axis"], pa.float32()),
+            "sensed_force": _fixed_size_list_column(columns["sensed_force"], pa.float32()),
+            "sensed_moment": _fixed_size_list_column(columns["sensed_moment"], pa.float32()),
+        }
+    )
+    pq.write_table(table, dataset_path / "dummy.parquet")
+    np.savez(
+        dataset_path / "metadata.npz",
+        episode_ends=np.array([2, 5], dtype=np.int64),
+        chunk_size=np.array(2, dtype=np.int64),
+    )
+    return columns
+
+
+def _write_point_cloud_chunks(dataset_path: Path, episode_lengths: list[int], *, num_points: int = 4) -> np.ndarray:
+    point_cloud_root = dataset_path / "point_clouds"
+    point_cloud_root.mkdir(parents=True, exist_ok=True)
+    all_episodes: list[np.ndarray] = []
+    for episode_idx, episode_length in enumerate(episode_lengths):
+        frames = np.zeros((episode_length, num_points, 3), dtype=np.float32)
+        base = float(episode_idx * 10)
+        for frame_idx in range(episode_length):
+            frames[frame_idx, :, 0] = base + frame_idx
+            frames[frame_idx, :, 1] = np.arange(num_points, dtype=np.float32)
+            frames[frame_idx, :, 2] = episode_idx
+        all_episodes.append(frames)
+
+        episode_dir = point_cloud_root / f"episode_{episode_idx + 1:04d}"
+        episode_dir.mkdir(parents=True, exist_ok=True)
+        chunk_index = 0
+        for frame_start in range(0, episode_length, 2):
+            chunk = frames[frame_start : frame_start + 2]
+            np.save(episode_dir / f"chunk_{chunk_index + 1:04d}.npy", chunk)
+            chunk_index += 1
+
+    return np.stack(all_episodes, axis=0)
+
+
 def _write_contract(
     contract_path: Path,
     *,
     loader_entries: list[tuple[str, dict[str, object]]],
     include_depth_key: bool = False,
+    scene_points_path: str | None = None,
 ) -> None:
     robot_cfg: dict[str, object] = {
         "data_loader": {
@@ -124,16 +244,28 @@ def _write_contract(
         }
     }
 
-    if include_depth_key:
+    if include_depth_key or scene_points_path is not None:
+        visual_keys: list[dict[str, object]] = []
+        if include_depth_key:
+            visual_keys.append(
+                {
+                    "camera_01_depth": {
+                        "type": "depth",
+                    }
+                }
+            )
+        if scene_points_path is not None:
+            visual_keys.append(
+                {
+                    "scene_points": {
+                        "type": "scene_points",
+                        "path": scene_points_path,
+                    }
+                }
+            )
         robot_cfg["data_sources"] = {
             "visual": {
-                "keys": [
-                    {
-                        "camera_01_depth": {
-                            "type": "depth",
-                        }
-                    }
-                ]
+                "keys": visual_keys
             }
         }
 
@@ -141,6 +273,7 @@ def _write_contract(
         yaml.safe_dump({"robot": robot_cfg}, handle, sort_keys=False)
 
 
+@unittest.skipUnless(PYARROW_AVAILABLE, "pyarrow not installed")
 class DatasetNormalizerTests(unittest.TestCase):
     def test_build_normalizer_includes_only_normalized_keys_and_default_representation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -372,6 +505,130 @@ class DatasetNormalizerTests(unittest.TestCase):
             normalizer.save(normalizer_path)
 
             with self.assertRaisesRegex(KeyError, "action_delta_rotvec"):
+                MultiModalDataset(dataset_path, contract_path)
+
+    def test_scene_points_load_per_episode_and_stay_out_of_prediction_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dataset_path = Path(tmp_dir) / "dataset"
+            _write_multiepisode_dataset(dataset_path)
+            _write_point_cloud_chunks(dataset_path, [3, 3], num_points=4)
+            scene_points = np.array(
+                [
+                    [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 2.0, 0.0]],
+                    [[5.0, 0.0, 0.0], [5.0, 1.0, 0.0], [5.0, 2.0, 0.0]],
+                ],
+                dtype=np.float32,
+            )
+            scene_points_path = Path(tmp_dir) / "scene_points.npy"
+            np.save(scene_points_path, scene_points)
+
+            contract_path = Path(tmp_dir) / "contract.yaml"
+            _write_contract(
+                contract_path,
+                loader_entries=[
+                    ("camera_01_depth", {"obs_window": 2, "obs_dss": 1}),
+                    ("scene_points", {"obs_window": 1, "obs_dss": 1}),
+                    ("motion_or_force_axis", {"obs_window": 2, "obs_dss": 1}),
+                    ("force_dimension", {"obs_window": 2, "obs_dss": 1}),
+                    ("action_delta_pos", {"obs_window": 2, "obs_dss": 1}),
+                    ("action_delta_rotvec", {"obs_window": 2, "obs_dss": 1}),
+                    ("action_force_magnitude", {"obs_window": 2, "obs_dss": 1}),
+                    ("sensed_force", {"obs_window": 2, "obs_dss": 1}),
+                    ("sensed_moment", {"obs_window": 2, "obs_dss": 1}),
+                ],
+                include_depth_key=True,
+                scene_points_path=str(scene_points_path),
+            )
+
+            dataset = MultiModalDataset(dataset_path, contract_path)
+            sample_episode_0 = dataset[1]
+            sample_episode_1 = dataset[4]
+
+        np.testing.assert_allclose(sample_episode_0["obs_dict"]["scene_points"].numpy()[0], scene_points[0], atol=1e-6)
+        np.testing.assert_allclose(sample_episode_1["obs_dict"]["scene_points"].numpy()[0], scene_points[1], atol=1e-6)
+        np.testing.assert_array_equal(
+            sample_episode_0["obs_dict"]["scene_points_mask"].numpy(),
+            np.ones((1, scene_points.shape[1]), dtype=bool),
+        )
+        self.assertNotIn("scene_points", sample_episode_0["prediction"])
+        self.assertEqual(dataset.static_point_cloud_keys, ["scene_points"])
+
+    def test_scene_points_reject_mismatched_episode_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dataset_path = Path(tmp_dir) / "dataset"
+            _write_multiepisode_dataset(dataset_path)
+            _write_point_cloud_chunks(dataset_path, [3, 3], num_points=4)
+            scene_points_path = Path(tmp_dir) / "scene_points.npy"
+            np.save(scene_points_path, np.zeros((1, 3, 3), dtype=np.float32))
+
+            contract_path = Path(tmp_dir) / "contract.yaml"
+            _write_contract(
+                contract_path,
+                loader_entries=[
+                    ("camera_01_depth", {"obs_window": 2, "obs_dss": 1}),
+                    ("scene_points", {"obs_window": 1, "obs_dss": 1}),
+                    ("sensed_force", {"obs_window": 2, "obs_dss": 1}),
+                    ("sensed_moment", {"obs_window": 2, "obs_dss": 1}),
+                    ("motion_or_force_axis", {"obs_window": 2, "obs_dss": 1}),
+                    ("force_dimension", {"obs_window": 2, "obs_dss": 1}),
+                ],
+                include_depth_key=True,
+                scene_points_path=str(scene_points_path),
+            )
+
+            with self.assertRaisesRegex(ValueError, "metadata declares 2 episodes"):
+                MultiModalDataset(dataset_path, contract_path)
+
+    def test_scene_points_reject_wrong_trailing_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dataset_path = Path(tmp_dir) / "dataset"
+            _write_multiepisode_dataset(dataset_path)
+            _write_point_cloud_chunks(dataset_path, [3, 3], num_points=4)
+            scene_points_path = Path(tmp_dir) / "scene_points.npy"
+            np.save(scene_points_path, np.zeros((2, 3, 4), dtype=np.float32))
+
+            contract_path = Path(tmp_dir) / "contract.yaml"
+            _write_contract(
+                contract_path,
+                loader_entries=[
+                    ("camera_01_depth", {"obs_window": 2, "obs_dss": 1}),
+                    ("scene_points", {"obs_window": 1, "obs_dss": 1}),
+                    ("sensed_force", {"obs_window": 2, "obs_dss": 1}),
+                    ("sensed_moment", {"obs_window": 2, "obs_dss": 1}),
+                    ("motion_or_force_axis", {"obs_window": 2, "obs_dss": 1}),
+                    ("force_dimension", {"obs_window": 2, "obs_dss": 1}),
+                ],
+                include_depth_key=True,
+                scene_points_path=str(scene_points_path),
+            )
+
+            with self.assertRaisesRegex(ValueError, "xyz dimension 3"):
+                MultiModalDataset(dataset_path, contract_path)
+
+    def test_scene_points_require_single_step_loader_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dataset_path = Path(tmp_dir) / "dataset"
+            _write_multiepisode_dataset(dataset_path)
+            _write_point_cloud_chunks(dataset_path, [3, 3], num_points=4)
+            scene_points_path = Path(tmp_dir) / "scene_points.npy"
+            np.save(scene_points_path, np.zeros((2, 3, 3), dtype=np.float32))
+
+            contract_path = Path(tmp_dir) / "contract.yaml"
+            _write_contract(
+                contract_path,
+                loader_entries=[
+                    ("camera_01_depth", {"obs_window": 2, "obs_dss": 1}),
+                    ("scene_points", {"obs_window": 2, "obs_dss": 1}),
+                    ("sensed_force", {"obs_window": 2, "obs_dss": 1}),
+                    ("sensed_moment", {"obs_window": 2, "obs_dss": 1}),
+                    ("motion_or_force_axis", {"obs_window": 2, "obs_dss": 1}),
+                    ("force_dimension", {"obs_window": 2, "obs_dss": 1}),
+                ],
+                include_depth_key=True,
+                scene_points_path=str(scene_points_path),
+            )
+
+            with self.assertRaisesRegex(ValueError, "obs_window` must be 1"):
                 MultiModalDataset(dataset_path, contract_path)
 
 

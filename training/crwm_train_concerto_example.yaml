@@ -1,0 +1,64 @@
+dataset_path: "data_storage/dpth_v7_extracted"
+universal_contract: "universal_contract.yaml"
+output_dir: "training_runs/crwm_dpth_v7_concerto_small"
+seed: 42
+epochs: 50
+batch_size: 4
+num_workers: 0
+val_fraction: 0.2
+pointcloud_cache_size: 4
+log_every: 10
+depth_encoder_trainable_epochs: 10
+gradient_clip_norm: 1.0
+amp: true
+
+optimizer:
+  lr: 0.0001
+  weight_decay: 0.0001
+
+scheduler:
+  warmup_steps: 100
+  min_lr_scale: 0.1
+
+depth_encoder_ema:
+  decay: 0.999
+  update_after_step: 0
+  update_every: 1
+
+contact_encoder_ema:
+  decay: 0.999
+  update_after_step: 0
+  update_every: 1
+
+model:
+  max_history_steps: 8
+  depth_encoder:
+    type: "ptv3"
+    model_name: "concerto_small"
+    repo_id: "Pointcept/Concerto"
+    enable_flash: false
+    patch_size: 256
+    grid_size: 0.02
+    # Defaults to the restored Concerto feature width for the chosen model.
+    # For concerto_small that is 896. You can set smaller projection dims later if needed.
+  contact_encoder:
+    hidden_dim: 128
+    output_dim: 128
+    num_force_dimensions: 4
+    force_embedding_dim: 16
+  action_encoder:
+    hidden_dim: 128
+    output_dim: 128
+  flow:
+    model_dim: 512
+    num_layers: 6
+    num_heads: 8
+    mlp_ratio: 4.0
+    dropout: 0.0
+  decoder:
+    depth_hidden_dim: 512
+    contact_hidden_dim: 128
+  loss_weights:
+    flow: 1.0
+    depth_recon: 1.0
+    contact_recon: 1.0

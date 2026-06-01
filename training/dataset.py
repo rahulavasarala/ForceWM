@@ -15,6 +15,7 @@ if __package__:
         DEFAULT_NORMALIZATION_REPRESENTATION,
         DatasetNormalizer,
         resolve_normalization_config,
+        resolve_point_cloud_source_specs,
     )
     from .parquet_utils import ParquetDatasetReader
 else:
@@ -22,6 +23,7 @@ else:
         DEFAULT_NORMALIZATION_REPRESENTATION,
         DatasetNormalizer,
         resolve_normalization_config,
+        resolve_point_cloud_source_specs,
     )
     from parquet_utils import ParquetDatasetReader
 
@@ -184,12 +186,23 @@ class MultiModalDataset(Dataset):
 
         self.parquet_reader = ParquetDatasetReader(parquet_path)
         self.parquet_columns = set(self.parquet_reader.pf.schema_arrow.names)
-        self.depth_keys = self._resolve_depth_keys()
+        self.point_cloud_source_specs = resolve_point_cloud_source_specs(self.contract)
+        self.depth_keys = {
+            key_name
+            for key_name, spec in self.point_cloud_source_specs.items()
+            if spec["kind"] == "depth"
+        }
+        self.scene_point_specs = {
+            key_name: spec
+            for key_name, spec in self.point_cloud_source_specs.items()
+            if spec["kind"] == "scene_points"
+        }
 
         self.key_order: list[str] = []
         self.key_configs: dict[str, dict[str, Any]] = {}
         self.lowdim_keys: list[str] = []
         self.point_cloud_keys: list[str] = []
+        self.static_point_cloud_keys: list[str] = []
         self._parse_loader_keys()
         self.normalized_lowdim_keys = [
             key_name
@@ -199,25 +212,12 @@ class MultiModalDataset(Dataset):
         self.normalizer = self._load_normalizer()
 
         self.point_cloud_readers = self._build_point_cloud_readers(pointcloud_cache_size)
+        self.static_point_cloud_data = self._load_static_point_cloud_data()
         self.prediction_cfg = self._parse_prediction_cfg()
         (
             self.prediction_key_order,
             self.prediction_key_configs,
         ) = self._resolve_prediction_keys()
-
-    def _resolve_depth_keys(self) -> set[str]:
-        visual_cfg = self.contract.get("robot", {}).get("data_sources", {}).get("visual", {})
-        key_entries = visual_cfg.get("keys", [])
-        depth_keys: set[str] = set()
-
-        for entry in key_entries:
-            if not isinstance(entry, dict) or len(entry) != 1:
-                continue
-            key_name, key_cfg = next(iter(entry.items()))
-            if isinstance(key_cfg, dict) and str(key_cfg.get("type", "rgb")).lower() == "depth":
-                depth_keys.add(str(key_name))
-
-        return depth_keys
 
     def _parse_loader_keys(self) -> None:
         loader_cfg = self.contract.get("robot", {}).get("data_loader", {})
@@ -251,19 +251,30 @@ class MultiModalDataset(Dataset):
             key_name = str(key_name)
             if key_name in self.depth_keys:
                 key_kind = "point_cloud"
+            elif key_name in self.scene_point_specs:
+                key_kind = "static_point_cloud"
             elif key_name in self.parquet_columns:
                 key_kind = "lowdim"
             else:
                 raise KeyError(
-                    f"Data-loader key `{key_name}` is neither a configured depth stream nor a parquet column. "
+                    f"Data-loader key `{key_name}` is neither a configured point-cloud stream nor a parquet column. "
                     f"Available parquet columns: {sorted(self.parquet_columns)}"
                 )
 
-            if key_kind == "point_cloud" and normalize:
+            if key_kind in {"point_cloud", "static_point_cloud"} and normalize:
                 raise ValueError(
                     f"Normalization is currently supported only for lowdim parquet keys. "
                     f"`{key_name}` is configured as a depth/point-cloud key."
                 )
+            if key_kind == "static_point_cloud":
+                if obs_window != 1:
+                    raise ValueError(
+                        f"`robot.data_loader.keys.{key_name}.obs_window` must be 1 for static scene points."
+                    )
+                if obs_dss != 1:
+                    raise ValueError(
+                        f"`robot.data_loader.keys.{key_name}.obs_dss` must be 1 for static scene points."
+                    )
 
             existing_cfg = self.key_configs.get(key_name)
             if existing_cfg is not None:
@@ -283,6 +294,8 @@ class MultiModalDataset(Dataset):
 
             if key_kind == "point_cloud":
                 self.point_cloud_keys.append(key_name)
+            elif key_kind == "static_point_cloud":
+                self.static_point_cloud_keys.append(key_name)
             else:
                 self.lowdim_keys.append(key_name)
 
@@ -363,6 +376,50 @@ class MultiModalDataset(Dataset):
             )
 
         return readers
+
+    def _load_static_point_cloud_data(self) -> dict[str, np.ndarray]:
+        if not self.static_point_cloud_keys:
+            return {}
+
+        static_data: dict[str, np.ndarray] = {}
+        num_episodes = len(self.episode_ends)
+        for key_name in self.static_point_cloud_keys:
+            spec = self.scene_point_specs[key_name]
+            scene_path = Path(spec["path"]).expanduser()
+            if not scene_path.is_absolute():
+                scene_path = (self.contract_path.parent / scene_path).resolve()
+            else:
+                scene_path = scene_path.resolve()
+
+            if not scene_path.exists():
+                raise FileNotFoundError(f"Missing scene-points file for `{key_name}`: {scene_path}")
+
+            scene_points = np.load(scene_path, allow_pickle=False)
+            if scene_points.dtype == object:
+                raise ValueError(
+                    f"Scene-points file for `{key_name}` must be a dense numeric array with shape "
+                    f"(num_episodes, N, 3), got dtype=object."
+                )
+
+            scene_points = np.asarray(scene_points, dtype=np.float32)
+            if scene_points.ndim != 3:
+                raise ValueError(
+                    f"Scene-points file for `{key_name}` must have shape (num_episodes, N, 3), "
+                    f"got {scene_points.shape}."
+                )
+            if int(scene_points.shape[0]) != num_episodes:
+                raise ValueError(
+                    f"Scene-points file for `{key_name}` has {scene_points.shape[0]} episodes, "
+                    f"but metadata declares {num_episodes} episodes."
+                )
+            if int(scene_points.shape[-1]) != 3:
+                raise ValueError(
+                    f"Scene-points file for `{key_name}` must end with xyz dimension 3, got {scene_points.shape}."
+                )
+
+            static_data[key_name] = np.ascontiguousarray(scene_points, dtype=np.float32)
+
+        return static_data
 
     def _parse_prediction_cfg(self) -> dict[str, Any]:
         prediction_cfg = self.contract.get("robot", {}).get("data_loader", {}).get("prediction", {})
@@ -475,14 +532,26 @@ class MultiModalDataset(Dataset):
 
         return _to_tensor(padded, dtype=np.float32), _to_tensor(mask)
 
+    def _load_static_point_cloud_window(self, key_name: str, episode_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        scene_points = self.static_point_cloud_data[key_name][int(episode_idx)]
+        mask = np.ones((1, int(scene_points.shape[0])), dtype=bool)
+        window = np.expand_dims(scene_points, axis=0)
+        return _to_tensor(window, dtype=np.float32), _to_tensor(mask)
+
     def __getitem__(self, idx: int) -> dict[str, Any]:
         idx = int(idx)
         self._check_idx_oob(idx)
-        _, episode_start, episode_end = self.get_episode_bounds(idx)
+        episode_idx, episode_start, episode_end = self.get_episode_bounds(idx)
 
         obs_dict: dict[str, torch.Tensor] = {}
         for key_name in self.key_order:
             key_cfg = self.key_configs[key_name]
+            if key_cfg["kind"] == "static_point_cloud":
+                point_cloud, point_cloud_mask = self._load_static_point_cloud_window(key_name, episode_idx)
+                obs_dict[key_name] = point_cloud
+                obs_dict[f"{key_name}{POINT_CLOUD_MASK_SUFFIX}"] = point_cloud_mask
+                continue
+
             obs_indices = self._build_obs_indices(
                 idx=idx,
                 episode_start=episode_start,

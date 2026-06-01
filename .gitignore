@@ -10,3 +10,4 @@ dump.rdb
 training_runs/
 dummy_dataset/
 generated_cad/
+Pointcept/

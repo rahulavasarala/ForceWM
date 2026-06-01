@@ -15,6 +15,39 @@ DEFAULT_NORMALIZATION_REPRESENTATION = "standard"
 SUPPORTED_NORMALIZATION_REPRESENTATIONS = frozenset({"standard", "rotvec", "quat", "matrix", "euler"})
 
 
+def resolve_point_cloud_source_specs(contract: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    visual_cfg = contract.get("robot", {}).get("data_sources", {}).get("visual", {})
+    key_entries = visual_cfg.get("keys", [])
+    point_cloud_specs: dict[str, dict[str, Any]] = {}
+
+    for entry in key_entries:
+        if not isinstance(entry, dict) or len(entry) != 1:
+            continue
+
+        key_name, key_cfg = next(iter(entry.items()))
+        if not isinstance(key_cfg, dict):
+            continue
+
+        key_name = str(key_name)
+        key_type = str(key_cfg.get("type", "rgb")).lower()
+        if key_type == "depth":
+            point_cloud_specs[key_name] = {"kind": "depth"}
+            continue
+
+        if key_type == "scene_points":
+            path_value = key_cfg.get("path")
+            if not isinstance(path_value, str) or not path_value.strip():
+                raise ValueError(
+                    f"`robot.data_sources.visual.keys.{key_name}.path` is required when type is `scene_points`."
+                )
+            point_cloud_specs[key_name] = {
+                "kind": "scene_points",
+                "path": path_value,
+            }
+
+    return point_cloud_specs
+
+
 def _resolve_parquet_path(dataset_path: Path) -> Path:
     dummy_path = dataset_path / "dummy.parquet"
     if dummy_path.exists():
@@ -39,18 +72,11 @@ def _load_contract(universal_contract: str | Path) -> dict[str, Any]:
 
 
 def _resolve_depth_keys(contract: dict[str, Any]) -> set[str]:
-    visual_cfg = contract.get("robot", {}).get("data_sources", {}).get("visual", {})
-    key_entries = visual_cfg.get("keys", [])
-    depth_keys: set[str] = set()
-
-    for entry in key_entries:
-        if not isinstance(entry, dict) or len(entry) != 1:
-            continue
-        key_name, key_cfg = next(iter(entry.items()))
-        if isinstance(key_cfg, dict) and str(key_cfg.get("type", "rgb")).lower() == "depth":
-            depth_keys.add(str(key_name))
-
-    return depth_keys
+    return {
+        key_name
+        for key_name, key_cfg in resolve_point_cloud_source_specs(contract).items()
+        if key_cfg["kind"] == "depth"
+    }
 
 
 def _to_numeric_array(column) -> np.ndarray:
@@ -100,7 +126,7 @@ def _resolve_normalized_lowdim_keys(
 ) -> dict[str, dict[str, Any]]:
     loader_cfg = contract.get("robot", {}).get("data_loader", {})
     key_entries = loader_cfg.get("keys")
-    depth_keys = _resolve_depth_keys(contract)
+    point_cloud_specs = resolve_point_cloud_source_specs(contract)
 
     if not isinstance(key_entries, list) or not key_entries:
         raise ValueError("`robot.data_loader.keys` must be a non-empty list.")
@@ -138,7 +164,7 @@ def _resolve_normalized_lowdim_keys(
                 "representation": representation,
             }
 
-        if key_name in depth_keys:
+        if key_name in point_cloud_specs:
             if normalize:
                 raise ValueError(
                     f"Normalization is currently supported only for lowdim parquet keys. "

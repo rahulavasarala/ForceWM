@@ -64,6 +64,7 @@ class SimplePointConfig:
     bottom_surface: BottomSurfaceConfig
     middle_ring: RingPointConfig
     upper_ring: RingPointConfig
+    female_surface_points: int = 256
 
 
 @dataclass(frozen=True)
@@ -120,6 +121,7 @@ def default_simple_point_config() -> SimplePointConfig:
         ),
         middle_ring=RingPointConfig(height_fraction=0.5, num_points=8),
         upper_ring=RingPointConfig(height_fraction=1.0, num_points=8),
+        female_surface_points=256,
     )
 
 
@@ -150,6 +152,9 @@ def _validate_simple_point_config(point_config: SimplePointConfig) -> SimplePoin
             raise ValueError(f"{name}.height_fraction must be in [0.0, 1.0].")
         if int(ring_config.num_points) <= 0:
             raise ValueError(f"{name}.num_points must be positive.")
+
+    if int(point_config.female_surface_points) <= 0:
+        raise ValueError("female_surface_points must be positive.")
 
     return point_config
 
@@ -227,6 +232,7 @@ def load_point_config(point_config_path: str | Path | None = None) -> SimplePoin
             height_fraction=require_fraction(upper_ring_raw, "height_fraction"),
             num_points=require_positive_int(upper_ring_raw, "num_points"),
         ),
+        female_surface_points=require_positive_int(raw_config, "female_surface_points"),
     )
     return _validate_simple_point_config(point_config)
 

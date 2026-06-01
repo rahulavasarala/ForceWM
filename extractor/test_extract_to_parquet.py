@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ import numpy as np
 
 from extractor import extract_to_parquet as mod
 from extractor import point_finder
+from policies.random_exploration_policy import planner_params_from_generation_metadata_defaults
 
 
 def _action_label_config() -> mod.ActionLabelConfig:
@@ -22,6 +24,78 @@ def _action_label_config() -> mod.ActionLabelConfig:
         frame="female_part",
         orientation_encoding="rotvec",
         target_resample="hold_last",
+    )
+
+
+def _make_point_config(*, female_surface_points: int) -> point_finder.SimplePointConfig:
+    default_config = point_finder.default_simple_point_config()
+    return point_finder.SimplePointConfig(
+        bottom_surface=default_config.bottom_surface,
+        middle_ring=default_config.middle_ring,
+        upper_ring=default_config.upper_ring,
+        female_surface_points=female_surface_points,
+    )
+
+
+def _write_generation_metadata(
+    asset_root: Path,
+    *,
+    part_name: str = "demo_part",
+    length: float = 1.0,
+    width: float = 1.0,
+    height: float = 0.05,
+    hole_radius: float = 0.15,
+    base_height: float = 0.02,
+    amp: float = 0.0,
+) -> dict:
+    asset_root.mkdir(parents=True, exist_ok=True)
+    generation_metadata = {
+        "part_name": part_name,
+        "block_dimensions": {
+            "length": length,
+            "width": width,
+            "height": height,
+        },
+        "hole_dimensions": {
+            "radius": hole_radius,
+            "diameter": 2.0 * hole_radius,
+            "center_x": 0.0,
+            "center_y": 0.0,
+        },
+        "discretization": {
+            "nx": 8,
+            "ny": 8,
+        },
+        "surface": {
+            "family": "default",
+            "base_height": base_height,
+            "amp": amp,
+            "freq_x": 0.0,
+            "freq_y": 0.0,
+            "seed": 0,
+            "gaussian_curvature": 0.08,
+            "gaussian_peak_offset": 0.18,
+            "origin_x": 0.0,
+            "origin_y": 0.0,
+        },
+    }
+    (asset_root / "generation_metadata.json").write_text(
+        json.dumps(generation_metadata),
+        encoding="utf-8",
+    )
+    return generation_metadata
+
+
+def _write_episode_part_metadata(episode_dir: Path, asset_root: Path) -> None:
+    (episode_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "part_metadata": {
+                    "part_asset_root": str(asset_root.resolve()),
+                }
+            }
+        ),
+        encoding="utf-8",
     )
 
 
@@ -97,6 +171,45 @@ class ExtractToParquetTests(unittest.TestCase):
         np.testing.assert_allclose(
             episode.passthrough_lowdim["motion_or_force_axis"],
             np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+        )
+
+    def test_load_lowdim_episode_can_standardize_fspf_axis_direction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            episode_dir = Path(tmp_dir)
+            np.savez(
+                episode_dir / "lowdim.npz",
+                timestamp_s=np.array([0.0, 1.0, 2.0], dtype=np.float64),
+                eef_pos=np.zeros((3, 3), dtype=np.float32),
+                eef_ori=np.repeat(np.eye(3, dtype=np.float32)[None], 3, axis=0),
+                desired_eef_pos=np.zeros((3, 3), dtype=np.float32),
+                desired_eef_ori=np.repeat(np.eye(3, dtype=np.float32)[None], 3, axis=0),
+                desired_force_magnitude=np.array([1.0, 2.0, 3.0], dtype=np.float32),
+                motion_or_force_axis=np.array(
+                    [
+                        [0.0, 0.0, 1.0],
+                        [0.0, 0.0, -1.0],
+                        [1.0, 0.0, 0.0],
+                    ],
+                    dtype=np.float32,
+                ),
+            )
+
+            episode = mod.load_lowdim_episode(
+                episode_dir,
+                _action_label_config(),
+                consistent_fspf_direction=True,
+            )
+
+        np.testing.assert_allclose(
+            episode.passthrough_lowdim["motion_or_force_axis"],
+            np.array(
+                [
+                    [0.0, 0.0, -1.0],
+                    [0.0, 0.0, -1.0],
+                    [1.0, 0.0, 0.0],
+                ],
+                dtype=np.float32,
+            ),
         )
 
     def test_compute_action_labels_returns_relative_pose_and_absolute_force(self) -> None:
@@ -224,6 +337,64 @@ class ExtractToParquetTests(unittest.TestCase):
             np.array([[1.0, 2.0, 3.0], [1.5, 2.5, 3.5], [2.0, 3.0, 4.0]], dtype=np.float32),
         )
 
+    def test_build_scene_points_returns_deterministic_workspace_filtered_surface_clouds(self) -> None:
+        point_config = _make_point_config(female_surface_points=16)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            asset_root = temp_root / "generated_cad" / "demo_part"
+            generation_metadata = _write_generation_metadata(asset_root, hole_radius=0.2)
+            episode_dirs = [
+                temp_root / "episode_000001",
+                temp_root / "episode_000002",
+            ]
+            for episode_dir in episode_dirs:
+                episode_dir.mkdir(parents=True, exist_ok=True)
+                _write_episode_part_metadata(episode_dir, asset_root)
+
+            scene_points = mod.build_scene_points(episode_dirs, point_config=point_config)
+            repeated_scene_points = mod.build_scene_points(episode_dirs, point_config=point_config)
+
+        self.assertEqual(scene_points.shape, (2, 16, 3))
+        self.assertEqual(scene_points.dtype, np.float32)
+        np.testing.assert_allclose(scene_points, repeated_scene_points)
+        np.testing.assert_allclose(scene_points[0], scene_points[1])
+
+        planner_params = planner_params_from_generation_metadata_defaults(
+            generation_metadata,
+            mod.SCENE_POINT_PLANNER_DEFAULTS,
+        )
+        for point_xyz in scene_points[0]:
+            self.assertTrue(planner_params.contains_workspace(point_xyz[:2]))
+            self.assertFalse(planner_params.point_is_in_hole(point_xyz[:2]))
+
+        expected_heights = planner_params.surface.height(scene_points[0, :, 0], scene_points[0, :, 1])
+        np.testing.assert_allclose(scene_points[0, :, 2], expected_heights.astype(np.float32), atol=1e-6)
+
+    def test_build_scene_points_requires_part_asset_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            episode_dir = Path(tmp_dir) / "episode_000001"
+            episode_dir.mkdir(parents=True, exist_ok=True)
+            (episode_dir / "metadata.json").write_text(
+                json.dumps({"part_metadata": {}}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(ValueError):
+                mod.build_scene_points([episode_dir], point_config=_make_point_config(female_surface_points=8))
+
+    def test_build_scene_points_requires_generation_metadata_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            episode_dir = temp_root / "episode_000001"
+            asset_root = temp_root / "generated_cad" / "missing_metadata_part"
+            episode_dir.mkdir(parents=True, exist_ok=True)
+            asset_root.mkdir(parents=True, exist_ok=True)
+            _write_episode_part_metadata(episode_dir, asset_root)
+
+            with self.assertRaises(FileNotFoundError):
+                mod.build_scene_points([episode_dir], point_config=_make_point_config(female_surface_points=8))
+
     def test_extract_dataset_writes_lowdim_only_outputs(self) -> None:
         contract_text = """
 robot:
@@ -242,7 +413,10 @@ robot:
             temp_root = Path(tmp_dir)
             input_dir = temp_root / "input"
             episode_dir = input_dir / "episode_000001"
+            asset_root = temp_root / "generated_cad" / "demo_part"
             episode_dir.mkdir(parents=True, exist_ok=True)
+            _write_generation_metadata(asset_root)
+            _write_episode_part_metadata(episode_dir, asset_root)
             np.savez(
                 episode_dir / "lowdim.npz",
                 timestamp_s=np.array([0.0, 1.0, 2.0], dtype=np.float64),
@@ -279,18 +453,26 @@ robot:
                     trim_end=0,
                     vel_thresh=-1.0,
                     stationary_window=1,
+                    consistent_fspf_direction=True,
                 )
 
             self.assertTrue((output_dir / "dataset.parquet").exists())
             self.assertTrue((output_dir / "metadata.npz").exists())
+            self.assertTrue((output_dir / mod.DEFAULT_SCENE_POINTS_NAME).exists())
             self.assertFalse((output_dir / "videos").exists())
             chunk_paths = sorted((output_dir / "point_clouds" / "episode_0001").glob("chunk_*.npy"))
             self.assertEqual([path.name for path in chunk_paths], ["chunk_0001.npy", "chunk_0002.npy"])
 
             first_chunk = np.load(chunk_paths[0])
             second_chunk = np.load(chunk_paths[1])
+            scene_points = np.load(output_dir / mod.DEFAULT_SCENE_POINTS_NAME)
             self.assertEqual(first_chunk.shape, (2, 32, 3))
             self.assertEqual(second_chunk.shape, (1, 32, 3))
+            self.assertEqual(
+                scene_points.shape,
+                (1, point_finder.default_simple_point_config().female_surface_points, 3),
+            )
+            self.assertEqual(scene_points.dtype, np.float32)
 
             with np.load(output_dir / "metadata.npz") as metadata:
                 np.testing.assert_array_equal(metadata["episode_ends"], np.array([2], dtype=np.int64))
@@ -311,6 +493,18 @@ robot:
                     "motion_or_force_axis",
                     "sensed_force",
                 ],
+            )
+            motion_axes = np.asarray(table.column("motion_or_force_axis").to_pylist(), dtype=np.float32)
+            np.testing.assert_allclose(
+                motion_axes,
+                np.array(
+                    [
+                        [1.0, 0.0, 0.0],
+                        [0.0, 1.0, 0.0],
+                        [0.0, 0.0, -1.0],
+                    ],
+                    dtype=np.float32,
+                ),
             )
 
 

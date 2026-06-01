@@ -1,3 +1,5 @@
+female_surface_points: 256
+
 bottom_surface:
   include_center: true
   concentric_rings:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,7 +24,24 @@ DEFAULT_CHUNK_SIZE = 128
 DEFAULT_VEL_THRESH = -1
 DEFAULT_STATIONARY_WINDOW = 1
 DEFAULT_PARQUET_NAME = "dataset.parquet"
+DEFAULT_SCENE_POINTS_NAME = "scene_points.npy"
 DEFAULT_FEMALE_PART_BODY_NAME = "task"
+FSPF_AXIS_KEYS = frozenset({"motion_or_force_axis", "force_or_motion_axis"})
+SCENE_POINT_PLANNER_DEFAULTS = {
+    "chunk_length": 1,
+    "step_length_k": 0.0,
+    "replan_every_n_chunks": 1,
+    "action_hz_q": 1.0,
+    "step_noise_std": 0.0,
+    "direction_noise_std_deg": 0.0,
+    "z_noise_std": 0.0,
+    "z_noise_lower_bound": 0.0,
+    "z_noise_upper_bound": 0.0,
+    "force_magnitude_lower_bound": 0.0,
+    "force_magnitude_upper_bound": 0.0,
+    "step_noise_decay": 1.0,
+    "direction_noise_decay": 1.0,
+}
 
 
 @dataclass(frozen=True)
@@ -297,7 +315,36 @@ def _validate_passthrough_lowdim_array(
     )
 
 
-def load_lowdim_episode(episode_dir: Path, action_label_config: ActionLabelConfig) -> EpisodeData:
+def _standardize_fspf_direction(
+    passthrough_lowdim: dict[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    standardized = dict(passthrough_lowdim)
+    for key_name in FSPF_AXIS_KEYS:
+        if key_name not in standardized:
+            continue
+
+        axis_values = np.asarray(standardized[key_name], dtype=np.float32)
+        if axis_values.ndim == 1:
+            axis_values = axis_values.reshape(1, -1)
+        if axis_values.ndim != 2 or axis_values.shape[1] != 3:
+            raise ValueError(
+                f"`{key_name}` must have shape (T, 3) to standardize FSPF direction, got {axis_values.shape}."
+            )
+
+        standardized_axis_values = axis_values.copy()
+        flip_mask = standardized_axis_values[:, 2] > 0.0
+        standardized_axis_values[flip_mask] *= -1.0
+        standardized[key_name] = standardized_axis_values
+
+    return standardized
+
+
+def load_lowdim_episode(
+    episode_dir: Path,
+    action_label_config: ActionLabelConfig,
+    *,
+    consistent_fspf_direction: bool = False,
+) -> EpisodeData:
     lowdim_path = episode_dir / "lowdim.npz"
     if not lowdim_path.exists():
         raise FileNotFoundError(f"Missing lowdim file: {lowdim_path}")
@@ -363,6 +410,9 @@ def load_lowdim_episode(episode_dir: Path, action_label_config: ActionLabelConfi
                 lowdim_archive[key_name],
                 expected_length=len(timestamps),
             )
+
+    if consistent_fspf_direction:
+        passthrough_lowdim = _standardize_fspf_direction(passthrough_lowdim)
 
     expected_length = len(timestamps)
     for key_name, array in [
@@ -559,8 +609,14 @@ def process_episode(
     female_part_position_world: np.ndarray,
     contact_spec: ContactCylinderSpec,
     point_config: SimplePointConfig,
+    *,
+    consistent_fspf_direction: bool = False,
 ) -> EpisodeProcessingResult | None:
-    episode = load_lowdim_episode(episode_dir, action_label_config)
+    episode = load_lowdim_episode(
+        episode_dir,
+        action_label_config,
+        consistent_fspf_direction=consistent_fspf_direction,
+    )
 
     prune_keep_mask = build_prune_keep_mask(
         timestamps=episode.timestamps,
@@ -730,6 +786,109 @@ def write_chunked_point_clouds(
         np.save(chunk_path, point_clouds[chunk_start:chunk_end].astype(np.float32))
 
 
+def _load_generation_metadata_path(episode_dir: Path) -> Path:
+    metadata_path = episode_dir / "metadata.json"
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"Missing episode metadata for scene points: {metadata_path}")
+
+    with metadata_path.open("r", encoding="utf-8") as handle:
+        episode_metadata = json.load(handle)
+    if not isinstance(episode_metadata, dict):
+        raise ValueError(f"Episode metadata at {metadata_path} must contain a top-level mapping.")
+
+    part_metadata = episode_metadata.get("part_metadata")
+    if not isinstance(part_metadata, dict):
+        raise ValueError(
+            f"Episode metadata at {metadata_path} must contain `part_metadata` to build scene points."
+        )
+
+    raw_asset_root = part_metadata.get("part_asset_root")
+    if not isinstance(raw_asset_root, str) or not raw_asset_root.strip():
+        raise ValueError(
+            f"Episode metadata at {metadata_path} must contain `part_metadata.part_asset_root`."
+        )
+
+    generation_metadata_path = (Path(raw_asset_root).expanduser().resolve() / "generation_metadata.json")
+    if not generation_metadata_path.exists():
+        raise FileNotFoundError(f"Missing generation metadata for scene points: {generation_metadata_path}")
+    return generation_metadata_path
+
+
+def _sample_scene_points_from_planner(params: Any, num_points: int) -> np.ndarray:
+    if int(num_points) <= 0:
+        raise ValueError("num_points must be positive when building scene points.")
+
+    target_points = int(num_points)
+    base_resolution = max(2, int(np.ceil(np.sqrt(target_points))))
+    resolution = base_resolution
+    max_resolution = max(base_resolution, 16384)
+    valid_points_xy: np.ndarray | None = None
+
+    while resolution <= max_resolution:
+        x_coords = np.linspace(params.rectangle.x_min, params.rectangle.x_max, num=resolution, dtype=np.float64)
+        y_coords = np.linspace(params.rectangle.y_min, params.rectangle.y_max, num=resolution, dtype=np.float64)
+        grid_x, grid_y = np.meshgrid(x_coords, y_coords, indexing="xy")
+        candidate_points_xy = np.column_stack((grid_x.reshape(-1), grid_y.reshape(-1)))
+        workspace_mask = np.array(
+            [params.contains_workspace(point_xy) for point_xy in candidate_points_xy],
+            dtype=bool,
+        )
+        valid_points_xy = candidate_points_xy[workspace_mask]
+        if len(valid_points_xy) >= target_points:
+            break
+        resolution *= 2
+
+    if valid_points_xy is None or len(valid_points_xy) < target_points:
+        raise ValueError(
+            f"Could not sample {target_points} valid scene points from workspace bounds "
+            f"{params.rectangle} after increasing lattice resolution to {resolution}."
+        )
+
+    if len(valid_points_xy) == target_points:
+        selected_points_xy = valid_points_xy
+    elif target_points == 1:
+        selected_points_xy = valid_points_xy[[len(valid_points_xy) // 2]]
+    else:
+        sample_indices = np.floor(
+            np.linspace(0.0, float(len(valid_points_xy) - 1), num=target_points) + 1e-9
+        ).astype(np.int64)
+        selected_points_xy = valid_points_xy[sample_indices]
+
+    selected_heights = np.asarray(
+        params.surface.height(selected_points_xy[:, 0], selected_points_xy[:, 1]),
+        dtype=np.float32,
+    ).reshape(-1)
+    return np.column_stack((selected_points_xy.astype(np.float32), selected_heights)).astype(np.float32)
+
+
+def build_scene_points(
+    episode_dirs: list[Path],
+    point_config: SimplePointConfig,
+) -> np.ndarray:
+    if not episode_dirs:
+        raise ValueError("build_scene_points requires at least one surviving episode directory.")
+
+    from policies.random_exploration_policy import planner_params_from_generation_metadata_defaults
+
+    scene_point_clouds: list[np.ndarray] = []
+    for episode_dir in episode_dirs:
+        generation_metadata_path = _load_generation_metadata_path(episode_dir)
+        with generation_metadata_path.open("r", encoding="utf-8") as handle:
+            generation_metadata = json.load(handle)
+        planner_params = planner_params_from_generation_metadata_defaults(
+            generation_metadata,
+            SCENE_POINT_PLANNER_DEFAULTS,
+        )
+        scene_point_clouds.append(
+            _sample_scene_points_from_planner(
+                params=planner_params,
+                num_points=point_config.female_surface_points,
+            )
+        )
+
+    return np.stack(scene_point_clouds, axis=0).astype(np.float32)
+
+
 def extract_dataset(
     input_dir: Path,
     output_dir: Path,
@@ -740,6 +899,7 @@ def extract_dataset(
     trim_end: int,
     vel_thresh: float,
     stationary_window: int,
+    consistent_fspf_direction: bool = False,
 ) -> None:
     contract = load_universal_contract(universal_contract_path)
     action_label_config = parse_action_label_config(contract)
@@ -752,6 +912,7 @@ def extract_dataset(
     prepare_output_dir(output_dir)
 
     processed_episodes: list[ProcessedEpisode] = []
+    surviving_episode_dirs: list[Path] = []
     point_cloud_episode_count = 0
     for episode_dir in episode_dirs:
         processing_result = process_episode(
@@ -764,6 +925,7 @@ def extract_dataset(
             female_part_position_world=female_part_position_world,
             contact_spec=contact_spec,
             point_config=point_config,
+            consistent_fspf_direction=consistent_fspf_direction,
         )
         if processing_result is None:
             continue
@@ -777,15 +939,19 @@ def extract_dataset(
         )
         point_cloud_episode_count += 1
         processed_episodes.append(processing_result.processed_episode)
+        surviving_episode_dirs.append(episode_dir)
 
     if not processed_episodes:
         raise RuntimeError("No episodes survived extraction. Nothing was written.")
 
     total_rows = write_parquet(output_dir, processed_episodes)
     episode_ends = write_metadata(output_dir, processed_episodes, chunk_size=chunk_size)
+    scene_points = build_scene_points(surviving_episode_dirs, point_config=point_config)
+    np.save(output_dir / DEFAULT_SCENE_POINTS_NAME, scene_points.astype(np.float32))
     print(f"Wrote {len(processed_episodes)} episodes and {total_rows} rows to {output_dir}")
     print(f"episode_ends={episode_ends.tolist()}")
     print(f"Wrote chunked synthetic point clouds for {point_cloud_episode_count} episodes.")
+    print(f"Wrote static scene points with shape {tuple(scene_points.shape)} to {output_dir / DEFAULT_SCENE_POINTS_NAME}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -844,6 +1010,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Trailing window size used to classify stationary frames.",
     )
+    parser.add_argument(
+        "--consistent-fspf-direction",
+        action="store_true",
+        help="Flip `motion_or_force_axis` / `force_or_motion_axis` rows so they point toward negative z when possible.",
+    )
     return parser.parse_args()
 
 
@@ -869,6 +1040,7 @@ def main() -> None:
         trim_end=int(args.trim_end),
         vel_thresh=float(args.vel_thresh),
         stationary_window=int(args.stationary_window),
+        consistent_fspf_direction=bool(args.consistent_fspf_direction),
     )
 
 

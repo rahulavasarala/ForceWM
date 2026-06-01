@@ -336,8 +336,10 @@ class SaverTimestampTests(unittest.TestCase):
         tmp_dir: str,
         lowdim_buffer: list[dict],
         camera_buffer: list[dict],
+        contract: dict | None = None,
+        contract_path: Path | None = None,
     ) -> tuple[Saver, _FakeWriter]:
-        contract = self._make_contract()
+        contract = self._make_contract() if contract is None else contract
         robot_observer = _FakeObserver(
             buffer=lowdim_buffer,
             contract=contract,
@@ -355,6 +357,7 @@ class SaverTimestampTests(unittest.TestCase):
             save_dir=Path(tmp_dir) / "episodes",
             robot_observer=robot_observer,
             camera_observer=camera_observer,
+            contract_path=contract_path,
         )
         saver._episode_id = 1
         saver._episode_dir = saver.save_dir / "episode_000001"
@@ -500,6 +503,72 @@ class SaverTimestampTests(unittest.TestCase):
                 metadata["camera_source_time_ranges_s"]["camera_01"],
                 {"start": 2.2, "end": 2.3},
             )
+    def test_saver_infers_part_metadata_from_scene_xml(self) -> None:
+        identity = np.eye(3, dtype=np.float64)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            models_dir = root / "models"
+            asset_dir = root / "generated_cad" / "demo_part"
+            models_dir.mkdir(parents=True, exist_ok=False)
+            asset_dir.mkdir(parents=True, exist_ok=False)
+            (root / "contract.yaml").write_text("robot:\n  xml_path: models/scene.xml\n", encoding="utf-8")
+            (models_dir / "scene.xml").write_text(
+                "<mujoco model=\"scene\">\n"
+                "  <include file=\"fr3.xml\"/>\n"
+                "  <include file=\"demo_part.xml\"/>\n"
+                "</mujoco>\n",
+                encoding="utf-8",
+            )
+            (models_dir / "fr3.xml").write_text("<mujoco model=\"fr3\"><worldbody/></mujoco>\n", encoding="utf-8")
+            (models_dir / "demo_part.xml").write_text(
+                "<mujoco model=\"demo_part\">\n"
+                "  <asset>\n"
+                "    <mesh name=\"demo\" file=\"../generated_cad/demo_part/hole_block.stl\"/>\n"
+                "  </asset>\n"
+                "  <worldbody>\n"
+                "    <body name=\"task\" pos=\"0.4 0.1 0.3\" quat=\"1 0 0 0\"/>\n"
+                "  </worldbody>\n"
+                "</mujoco>\n",
+                encoding="utf-8",
+            )
+            contract = self._make_contract()
+            contract["robot"]["xml_path"] = "models/scene.xml"
+            saver, _ = self._prepare_saver(
+                tmp_dir=tmp_dir,
+                lowdim_buffer=[
+                    {
+                        "observer_seq": 0,
+                        "timestamp_s": 3.0,
+                        "source_seq": 30,
+                        "eef_pos": np.array([0.0, 0.0, 0.0]),
+                        "eef_ori": identity,
+                    }
+                ],
+                camera_buffer=[
+                    {
+                        "observer_seq": 0,
+                        "timestamp_s": 2.0,
+                        "camera_frame_seq": 20,
+                        "camera_frame_seqs": {"camera_01": 20},
+                        "camera_01": np.zeros((2, 2, 3), dtype=np.uint8),
+                    }
+                ],
+                contract=contract,
+                contract_path=root / "contract.yaml",
+            )
+
+            saver._finalize_episode(110.0)
+            metadata = saver.last_completed_episode_summary
+            self.assertIsNotNone(metadata)
+            assert metadata is not None
+
+            part_metadata = metadata["part_metadata"]
+            self.assertEqual(part_metadata["part_name"], "demo_part")
+            self.assertEqual(part_metadata["scene_xml_path"], str((models_dir / "scene.xml").resolve()))
+            self.assertEqual(part_metadata["part_xml_path"], str((models_dir / "demo_part.xml").resolve()))
+            self.assertEqual(part_metadata["part_asset_root"], str(asset_dir.resolve()))
+            self.assertEqual(part_metadata["part_position"], [0.4, 0.1, 0.3])
+            self.assertEqual(part_metadata["part_orientation_quat"], [1.0, 0.0, 0.0, 0.0])
 
 if __name__ == "__main__":
     unittest.main()

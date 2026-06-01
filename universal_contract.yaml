@@ -44,6 +44,9 @@ robot:
             unit: "mm"
             dim: [224, 224, 1]
             align_to: "camera_01"
+        - scene_points:
+            type: "scene_points"
+            path: "data_storage/dpth_v8_extracted/scene_points.npy"
   action_labels:
     current_position_key: "eef_pos"
     current_orientation_key: "eef_ori"
@@ -79,11 +82,15 @@ robot:
       - sensed_force:
           obs_window: 3
           obs_dss: 1
-          normalize: true
+        #   normalize: true
       - sensed_moment:
           obs_window: 3
           obs_dss: 1
-          normalize: true
+        #   normalize: true
+      - scene_points:
+          obs_window: 1
+          obs_dss: 1
+
   
     prediction:
       mode: absolute # absolute or relative

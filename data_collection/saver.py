@@ -3,6 +3,7 @@ import json
 import shutil
 import threading
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 import cv2
@@ -10,6 +11,7 @@ import numpy as np
 import yaml
 class Saver:
     DEFAULT_FPS = 30.0
+    DEFAULT_TASK_BODY_NAME = "task"
     def __init__(self, save_dir, robot_observer, camera_observer, contract_path=None, video_codec="mp4v"):
         if robot_observer is None or camera_observer is None:
             raise ValueError("Both robot_observer and camera_observer must be provided.")
@@ -65,6 +67,7 @@ class Saver:
             name: "sim_time_s" if spec.get("source_type") == "sim" else "wall_time_s"
             for name, spec in self.camera_specs.items()
         }
+        self._part_metadata = self._load_part_metadata()
     def start(self) -> float:
         with self._state_lock:
             if self._recording:
@@ -257,6 +260,8 @@ class Saver:
                 "lowdim_source_time_range_s": self._timestamp_range(self._lowdim_records["timestamp_s"]),
                 "camera_source_time_ranges_s": {name: self._timestamp_range(timestamps) for name, timestamps in self._camera_timestamps.items()},
             }
+            if self._part_metadata is not None:
+                metadata["part_metadata"] = dict(self._part_metadata)
             with (self._episode_dir / "metadata.json").open("w", encoding="utf-8") as handle:
                 json.dump(metadata, handle, indent=2)
             self._last_completed_episode_summary = metadata
@@ -323,3 +328,117 @@ class Saver:
     @staticmethod
     def _timestamp_range(values: list[float]) -> dict[str, float] | None:
         return None if not values else {"start": float(values[0]), "end": float(values[-1])}
+    def _load_part_metadata(self) -> dict[str, Any] | None:
+        scene_xml_path = self._resolve_scene_xml_path()
+        if scene_xml_path is None:
+            return None
+        metadata: dict[str, Any] = {
+            "scene_xml_path": str(scene_xml_path),
+            "task_body_name": self.DEFAULT_TASK_BODY_NAME,
+        }
+        try:
+            metadata.update(self._infer_part_metadata(scene_xml_path, body_name=self.DEFAULT_TASK_BODY_NAME))
+        except Exception as exc:
+            metadata["inference_error"] = str(exc)
+        return metadata
+    def _resolve_scene_xml_path(self) -> Path | None:
+        robot_cfg = self.contract.get("robot")
+        if not isinstance(robot_cfg, dict):
+            return None
+        raw_xml_path = robot_cfg.get("xml_path")
+        if not isinstance(raw_xml_path, str) or not raw_xml_path.strip():
+            return None
+        candidate_path = Path(raw_xml_path).expanduser()
+        if candidate_path.is_absolute():
+            return candidate_path.resolve()
+        base_dir = self.contract_path.parent if self.contract_path is not None else Path(__file__).resolve().parents[1]
+        return (base_dir / candidate_path).resolve()
+    @classmethod
+    def _infer_part_metadata(cls, scene_xml_path: Path, body_name: str) -> dict[str, Any]:
+        search_paths = cls._collect_xml_search_paths(scene_xml_path)
+        for xml_path in search_paths:
+            if not xml_path.exists():
+                continue
+            xml_root = ET.parse(xml_path).getroot()
+            body_element = cls._find_body_element(xml_root, body_name)
+            if body_element is None:
+                continue
+            mesh_paths = cls._resolve_mesh_paths(xml_root, xml_path)
+            part_name, asset_root = cls._infer_part_identity(xml_path, mesh_paths)
+            part_metadata = {
+                "part_name": part_name,
+                "part_xml_path": str(xml_path),
+                "part_position": cls._parse_vector(
+                    raw_value=body_element.attrib.get("pos", "0 0 0"),
+                    expected_dim=3,
+                    field_name="pos",
+                    xml_path=xml_path,
+                ),
+            }
+            if asset_root is not None:
+                part_metadata["part_asset_root"] = str(asset_root)
+            raw_quat = body_element.attrib.get("quat")
+            if raw_quat is not None:
+                part_metadata["part_orientation_quat"] = cls._parse_vector(
+                    raw_value=raw_quat,
+                    expected_dim=4,
+                    field_name="quat",
+                    xml_path=xml_path,
+                )
+            return part_metadata
+        raise ValueError(f"Could not find body `{body_name}` in {scene_xml_path} or its included XML files.")
+    @classmethod
+    def _collect_xml_search_paths(cls, scene_xml_path: Path) -> list[Path]:
+        pending_paths = [scene_xml_path.resolve()]
+        search_paths: list[Path] = []
+        visited_paths: set[Path] = set()
+        while pending_paths:
+            xml_path = pending_paths.pop(0)
+            if xml_path in visited_paths:
+                continue
+            visited_paths.add(xml_path)
+            search_paths.append(xml_path)
+            if not xml_path.exists():
+                continue
+            xml_root = ET.parse(xml_path).getroot()
+            for include_element in xml_root.iter("include"):
+                raw_include_path = include_element.attrib.get("file")
+                if not isinstance(raw_include_path, str) or not raw_include_path.strip():
+                    continue
+                pending_paths.append((xml_path.parent / raw_include_path).resolve())
+        return search_paths
+    @staticmethod
+    def _find_body_element(xml_root: ET.Element, body_name: str) -> ET.Element | None:
+        for body_element in xml_root.iter("body"):
+            if body_element.attrib.get("name") == body_name:
+                return body_element
+        return None
+    @staticmethod
+    def _resolve_mesh_paths(xml_root: ET.Element, xml_path: Path) -> list[Path]:
+        mesh_paths: list[Path] = []
+        for mesh_element in xml_root.iter("mesh"):
+            raw_mesh_path = mesh_element.attrib.get("file")
+            if not isinstance(raw_mesh_path, str) or not raw_mesh_path.strip():
+                continue
+            mesh_paths.append((xml_path.parent / raw_mesh_path).resolve())
+        return mesh_paths
+    @staticmethod
+    def _infer_part_identity(part_xml_path: Path, mesh_paths: list[Path]) -> tuple[str, Path | None]:
+        for mesh_path in mesh_paths:
+            mesh_parts = mesh_path.parts
+            if "generated_cad" in mesh_parts:
+                generated_cad_index = mesh_parts.index("generated_cad")
+                if generated_cad_index + 1 < len(mesh_parts):
+                    asset_root = Path(*mesh_parts[: generated_cad_index + 2])
+                    return mesh_parts[generated_cad_index + 1], asset_root
+        if mesh_paths:
+            return part_xml_path.stem, mesh_paths[0].parent
+        return part_xml_path.stem, None
+    @staticmethod
+    def _parse_vector(raw_value: str, expected_dim: int, field_name: str, xml_path: Path) -> list[float]:
+        vector = np.fromstring(raw_value, sep=" ", dtype=np.float64)
+        if vector.shape != (expected_dim,):
+            raise ValueError(
+                f"Expected `{field_name}` in {xml_path} to have {expected_dim} values, got `{raw_value}`."
+            )
+        return vector.tolist()

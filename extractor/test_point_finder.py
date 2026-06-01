@@ -132,11 +132,17 @@ class PointFinderTests(unittest.TestCase):
         self.assertEqual(point_clouds.shape, (1, 31, 3))
         np.testing.assert_allclose(point_clouds[0, 1], expected_first_surface_point, atol=1e-6)
 
+    def test_default_simple_point_config_includes_positive_female_surface_points(self) -> None:
+        point_config = mod.default_simple_point_config()
+
+        self.assertGreater(point_config.female_surface_points, 0)
+
     def test_load_point_config_parses_explicit_counts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = Path(tmp_dir) / "points.yaml"
             config_path.write_text(
                 (
+                    "female_surface_points: 64\n"
                     "bottom_surface:\n"
                     "  include_center: true\n"
                     "  concentric_rings:\n"
@@ -159,6 +165,7 @@ class PointFinderTests(unittest.TestCase):
         self.assertEqual(point_config.bottom_surface.concentric_rings[0].num_points, 4)
         self.assertEqual(point_config.middle_ring.num_points, 6)
         self.assertEqual(point_config.upper_ring.height_fraction, 1.0)
+        self.assertEqual(point_config.female_surface_points, 64)
 
     def test_project_world_points_to_pixels_projects_camera_center(self) -> None:
         calibration = self._camera_calibration()

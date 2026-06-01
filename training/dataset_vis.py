@@ -19,6 +19,7 @@ MOTION_OR_FORCE_AXIS_KEYS = ("motion_or_force_axis", "force_or_motion_axis")
 SENSED_FORCE_KEY = "sensed_force"
 SENSED_MOMENT_KEY = "sensed_moment"
 ACTION_DELTA_POS_KEY = "action_delta_pos"
+SCENE_POINT_COLOR = "saddlebrown"
 
 
 def _to_numpy(value):
@@ -46,6 +47,12 @@ def _select_point_cloud_key(dataset: MultiModalDataset) -> str:
     if not dataset.point_cloud_keys:
         raise ValueError("The dataset does not expose any point-cloud observation keys.")
     return dataset.point_cloud_keys[0]
+
+
+def _select_scene_point_cloud_key(dataset: MultiModalDataset) -> str | None:
+    if not dataset.static_point_cloud_keys:
+        return None
+    return dataset.static_point_cloud_keys[0]
 
 
 def _split_depth_and_ee_points(valid_points: np.ndarray) -> tuple[np.ndarray | None, np.ndarray]:
@@ -370,19 +377,6 @@ def _draw_force_motion_axis_panel(
             color="royalblue",
             linewidth=2.8,
         )
-        axis.quiver(
-            0.0,
-            0.0,
-            0.0,
-            -basis_axis[0],
-            -basis_axis[1],
-            -basis_axis[2],
-            length=0.95,
-            normalize=True,
-            color="royalblue",
-            linewidth=1.6,
-            alpha=0.45,
-        )
 
     for basis_axis in force_axes:
         axis.quiver(
@@ -396,19 +390,6 @@ def _draw_force_motion_axis_panel(
             normalize=True,
             color="crimson",
             linewidth=2.8,
-        )
-        axis.quiver(
-            0.0,
-            0.0,
-            0.0,
-            -basis_axis[0],
-            -basis_axis[1],
-            -basis_axis[2],
-            length=0.95,
-            normalize=True,
-            color="crimson",
-            linewidth=1.6,
-            alpha=0.45,
         )
 
     if predicted_force_dimensions is not None and predicted_axes is not None:
@@ -520,6 +501,7 @@ def _draw_point_cloud_sample(
         sample,
         point_cloud_key,
     )
+    scene_point_cloud_key = _select_scene_point_cloud_key(dataset)
     force_dimension = _extract_latest_scalar(obs_dict, FORCE_DIMENSION_KEY)
     motion_or_force_axis = _extract_latest_vector(obs_dict, MOTION_OR_FORCE_AXIS_KEYS)
     sensed_force = _extract_latest_vector(obs_dict, SENSED_FORCE_KEY)
@@ -545,6 +527,33 @@ def _draw_point_cloud_sample(
     pred_color_map = plt.get_cmap("plasma", prediction_point_clouds.shape[0])
     latest_valid_points = point_clouds[-1][point_cloud_mask[-1]]
     latest_ee_point, _ = _split_depth_and_ee_points(latest_valid_points)
+
+    if scene_point_cloud_key is not None and scene_point_cloud_key in obs_dict:
+        scene_point_clouds = _to_numpy(obs_dict[scene_point_cloud_key]).astype(np.float32, copy=False)
+        scene_point_cloud_mask = _to_numpy(
+            obs_dict[f"{scene_point_cloud_key}{POINT_CLOUD_MASK_SUFFIX}"]
+        ).astype(bool, copy=False)
+        if scene_point_clouds.ndim != 3 or scene_point_clouds.shape[-1] != 3:
+            raise ValueError(
+                f"Expected `{scene_point_cloud_key}` to have shape (T, P, 3), got {scene_point_clouds.shape}."
+            )
+        if scene_point_cloud_mask.shape != scene_point_clouds.shape[:2]:
+            raise ValueError(
+                f"Expected `{scene_point_cloud_key}{POINT_CLOUD_MASK_SUFFIX}` to have shape "
+                f"{scene_point_clouds.shape[:2]}, got {scene_point_cloud_mask.shape}."
+            )
+
+        scene_valid_points = scene_point_clouds[0][scene_point_cloud_mask[0]]
+        if len(scene_valid_points) != 0:
+            point_cloud_axis.scatter(
+                scene_valid_points[:, 0],
+                scene_valid_points[:, 1],
+                scene_valid_points[:, 2],
+                s=16,
+                alpha=0.9,
+                color=SCENE_POINT_COLOR,
+                label=f"scene points ({len(scene_valid_points)} pts)",
+            )
 
     ee_label_drawn = False
     for timestep in timesteps_to_draw:

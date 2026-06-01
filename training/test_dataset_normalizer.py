@@ -41,7 +41,7 @@ def _write_dataset(dataset_path: Path) -> dict[str, np.ndarray]:
     dataset_path.mkdir(parents=True, exist_ok=True)
 
     angles = np.array([0.0, 0.15, 0.3, 0.45, 0.6], dtype=np.float32)
-    eef_ori = R.from_euler("z", angles).as_matrix().astype(np.float32).reshape(-1, 9)
+    eef_ori = R.from_euler("z", angles.reshape(-1, 1)).as_matrix().astype(np.float32).reshape(-1, 9)
 
     columns = {
         "eef_pos": np.array(
@@ -232,7 +232,6 @@ def _write_contract(
     *,
     loader_entries: list[tuple[str, dict[str, object]]],
     include_depth_key: bool = False,
-    scene_points_path: str | None = None,
 ) -> None:
     robot_cfg: dict[str, object] = {
         "data_loader": {
@@ -244,22 +243,13 @@ def _write_contract(
         }
     }
 
-    if include_depth_key or scene_points_path is not None:
+    if include_depth_key:
         visual_keys: list[dict[str, object]] = []
         if include_depth_key:
             visual_keys.append(
                 {
                     "camera_01_depth": {
                         "type": "depth",
-                    }
-                }
-            )
-        if scene_points_path is not None:
-            visual_keys.append(
-                {
-                    "scene_points": {
-                        "type": "scene_points",
-                        "path": scene_points_path,
                     }
                 }
             )
@@ -308,6 +298,29 @@ class DatasetNormalizerTests(unittest.TestCase):
                 contract_path,
                 loader_entries=[
                     ("camera_01_depth", {"obs_window": 2, "obs_dss": 1, "normalize": True}),
+                    ("sensed_force", {"obs_window": 2, "obs_dss": 1}),
+                ],
+                include_depth_key=True,
+            )
+
+            with self.assertRaisesRegex(ValueError, "point-cloud key"):
+                build_normalizer(dataset_path, contract_path)
+
+            with self.assertRaisesRegex(ValueError, "point-cloud key"):
+                MultiModalDataset(dataset_path, contract_path)
+
+    def test_dataset_rejects_scene_points_normalization(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dataset_path = Path(tmp_dir) / "dataset"
+            _write_multiepisode_dataset(dataset_path)
+            _write_point_cloud_chunks(dataset_path, [3, 3], num_points=4)
+            np.save(dataset_path / "scene_points.npy", np.zeros((2, 3, 3), dtype=np.float32))
+            contract_path = Path(tmp_dir) / "contract.yaml"
+            _write_contract(
+                contract_path,
+                loader_entries=[
+                    ("camera_01_depth", {"obs_window": 2, "obs_dss": 1}),
+                    ("scene_points", {"obs_window": 1, "obs_dss": 1, "normalize": True}),
                     ("sensed_force", {"obs_window": 2, "obs_dss": 1}),
                 ],
                 include_depth_key=True,
@@ -519,7 +532,7 @@ class DatasetNormalizerTests(unittest.TestCase):
                 ],
                 dtype=np.float32,
             )
-            scene_points_path = Path(tmp_dir) / "scene_points.npy"
+            scene_points_path = dataset_path / "scene_points.npy"
             np.save(scene_points_path, scene_points)
 
             contract_path = Path(tmp_dir) / "contract.yaml"
@@ -537,7 +550,6 @@ class DatasetNormalizerTests(unittest.TestCase):
                     ("sensed_moment", {"obs_window": 2, "obs_dss": 1}),
                 ],
                 include_depth_key=True,
-                scene_points_path=str(scene_points_path),
             )
 
             dataset = MultiModalDataset(dataset_path, contract_path)
@@ -558,7 +570,7 @@ class DatasetNormalizerTests(unittest.TestCase):
             dataset_path = Path(tmp_dir) / "dataset"
             _write_multiepisode_dataset(dataset_path)
             _write_point_cloud_chunks(dataset_path, [3, 3], num_points=4)
-            scene_points_path = Path(tmp_dir) / "scene_points.npy"
+            scene_points_path = dataset_path / "scene_points.npy"
             np.save(scene_points_path, np.zeros((1, 3, 3), dtype=np.float32))
 
             contract_path = Path(tmp_dir) / "contract.yaml"
@@ -573,7 +585,6 @@ class DatasetNormalizerTests(unittest.TestCase):
                     ("force_dimension", {"obs_window": 2, "obs_dss": 1}),
                 ],
                 include_depth_key=True,
-                scene_points_path=str(scene_points_path),
             )
 
             with self.assertRaisesRegex(ValueError, "metadata declares 2 episodes"):
@@ -584,7 +595,7 @@ class DatasetNormalizerTests(unittest.TestCase):
             dataset_path = Path(tmp_dir) / "dataset"
             _write_multiepisode_dataset(dataset_path)
             _write_point_cloud_chunks(dataset_path, [3, 3], num_points=4)
-            scene_points_path = Path(tmp_dir) / "scene_points.npy"
+            scene_points_path = dataset_path / "scene_points.npy"
             np.save(scene_points_path, np.zeros((2, 3, 4), dtype=np.float32))
 
             contract_path = Path(tmp_dir) / "contract.yaml"
@@ -599,7 +610,6 @@ class DatasetNormalizerTests(unittest.TestCase):
                     ("force_dimension", {"obs_window": 2, "obs_dss": 1}),
                 ],
                 include_depth_key=True,
-                scene_points_path=str(scene_points_path),
             )
 
             with self.assertRaisesRegex(ValueError, "xyz dimension 3"):
@@ -610,7 +620,7 @@ class DatasetNormalizerTests(unittest.TestCase):
             dataset_path = Path(tmp_dir) / "dataset"
             _write_multiepisode_dataset(dataset_path)
             _write_point_cloud_chunks(dataset_path, [3, 3], num_points=4)
-            scene_points_path = Path(tmp_dir) / "scene_points.npy"
+            scene_points_path = dataset_path / "scene_points.npy"
             np.save(scene_points_path, np.zeros((2, 3, 3), dtype=np.float32))
 
             contract_path = Path(tmp_dir) / "contract.yaml"
@@ -625,10 +635,32 @@ class DatasetNormalizerTests(unittest.TestCase):
                     ("force_dimension", {"obs_window": 2, "obs_dss": 1}),
                 ],
                 include_depth_key=True,
-                scene_points_path=str(scene_points_path),
             )
 
             with self.assertRaisesRegex(ValueError, "obs_window` must be 1"):
+                MultiModalDataset(dataset_path, contract_path)
+
+    def test_scene_points_require_dataset_root_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dataset_path = Path(tmp_dir) / "dataset"
+            _write_multiepisode_dataset(dataset_path)
+            _write_point_cloud_chunks(dataset_path, [3, 3], num_points=4)
+
+            contract_path = Path(tmp_dir) / "contract.yaml"
+            _write_contract(
+                contract_path,
+                loader_entries=[
+                    ("camera_01_depth", {"obs_window": 2, "obs_dss": 1}),
+                    ("scene_points", {"obs_window": 1, "obs_dss": 1}),
+                    ("sensed_force", {"obs_window": 2, "obs_dss": 1}),
+                    ("sensed_moment", {"obs_window": 2, "obs_dss": 1}),
+                    ("motion_or_force_axis", {"obs_window": 2, "obs_dss": 1}),
+                    ("force_dimension", {"obs_window": 2, "obs_dss": 1}),
+                ],
+                include_depth_key=True,
+            )
+
+            with self.assertRaisesRegex(FileNotFoundError, "dataset root"):
                 MultiModalDataset(dataset_path, contract_path)
 
 

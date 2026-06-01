@@ -14,6 +14,7 @@ if __package__:
     from .normalizer import (
         DEFAULT_NORMALIZATION_REPRESENTATION,
         DatasetNormalizer,
+        STATIC_SCENE_POINTS_KEY,
         resolve_normalization_config,
         resolve_point_cloud_source_specs,
     )
@@ -22,6 +23,7 @@ else:
     from normalizer import (
         DEFAULT_NORMALIZATION_REPRESENTATION,
         DatasetNormalizer,
+        STATIC_SCENE_POINTS_KEY,
         resolve_normalization_config,
         resolve_point_cloud_source_specs,
     )
@@ -192,11 +194,6 @@ class MultiModalDataset(Dataset):
             for key_name, spec in self.point_cloud_source_specs.items()
             if spec["kind"] == "depth"
         }
-        self.scene_point_specs = {
-            key_name: spec
-            for key_name, spec in self.point_cloud_source_specs.items()
-            if spec["kind"] == "scene_points"
-        }
 
         self.key_order: list[str] = []
         self.key_configs: dict[str, dict[str, Any]] = {}
@@ -251,7 +248,7 @@ class MultiModalDataset(Dataset):
             key_name = str(key_name)
             if key_name in self.depth_keys:
                 key_kind = "point_cloud"
-            elif key_name in self.scene_point_specs:
+            elif key_name == STATIC_SCENE_POINTS_KEY:
                 key_kind = "static_point_cloud"
             elif key_name in self.parquet_columns:
                 key_kind = "lowdim"
@@ -384,15 +381,12 @@ class MultiModalDataset(Dataset):
         static_data: dict[str, np.ndarray] = {}
         num_episodes = len(self.episode_ends)
         for key_name in self.static_point_cloud_keys:
-            spec = self.scene_point_specs[key_name]
-            scene_path = Path(spec["path"]).expanduser()
-            if not scene_path.is_absolute():
-                scene_path = (self.contract_path.parent / scene_path).resolve()
-            else:
-                scene_path = scene_path.resolve()
+            scene_path = (self.dataset_path / "scene_points.npy").resolve()
 
             if not scene_path.exists():
-                raise FileNotFoundError(f"Missing scene-points file for `{key_name}`: {scene_path}")
+                raise FileNotFoundError(
+                    f"Missing scene-points file for `{key_name}` at dataset root: {scene_path}"
+                )
 
             scene_points = np.load(scene_path, allow_pickle=False)
             if scene_points.dtype == object:

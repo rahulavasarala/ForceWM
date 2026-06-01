@@ -59,6 +59,7 @@ class DataCollection:
 
         self._terminal_settings: Any = None
         self._stdin_fd: int | None = None
+        self._is_open = False
 
     def _launch_observers(self) -> None:
         if self.robot_observer is None:
@@ -102,6 +103,14 @@ class DataCollection:
     def _stop_saver(self) -> None:
         if self.saver is not None:
             self.saver.quit()
+
+    @property
+    def is_open(self) -> bool:
+        return bool(self._is_open)
+
+    @property
+    def recording_active(self) -> bool:
+        return bool(self._recording_event.is_set())
 
     def start_recording(self) -> None:
         if self.saver is None:
@@ -159,15 +168,54 @@ class DataCollection:
             shutil.rmtree(latest_episode_dir)
             print(f"Deleted {latest_episode_dir.name} from {latest_episode_dir}", flush=True)
 
-    def run(self) -> None:
-        self.buffer_dir.mkdir(parents=True, exist_ok=True)
+    def open(
+        self,
+        *,
+        enable_keyboard_listener: bool = False,
+        enable_saving_indicator: bool = True,
+    ) -> None:
+        if self._is_open:
+            return
 
+        self.buffer_dir.mkdir(parents=True, exist_ok=True)
+        self._shutdown_event.clear()
         try:
             self._launch_observers()
             self._launch_saver()
-            self._start_keyboard_listener()
-            self._start_saving_indicator()
+            if enable_keyboard_listener:
+                self._start_keyboard_listener()
+            if enable_saving_indicator:
+                self._start_saving_indicator()
+        except Exception:
+            self.close()
+            raise
 
+        self._is_open = True
+
+    def close(self) -> None:
+        self._shutdown_event.set()
+
+        if self._recording_event.is_set():
+            try:
+                self.stop_recording()
+            except Exception as exc:
+                print(f"Failed to stop the active recording cleanly: {exc}", flush=True)
+            finally:
+                self._recording_event.clear()
+
+        try:
+            self._stop_saver()
+        except Exception as exc:
+            print(f"Failed to finalize saver cleanly: {exc}", flush=True)
+
+        self._stop_observers()
+        self._join_background_threads()
+        self._restore_terminal_settings()
+        self._is_open = False
+
+    def run(self) -> None:
+        try:
+            self.open(enable_keyboard_listener=True, enable_saving_indicator=True)
             print(f"Data collection ready. Episodes will be saved under {self.buffer_dir}", flush=True)
             print("Press `k` to start recording, `l` to stop recording, `d` to delete the latest episode, Ctrl-C to exit.", flush=True)
 
@@ -176,24 +224,7 @@ class DataCollection:
         except KeyboardInterrupt:
             print("\nShutting down data collection.", flush=True)
         finally:
-            self._shutdown_event.set()
-
-            if self._recording_event.is_set():
-                try:
-                    self.stop_recording()
-                except Exception as exc:
-                    print(f"Failed to stop the active recording cleanly: {exc}", flush=True)
-                finally:
-                    self._recording_event.clear()
-
-            try:
-                self._stop_saver()
-            except Exception as exc:
-                print(f"Failed to finalize saver cleanly: {exc}", flush=True)
-
-            self._stop_observers()
-            self._join_background_threads()
-            self._restore_terminal_settings()
+            self.close()
 
     def _start_keyboard_listener(self) -> None:
         if os.name != "posix":

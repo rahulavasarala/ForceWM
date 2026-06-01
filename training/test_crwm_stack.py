@@ -140,7 +140,6 @@ def _write_point_cloud_chunks(dataset_path: Path, episode_lengths: list[int], *,
 def _write_contract(
     contract_path: Path,
     *,
-    scene_points_path: Path,
     normalize_force: bool,
 ) -> None:
     contract = {
@@ -149,7 +148,6 @@ def _write_contract(
                 "visual": {
                     "keys": [
                         {"camera_01_depth": {"type": "depth"}},
-                        {"scene_points": {"type": "scene_points", "path": str(scene_points_path)}},
                     ]
                 }
             },
@@ -191,11 +189,10 @@ def _write_scene_points(path: Path) -> np.ndarray:
 def _write_crwm_contract(
     contract_path: Path,
     *,
-    scene_points_path: Path,
     prediction_window: int = 1,
     normalize_force: bool = False,
 ) -> None:
-    _write_contract(contract_path, scene_points_path=scene_points_path, normalize_force=normalize_force)
+    _write_contract(contract_path, normalize_force=normalize_force)
     with contract_path.open("r", encoding="utf-8") as handle:
         contract = yaml.safe_load(handle)
     contract["robot"]["data_loader"]["prediction"]["window"] = int(prediction_window)
@@ -326,10 +323,10 @@ class TrainerSmokeTests(unittest.TestCase):
             dataset_path = Path(tmp_dir) / "dataset"
             _write_multiepisode_dataset(dataset_path)
             _write_point_cloud_chunks(dataset_path, [3, 3], num_points=4)
-            scene_points_path = Path(tmp_dir) / "scene_points.npy"
+            scene_points_path = dataset_path / "scene_points.npy"
             _write_scene_points(scene_points_path)
             contract_path = Path(tmp_dir) / "contract.yaml"
-            _write_crwm_contract(contract_path, scene_points_path=scene_points_path, prediction_window=2)
+            _write_crwm_contract(contract_path, prediction_window=2)
 
             config = {
                 "dataset_path": str(dataset_path),
@@ -348,12 +345,11 @@ class TrainerSmokeTests(unittest.TestCase):
             dataset_path = Path(tmp_dir) / "dataset"
             _write_multiepisode_dataset(dataset_path)
             _write_point_cloud_chunks(dataset_path, [3, 3], num_points=4)
-            scene_points_path = Path(tmp_dir) / "scene_points.npy"
+            scene_points_path = dataset_path / "scene_points.npy"
             _write_scene_points(scene_points_path)
             contract_path = Path(tmp_dir) / "contract.yaml"
             _write_crwm_contract(
                 contract_path,
-                scene_points_path=scene_points_path,
                 prediction_window=1,
                 normalize_force=True,
             )

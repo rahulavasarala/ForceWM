@@ -13,6 +13,7 @@ import numpy as np
 
 from data_collection.camera_observer import CameraObserver
 from data_collection.robot_observer import RobotObserver
+from data_collection.data_collection import DataCollection
 from data_collection.saver import Saver
 
 
@@ -178,6 +179,27 @@ class RobotObserverTimestampTests(unittest.TestCase):
 
 
 class CameraObserverTimestampTests(unittest.TestCase):
+    def test_camera_observer_rejects_unsupported_visual_types(self) -> None:
+        contract = {
+            "robot": {
+                "redis_namespace": "sai",
+                "prefix": "sim::franka",
+                "type": "sim",
+                "data_sources": {
+                    "visual": {
+                        "fps": 30,
+                        "keys": [
+                            {"camera_01": {"type": "rgb", "dim": [2, 2, 3]}},
+                            {"scene_points": {"type": "scene_points", "path": "scene_points.npy"}},
+                        ],
+                    }
+                },
+            }
+        }
+
+        with self.assertRaisesRegex(ValueError, "Unsupported visual `type: scene_points`"):
+            CameraObserver(buffer_size=4, example_obs={}, camera_freq=30, robot_data=contract)
+
     def test_sim_camera_uses_stable_metadata_sim_time(self) -> None:
         ok, encoded = cv2.imencode(".jpg", np.zeros((2, 2, 3), dtype=np.uint8))
         self.assertTrue(ok)
@@ -569,6 +591,61 @@ class SaverTimestampTests(unittest.TestCase):
             self.assertEqual(part_metadata["part_asset_root"], str(asset_dir.resolve()))
             self.assertEqual(part_metadata["part_position"], [0.4, 0.1, 0.3])
             self.assertEqual(part_metadata["part_orientation_quat"], [1.0, 0.0, 0.0, 0.0])
+
+
+class DataCollectionLifecycleTests(unittest.TestCase):
+    def test_open_and_close_support_headless_programmatic_use(self) -> None:
+        contract_text = """
+robot:
+  redis_namespace: sai
+  prefix: sim::franka
+  type: sim
+  data_sources:
+    lowdim:
+      fps: 30
+      keys:
+        - eef_pos:
+            redis: current_cartesian_position
+    visual:
+      fps: 30
+      keys:
+        - camera_01:
+            type: rgb
+            dim: [2, 2, 3]
+  data_loader:
+    keys:
+      - eef_pos:
+          obs_window: 1
+          obs_dss: 1
+"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            contract_path = Path(tmp_dir) / "contract.yaml"
+            contract_path.write_text(contract_text, encoding="utf-8")
+            collector = DataCollection(tmp_dir, "demo_buffer", str(contract_path))
+
+            with (
+                mock.patch.object(collector, "_launch_observers") as launch_observers,
+                mock.patch.object(collector, "_launch_saver") as launch_saver,
+                mock.patch.object(collector, "_start_keyboard_listener") as start_keyboard_listener,
+                mock.patch.object(collector, "_start_saving_indicator") as start_saving_indicator,
+                mock.patch.object(collector, "_stop_saver") as stop_saver,
+                mock.patch.object(collector, "_stop_observers") as stop_observers,
+                mock.patch.object(collector, "_join_background_threads") as join_background_threads,
+                mock.patch.object(collector, "_restore_terminal_settings") as restore_terminal_settings,
+            ):
+                collector.open(enable_keyboard_listener=False, enable_saving_indicator=False)
+                self.assertTrue(collector.is_open)
+                launch_observers.assert_called_once()
+                launch_saver.assert_called_once()
+                start_keyboard_listener.assert_not_called()
+                start_saving_indicator.assert_not_called()
+
+                collector.close()
+                self.assertFalse(collector.is_open)
+                stop_saver.assert_called_once()
+                stop_observers.assert_called_once()
+                join_background_threads.assert_called_once()
+                restore_terminal_settings.assert_called_once()
 
 if __name__ == "__main__":
     unittest.main()

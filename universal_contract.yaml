@@ -44,9 +44,6 @@ robot:
             unit: "mm"
             dim: [224, 224, 1]
             align_to: "camera_01"
-        - scene_points:
-            type: "scene_points"
-            path: "data_storage/dpth_v8_extracted/scene_points.npy"
   action_labels:
     current_position_key: "eef_pos"
     current_orientation_key: "eef_ori"

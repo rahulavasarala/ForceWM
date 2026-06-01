@@ -13,6 +13,7 @@ STD_EPS = 1e-6
 NORMALIZER_VERSION = 1
 DEFAULT_NORMALIZATION_REPRESENTATION = "standard"
 SUPPORTED_NORMALIZATION_REPRESENTATIONS = frozenset({"standard", "rotvec", "quat", "matrix", "euler"})
+STATIC_SCENE_POINTS_KEY = "scene_points"
 
 
 def resolve_point_cloud_source_specs(contract: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -32,18 +33,6 @@ def resolve_point_cloud_source_specs(contract: dict[str, Any]) -> dict[str, dict
         key_type = str(key_cfg.get("type", "rgb")).lower()
         if key_type == "depth":
             point_cloud_specs[key_name] = {"kind": "depth"}
-            continue
-
-        if key_type == "scene_points":
-            path_value = key_cfg.get("path")
-            if not isinstance(path_value, str) or not path_value.strip():
-                raise ValueError(
-                    f"`robot.data_sources.visual.keys.{key_name}.path` is required when type is `scene_points`."
-                )
-            point_cloud_specs[key_name] = {
-                "kind": "scene_points",
-                "path": path_value,
-            }
 
     return point_cloud_specs
 
@@ -164,7 +153,7 @@ def _resolve_normalized_lowdim_keys(
                 "representation": representation,
             }
 
-        if key_name in point_cloud_specs:
+        if key_name in point_cloud_specs or key_name == STATIC_SCENE_POINTS_KEY:
             if normalize:
                 raise ValueError(
                     f"Normalization is currently supported only for lowdim parquet keys. "

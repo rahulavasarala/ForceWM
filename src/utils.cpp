@@ -231,6 +231,10 @@ SimulationContractConfig load_simulation_contract(
     const YAML::Node camera_cfg = camera_it->second;
     const std::string camera_context =
         "camera `" + visual_name + "` in " + contract_context;
+    const std::string visual_type_raw =
+        node_or<std::string>(camera_cfg["type"], "rgb");
+    const std::string normalized_visual_type =
+        lowercase_copy(visual_type_raw);
 
     VisualContractEntry visual_entry;
     visual_entry.visual_name = visual_name;
@@ -239,7 +243,7 @@ SimulationContractConfig load_simulation_contract(
     visual_entry.redis_key = make_redis_key(config.prefix, redis_suffix);
     visual_entry.metadata_redis_key = visual_entry.redis_key + "::meta";
     visual_entry.type = parse_visual_stream_type(
-        node_or<std::string>(camera_cfg["type"], "rgb"), camera_context);
+        visual_type_raw, camera_context);
     visual_entry.source =
         lowercase_copy(node_or<std::string>(camera_cfg["source"], "sim"));
     visual_entry.encoding = lowercase_copy(node_or<std::string>(

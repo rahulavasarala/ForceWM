@@ -49,49 +49,6 @@ def _volume_path(subdir: str) -> str:
     return str(PurePosixPath("/") / subdir)
 
 
-def _rewrite_contract_for_remote(
-    contract: dict[str, Any],
-    *,
-    dataset_local_path: Path,
-    dataset_container_path: str,
-    dataset_volume_path: str,
-) -> tuple[dict[str, Any], list[tuple[Path, str]]]:
-    rewritten = copy.deepcopy(contract)
-    extra_uploads: list[tuple[Path, str]] = []
-
-    visual_cfg = rewritten.get("robot", {}).get("data_sources", {}).get("visual", {})
-    key_entries = visual_cfg.get("keys", [])
-    if not isinstance(key_entries, list):
-        return rewritten, extra_uploads
-
-    dataset_container_root = PurePosixPath(dataset_container_path)
-    dataset_volume_root = PurePosixPath(dataset_volume_path)
-    for entry in key_entries:
-        if not isinstance(entry, dict) or len(entry) != 1:
-            continue
-        _, key_cfg = next(iter(entry.items()))
-        if not isinstance(key_cfg, dict):
-            continue
-        if str(key_cfg.get("type", "")).lower() != "scene_points":
-            continue
-
-        scene_path_value = key_cfg.get("path")
-        if not isinstance(scene_path_value, str) or not scene_path_value.strip():
-            raise ValueError("Scene-points entries must include a non-empty `path`.")
-        local_scene_path = Path(scene_path_value).expanduser().resolve()
-        try:
-            relative_scene_path = local_scene_path.relative_to(dataset_local_path)
-            remote_container_path = dataset_container_root / relative_scene_path.as_posix()
-        except ValueError:
-            remote_relative_path = PurePosixPath("_scene_points") / local_scene_path.name
-            remote_container_path = dataset_container_root / remote_relative_path
-            extra_uploads.append((local_scene_path, str(dataset_volume_root / remote_relative_path)))
-
-        key_cfg["path"] = str(remote_container_path)
-
-    return rewritten, extra_uploads
-
-
 def _resolve_remote_resume_path(resume_from: str | None, output_container_path: str) -> str | None:
     if resume_from is None:
         return None
@@ -205,21 +162,12 @@ def main(
     output_subdir = _normalize_subdir(output_subdir, default=default_output_name)
 
     dataset_container_path = _container_path(REMOTE_DATASET_MOUNT, dataset_subdir)
-    dataset_volume_path = _volume_path(dataset_subdir)
     output_container_path = _container_path(REMOTE_OUTPUT_MOUNT, output_subdir)
-
-    rewritten_contract, extra_uploads = _rewrite_contract_for_remote(
-        contract_payload,
-        dataset_local_path=dataset_local_path,
-        dataset_container_path=dataset_container_path,
-        dataset_volume_path=dataset_volume_path,
-    )
+    rewritten_contract = copy.deepcopy(contract_payload)
 
     if sync_dataset:
         with dataset_volume.batch_upload(force=force_sync) as batch:
-            batch.put_directory(str(dataset_local_path), dataset_volume_path)
-            for local_path, remote_path in extra_uploads:
-                batch.put_file(str(local_path), remote_path)
+            batch.put_directory(str(dataset_local_path), _volume_path(dataset_subdir))
 
     remote_config = copy.deepcopy(config_payload)
     remote_config["dataset_path"] = dataset_container_path

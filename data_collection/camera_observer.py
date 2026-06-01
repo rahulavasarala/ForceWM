@@ -12,6 +12,8 @@ import numpy as np
 import redis
 import yaml
 
+SUPPORTED_VISUAL_TYPES = frozenset({"rgb", "depth", "realsense"})
+
 
 def _default_contract_path() -> Path:
     return Path(__file__).resolve().parents[1] / "universal_contract.yaml"
@@ -334,6 +336,11 @@ class CameraObserver:
 
             visual_name, visual_cfg = next(iter(visual_entry.items()))
             visual_type = str(visual_cfg.get("type", "rgb")).lower()
+            if visual_type not in SUPPORTED_VISUAL_TYPES:
+                raise ValueError(
+                    f"Unsupported visual `type: {visual_type}` in camera `{visual_name}`. "
+                    f"Supported visual types are {sorted(SUPPORTED_VISUAL_TYPES)}."
+                )
             source_type = str(
                 visual_cfg.get(
                     "source",

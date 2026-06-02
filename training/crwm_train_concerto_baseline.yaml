@@ -3,8 +3,8 @@ universal_contract: "universal_contract.yaml"
 output_dir: "training_runs/crwm_dpth_v9_concerto_small"
 seed: 42
 epochs: 50
-batch_size: 4
-num_workers: 0
+batch_size: 16
+num_workers: 8
 val_fraction: 0.2
 val_every_epochs: 5
 pointcloud_cache_size: 4

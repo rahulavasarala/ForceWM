@@ -658,7 +658,11 @@ class CRWMModel(nn.Module):
     ) -> None:
         super().__init__()
         self.depth_key = str(depth_key)
-        self.scene_points_key = None if scene_points_key is None else str(scene_points_key)
+        if scene_points_key is None or not str(scene_points_key).strip():
+            raise ValueError(
+                "CRWMModel requires `scene_points_key` because scene conditioning is mandatory for CRWM."
+            )
+        self.scene_points_key = str(scene_points_key)
         self.action_delta_pos_key = str(action_delta_pos_key)
         self.action_delta_rotvec_key = str(action_delta_rotvec_key)
         self.action_force_magnitude_key = str(action_force_magnitude_key)
@@ -698,7 +702,8 @@ class CRWMModel(nn.Module):
         self.action_token_projection = nn.Linear(self.action_latent_dim, self.model_dim)
         self.depth_token_projection = nn.Linear(self.depth_latent_dim, self.model_dim)
         self.contact_token_projection = nn.Linear(self.contact_latent_dim, self.model_dim)
-        self.modality_embeddings = nn.Parameter(torch.zeros(3, self.model_dim))
+        self.scene_token_projection = nn.Linear(self.depth_latent_dim, self.model_dim)
+        self.modality_embeddings = nn.Parameter(torch.zeros(4, self.model_dim))
         self.temporal_embeddings = nn.Embedding(self.max_history_steps, self.model_dim)
 
         self.flow_model = LatentFlowTransformer(
@@ -716,7 +721,7 @@ class CRWMModel(nn.Module):
             num_force_dimensions=int(contact_encoder_config.get("num_force_dimensions", 4)),
         )
         self.depth_decoder = DepthReconstructionDecoder(
-            input_dim=self.depth_latent_dim * 2,
+            input_dim=self.depth_latent_dim,
             num_points=self.num_depth_points,
             hidden_dim=int(decoder_config.get("depth_hidden_dim", 256)),
         )
@@ -777,6 +782,7 @@ class CRWMModel(nn.Module):
         action_latents: torch.Tensor,
         depth_latents: torch.Tensor,
         contact_latents: torch.Tensor,
+        scene_latent: torch.Tensor,
     ) -> torch.Tensor:
         if action_latents.shape[:2] != depth_latents.shape[:2] or action_latents.shape[:2] != contact_latents.shape[:2]:
             raise ValueError(
@@ -786,6 +792,11 @@ class CRWMModel(nn.Module):
             )
 
         batch_size, time_steps, _ = action_latents.shape
+        if scene_latent.ndim != 2 or scene_latent.shape[0] != batch_size or scene_latent.shape[1] != self.depth_latent_dim:
+            raise ValueError(
+                "Scene latent must have shape "
+                f"(B, {self.depth_latent_dim}), got {tuple(scene_latent.shape)}."
+            )
         if time_steps > self.max_history_steps:
             raise ValueError(
                 f"History length {time_steps} exceeds `max_history_steps={self.max_history_steps}` configured "
@@ -794,7 +805,7 @@ class CRWMModel(nn.Module):
 
         temporal_indices = torch.arange(time_steps, device=action_latents.device)
         temporal_embeddings = self.temporal_embeddings(temporal_indices).unsqueeze(0).unsqueeze(2)
-        modality_embeddings = self.modality_embeddings.view(1, 1, 3, self.model_dim)
+        history_modality_embeddings = self.modality_embeddings[:3].view(1, 1, 3, self.model_dim)
 
         tokens = torch.stack(
             [
@@ -804,8 +815,12 @@ class CRWMModel(nn.Module):
             ],
             dim=2,
         )
-        tokens = tokens + temporal_embeddings + modality_embeddings
-        return tokens.reshape(batch_size, time_steps * 3, self.model_dim)
+        tokens = tokens + temporal_embeddings + history_modality_embeddings
+        history_tokens = tokens.reshape(batch_size, time_steps * 3, self.model_dim)
+
+        scene_token = self.scene_token_projection(scene_latent).unsqueeze(1)
+        scene_token = scene_token + self.modality_embeddings[3].view(1, 1, self.model_dim)
+        return torch.cat([history_tokens, scene_token], dim=1)
 
     def _split_predicted_latent(self, predicted_velocity: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return predicted_velocity.split([self.depth_latent_dim, self.contact_latent_dim], dim=-1)
@@ -879,28 +894,26 @@ class CRWMModel(nn.Module):
         observed_depth_latents = self._encode_depth_sequence(self.depth_encoder, observed_depth, observed_depth_mask)
         with torch.no_grad():
             target_depth_latents = self._encode_depth_sequence(ema_depth_encoder, future_depth, future_depth_mask)
+            scene_points = obs_dict[self.scene_points_key]
+            scene_points_mask = obs_dict[f"{self.scene_points_key}{POINT_CLOUD_MASK_SUFFIX}"]
+            scene_depth_latents = self._encode_depth_sequence(ema_depth_encoder, scene_points, scene_points_mask)
 
         observed_contact_latents = self._encode_contact_sequence(self.contact_encoder, obs_dict)
         with torch.no_grad():
             target_contact_latents = self._encode_contact_sequence(ema_contact_encoder, prediction_dict)
         action_latents = self._encode_action_sequence(obs_dict)
+        scene_latent = scene_depth_latents.global_latent[:, 0, :]
         condition_tokens = self._build_condition_tokens(
             action_latents=action_latents,
             depth_latents=observed_depth_latents.global_latent,
             contact_latents=observed_contact_latents,
+            scene_latent=scene_latent,
         )
 
         last_observed_depth = observed_depth_latents.global_latent[:, -1, :]
         last_observed_contact = observed_contact_latents[:, -1, :]
         future_depth_latent = target_depth_latents.global_latent[:, 0, :]
         future_contact_latent = target_contact_latents[:, 0, :]
-        scene_latent = last_observed_depth
-        if self.scene_points_key is not None:
-            scene_points = obs_dict[self.scene_points_key]
-            scene_points_mask = obs_dict[f"{self.scene_points_key}{POINT_CLOUD_MASK_SUFFIX}"]
-            with torch.no_grad():
-                scene_depth_latents = self._encode_depth_sequence(ema_depth_encoder, scene_points, scene_points_mask)
-            scene_latent = scene_depth_latents.global_latent[:, 0, :]
 
         p1_target = future_depth_latent - last_observed_depth
         p2_target = future_contact_latent - last_observed_contact
@@ -925,7 +938,7 @@ class CRWMModel(nn.Module):
         )
         contact_recon_loss = contact_losses["contact_recon_loss"]
 
-        predicted_depth_points = self.depth_decoder(torch.cat([predicted_depth_latent, scene_latent], dim=-1))
+        predicted_depth_points = self.depth_decoder(predicted_depth_latent)
         future_depth_target = future_depth[:, 0, :, :]
         future_depth_target_mask = future_depth_mask[:, 0, :]
         depth_recon_loss = self._depth_reconstruction_loss(

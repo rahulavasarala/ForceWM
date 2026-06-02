@@ -126,18 +126,18 @@ def _resolve_split_indices(dataset: MultiModalDataset, val_fraction: float) -> t
     return train_indices, val_indices
 
 
-def _resolve_depth_and_scene_keys(dataset: MultiModalDataset) -> tuple[str, str | None]:
+def _resolve_depth_and_scene_keys(dataset: MultiModalDataset) -> tuple[str, str]:
     if len(dataset.point_cloud_keys) != 1:
         raise ValueError(
             "CRWM v1 expects exactly one dynamic depth key in `robot.data_loader.keys`, "
             f"but found {dataset.point_cloud_keys}."
         )
-    if len(dataset.static_point_cloud_keys) > 1:
+    if len(dataset.static_point_cloud_keys) != 1:
         raise ValueError(
-            "CRWM v1 expects at most one `scene_points` key in `robot.data_loader.keys`, "
+            "CRWM v1 expects exactly one `scene_points` key in `robot.data_loader.keys`, "
             f"but found {dataset.static_point_cloud_keys}."
         )
-    scene_points_key = dataset.static_point_cloud_keys[0] if dataset.static_point_cloud_keys else None
+    scene_points_key = dataset.static_point_cloud_keys[0]
     return dataset.point_cloud_keys[0], scene_points_key
 
 
@@ -524,6 +524,7 @@ def _build_model_size_report(model: CRWMModel) -> dict[str, Any]:
         "action_token_projection": _module_parameter_summary(model.action_token_projection),
         "depth_token_projection": _module_parameter_summary(model.depth_token_projection),
         "contact_token_projection": _module_parameter_summary(model.contact_token_projection),
+        "scene_token_projection": _module_parameter_summary(model.scene_token_projection),
         "modality_embeddings": _parameter_summary_from_parameters([model.modality_embeddings]),
         "temporal_embeddings": _module_parameter_summary(model.temporal_embeddings),
     }

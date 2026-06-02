@@ -19,7 +19,7 @@ except ModuleNotFoundError:
     pq = None
 
 from training.crwm_model import CRWMModel, DummyDepthEncoder
-from training.train import ModuleEMA, train
+from training.train import ModuleEMA, _build_model_size_report, train
 
 
 PYARROW_AVAILABLE = pa is not None and pq is not None
@@ -145,7 +145,21 @@ def _write_contract(
     contract_path: Path,
     *,
     normalize_force: bool,
+    include_scene_points: bool = True,
 ) -> None:
+    loader_keys = [
+        {"camera_01_depth": {"obs_window": 2, "obs_dss": 1}},
+        {"motion_or_force_axis": {"obs_window": 2, "obs_dss": 1}},
+        {"force_dimension": {"obs_window": 2, "obs_dss": 1}},
+        {"action_delta_pos": {"obs_window": 2, "obs_dss": 1}},
+        {"action_delta_rotvec": {"obs_window": 2, "obs_dss": 1}},
+        {"action_force_magnitude": {"obs_window": 2, "obs_dss": 1}},
+        {"sensed_force": {"obs_window": 2, "obs_dss": 1, "normalize": normalize_force}},
+        {"sensed_moment": {"obs_window": 2, "obs_dss": 1, "normalize": normalize_force}},
+    ]
+    if include_scene_points:
+        loader_keys.insert(1, {"scene_points": {"obs_window": 1, "obs_dss": 1}})
+
     contract = {
         "robot": {
             "data_sources": {
@@ -156,17 +170,7 @@ def _write_contract(
                 }
             },
             "data_loader": {
-                "keys": [
-                    {"camera_01_depth": {"obs_window": 2, "obs_dss": 1}},
-                    {"scene_points": {"obs_window": 1, "obs_dss": 1}},
-                    {"motion_or_force_axis": {"obs_window": 2, "obs_dss": 1}},
-                    {"force_dimension": {"obs_window": 2, "obs_dss": 1}},
-                    {"action_delta_pos": {"obs_window": 2, "obs_dss": 1}},
-                    {"action_delta_rotvec": {"obs_window": 2, "obs_dss": 1}},
-                    {"action_force_magnitude": {"obs_window": 2, "obs_dss": 1}},
-                    {"sensed_force": {"obs_window": 2, "obs_dss": 1, "normalize": normalize_force}},
-                    {"sensed_moment": {"obs_window": 2, "obs_dss": 1, "normalize": normalize_force}},
-                ],
+                "keys": loader_keys,
                 "prediction": {
                     "window": 1,
                     "dss": 1,
@@ -195,8 +199,13 @@ def _write_crwm_contract(
     *,
     prediction_window: int = 1,
     normalize_force: bool = False,
+    include_scene_points: bool = True,
 ) -> None:
-    _write_contract(contract_path, normalize_force=normalize_force)
+    _write_contract(
+        contract_path,
+        normalize_force=normalize_force,
+        include_scene_points=include_scene_points,
+    )
     with contract_path.open("r", encoding="utf-8") as handle:
         contract = yaml.safe_load(handle)
     contract["robot"]["data_loader"]["prediction"]["window"] = int(prediction_window)
@@ -337,6 +346,8 @@ class CRWMModelTests(unittest.TestCase):
         self.assertEqual(tuple(outputs["latent_target"].shape), (2, 14))
         self.assertEqual(tuple(outputs["predicted_depth_points"].shape), (2, 4, 3))
         self.assertEqual(tuple(outputs["predicted_force_dimension_logits"].shape), (2, 4))
+        self.assertEqual(model.depth_decoder.decoder[0].in_features, model.depth_latent_dim)
+        self.assertEqual(tuple(model.modality_embeddings.shape), (4, model.model_dim))
         self.assertIn("contact_force_dimension_ce", outputs)
         self.assertIn("contact_motion_axis_mse", outputs)
         self.assertIn("contact_sensed_force_mse", outputs)
@@ -351,10 +362,24 @@ class CRWMModelTests(unittest.TestCase):
             )
         )
 
-    def test_crwm_forward_allows_missing_scene_points(self) -> None:
+    def test_crwm_requires_scene_points_key(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires `scene_points_key`"):
+            CRWMModel(
+                depth_key="camera_01_depth",
+                scene_points_key=None,
+                num_depth_points=4,
+                depth_encoder_config={"type": "dummy", "hidden_dim": 16, "point_feature_dim": 12, "global_latent_dim": 8, "num_blocks": 1},
+                contact_encoder_config={"hidden_dim": 16, "output_dim": 6, "num_force_dimensions": 4, "force_embedding_dim": 4},
+                action_encoder_config={"hidden_dim": 16, "output_dim": 5},
+                flow_config={"model_dim": 24, "num_layers": 2, "num_heads": 4, "mlp_ratio": 2.0},
+                decoder_config={"depth_hidden_dim": 16, "contact_hidden_dim": 16},
+                max_history_steps=4,
+            )
+
+    def test_crwm_forward_uses_scene_for_conditioning_not_decoder_input(self) -> None:
         model = CRWMModel(
             depth_key="camera_01_depth",
-            scene_points_key=None,
+            scene_points_key="scene_points",
             num_depth_points=4,
             depth_encoder_config={"type": "dummy", "hidden_dim": 16, "point_feature_dim": 12, "global_latent_dim": 8, "num_blocks": 1},
             contact_encoder_config={"hidden_dim": 16, "output_dim": 6, "num_force_dimensions": 4, "force_embedding_dim": 4},
@@ -367,6 +392,8 @@ class CRWMModelTests(unittest.TestCase):
             "obs_dict": {
                 "camera_01_depth": torch.randn(2, 2, 4, 3),
                 "camera_01_depth_mask": torch.ones(2, 2, 4, dtype=torch.bool),
+                "scene_points": torch.randn(2, 1, 4, 3),
+                "scene_points_mask": torch.ones(2, 1, 4, dtype=torch.bool),
                 "motion_or_force_axis": torch.randn(2, 2, 3),
                 "force_dimension": torch.tensor([[0, 1], [2, 3]], dtype=torch.long),
                 "action_delta_pos": torch.randn(2, 2, 3),
@@ -385,10 +412,64 @@ class CRWMModelTests(unittest.TestCase):
             },
         }
 
+        class _RecordingFlowModel(torch.nn.Module):
+            def __init__(self, latent_dim: int) -> None:
+                super().__init__()
+                self.latent_dim = int(latent_dim)
+                self.last_condition_tokens: torch.Tensor | None = None
+
+            def forward(
+                self,
+                x_t: torch.Tensor,
+                timesteps: torch.Tensor,
+                condition_tokens: torch.Tensor,
+            ) -> torch.Tensor:
+                _ = timesteps
+                self.last_condition_tokens = condition_tokens.detach().clone()
+                return torch.zeros_like(x_t)
+
+        class _RecordingDepthDecoder(torch.nn.Module):
+            def __init__(self, num_points: int) -> None:
+                super().__init__()
+                self.num_points = int(num_points)
+                self.last_input: torch.Tensor | None = None
+
+            def forward(self, latent: torch.Tensor) -> torch.Tensor:
+                self.last_input = latent.detach().clone()
+                return torch.zeros(latent.shape[0], self.num_points, 3, dtype=latent.dtype, device=latent.device)
+
+        recording_flow_model = _RecordingFlowModel(model.latent_dim)
+        recording_depth_decoder = _RecordingDepthDecoder(model.num_depth_points)
+        model.flow_model = recording_flow_model
+        model.depth_decoder = recording_depth_decoder
+
         outputs = model(batch)
 
         self.assertTrue(torch.isfinite(outputs["loss"]))
         self.assertEqual(tuple(outputs["predicted_depth_points"].shape), (2, 4, 3))
+        assert recording_flow_model.last_condition_tokens is not None
+        assert recording_depth_decoder.last_input is not None
+        self.assertEqual(tuple(recording_flow_model.last_condition_tokens.shape), (2, 7, model.model_dim))
+        self.assertEqual(tuple(recording_depth_decoder.last_input.shape), (2, model.depth_latent_dim))
+
+    def test_model_size_report_counts_scene_conditioning_components(self) -> None:
+        model = CRWMModel(
+            depth_key="camera_01_depth",
+            scene_points_key="scene_points",
+            num_depth_points=4,
+            depth_encoder_config={"type": "dummy", "hidden_dim": 16, "point_feature_dim": 12, "global_latent_dim": 8, "num_blocks": 1},
+            contact_encoder_config={"hidden_dim": 16, "output_dim": 6, "num_force_dimensions": 4, "force_embedding_dim": 4},
+            action_encoder_config={"hidden_dim": 16, "output_dim": 5},
+            flow_config={"model_dim": 24, "num_layers": 2, "num_heads": 4, "mlp_ratio": 2.0},
+            decoder_config={"depth_hidden_dim": 16, "contact_hidden_dim": 16},
+            max_history_steps=4,
+        )
+
+        report = _build_model_size_report(model)
+
+        conditioning_components = report["components"]["conditioning_stack"]["components"]
+        self.assertIn("scene_token_projection", conditioning_components)
+        self.assertEqual(model.depth_decoder.decoder[0].in_features, model.depth_latent_dim)
 
 
 class TrainerSmokeTests(unittest.TestCase):
@@ -423,6 +504,30 @@ class TrainerSmokeTests(unittest.TestCase):
             }
 
             with self.assertRaisesRegex(ValueError, "prediction.window == 1"):
+                train(config)
+
+    @unittest.skipUnless(PYARROW_AVAILABLE, "pyarrow not installed")
+    def test_train_requires_scene_points_loader_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dataset_path = Path(tmp_dir) / "dataset"
+            _write_multiepisode_dataset(dataset_path)
+            _write_point_cloud_chunks(dataset_path, [3, 3], num_points=4)
+            contract_path = Path(tmp_dir) / "contract.yaml"
+            _write_crwm_contract(
+                contract_path,
+                prediction_window=1,
+                include_scene_points=False,
+            )
+
+            config = {
+                "dataset_path": str(dataset_path),
+                "universal_contract": str(contract_path),
+                "output_dir": str(Path(tmp_dir) / "run"),
+                "device": "cpu",
+                "epochs": 1,
+            }
+
+            with self.assertRaisesRegex(ValueError, "expects exactly one `scene_points` key"):
                 train(config)
 
     @unittest.skipUnless(PYARROW_AVAILABLE, "pyarrow not installed")

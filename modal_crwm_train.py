@@ -72,6 +72,15 @@ def _select_remote_runner(config: dict[str, Any]):
     return run_training_wandb if _wandb_enabled(config) else run_training
 
 
+def _invoke_remote_runner(
+    remote_runner: Any,
+    config: dict[str, Any],
+    contract_payload: dict[str, Any],
+) -> dict[str, float]:
+    function_call = remote_runner.spawn(config, contract_payload)
+    return function_call.get()
+
+
 image = (
     modal.Image.from_registry(
         f"nvidia/cuda:{CUDA_BASE_IMAGE}",
@@ -215,5 +224,5 @@ def main(
         remote_config["resume_from"] = resolved_resume_path
 
     remote_runner = _select_remote_runner(remote_config)
-    result = remote_runner.remote(remote_config, rewritten_contract)
+    result = _invoke_remote_runner(remote_runner, remote_config, rewritten_contract)
     print(json.dumps(result, indent=2, sort_keys=True))

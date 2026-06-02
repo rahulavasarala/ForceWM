@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
+import io
 import math
 import random
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Mapping
@@ -148,9 +151,9 @@ def _build_dataloaders(
     *,
     batch_size: int,
     num_workers: int,
-    val_fraction: float,
+    train_indices: list[int],
+    val_indices: list[int],
 ) -> tuple[DataLoader, DataLoader]:
-    train_indices, val_indices = _resolve_split_indices(dataset, val_fraction)
     if not train_indices or not val_indices:
         raise ValueError(
             f"Unable to create a non-empty train/validation split. train={len(train_indices)} val={len(val_indices)}"
@@ -256,6 +259,376 @@ def _aggregate_metrics(metric_rows: list[dict[str, float]]) -> dict[str, float]:
         key: float(sum(row[key] for row in metric_rows) / len(metric_rows))
         for key in keys
     }
+
+
+def _tensor_summary(tensor: torch.Tensor) -> dict[str, Any]:
+    detached = tensor.detach()
+    cpu_tensor = detached.to(device="cpu")
+    numel = int(cpu_tensor.numel())
+    summary: dict[str, Any] = {
+        "shape": [int(dim) for dim in cpu_tensor.shape],
+        "dtype": str(detached.dtype),
+        "device": str(detached.device),
+        "numel": numel,
+    }
+
+    if numel == 1:
+        summary["value"] = cpu_tensor.reshape(-1)[0].item()
+        return summary
+
+    if numel <= 32:
+        summary["values"] = cpu_tensor.tolist()
+        return summary
+
+    flattened = cpu_tensor.reshape(-1)
+    summary["preview"] = flattened[:8].tolist()
+    stats_tensor = flattened.to(dtype=torch.float32)
+    summary["stats"] = {
+        "min": float(stats_tensor.min().item()),
+        "max": float(stats_tensor.max().item()),
+        "mean": float(stats_tensor.mean().item()),
+    }
+    return summary
+
+
+def _mapping_tensor_summary(mapping: Mapping[str, torch.Tensor]) -> dict[str, dict[str, Any]]:
+    return {
+        str(key): _tensor_summary(value)
+        for key, value in mapping.items()
+    }
+
+
+def _build_normalization_report(dataset: MultiModalDataset) -> dict[str, Any]:
+    normalized_keys = [str(key_name) for key_name in dataset.normalized_lowdim_keys]
+    normalizer_path = dataset.dataset_path / "normalizer.npy"
+    report: dict[str, Any] = {
+        "normalizer_path": str(normalizer_path),
+        "keys": {},
+    }
+    if not normalized_keys:
+        return report
+    if dataset.normalizer is None:
+        raise RuntimeError(
+            "Normalization is enabled for at least one loader key, but no dataset normalizer is loaded."
+        )
+
+    key_reports: dict[str, Any] = {}
+    for key_name in normalized_keys:
+        key_stats = dataset.normalizer.require_key(key_name)
+        key_reports[key_name] = {
+            "representation": str(key_stats["representation"]),
+            "feature_shape": [int(dim) for dim in tuple(key_stats["feature_shape"])],
+            "count": int(key_stats["count"]),
+            "mean": _tensor_summary(torch.from_numpy(np.asarray(key_stats["mean"]).copy())),
+            "std": _tensor_summary(torch.from_numpy(np.asarray(key_stats["std"]).copy())),
+        }
+    report["keys"] = key_reports
+    return report
+
+
+def _format_shape(shape: list[int]) -> str:
+    return "[" + ", ".join(str(int(dim)) for dim in shape) + "]"
+
+
+def _format_float_list(values: list[Any]) -> str:
+    return "[" + ", ".join(f"{float(value):.4f}" for value in values) + "]"
+
+
+def _format_mapping_shapes(title: str, mapping: Mapping[str, Any]) -> list[str]:
+    lines = [f"{title}:"]
+    for key_name, summary in mapping.items():
+        shape = summary.get("shape", [])
+        lines.append(f"  - {key_name}: shape={_format_shape(shape)}")
+    return lines
+
+
+def _format_loss_target_shapes(title: str, mapping: Mapping[str, Any]) -> list[str]:
+    lines = [f"{title}:"]
+    for loss_name, loss_mapping in mapping.items():
+        lines.append(f"  {loss_name}:")
+        for key_name, summary in loss_mapping.items():
+            shape = summary.get("shape", [])
+            lines.append(f"    - {key_name}: shape={_format_shape(shape)}")
+    return lines
+
+
+def _format_parameter_summary(name: str, summary: Mapping[str, Any]) -> str:
+    total_params = int(summary["total_params"])
+    trainable_params = int(summary["trainable_params"])
+    return f"  - {name}: total_params={total_params} trainable_params={trainable_params}"
+
+
+def _format_normalization_preflight(report: Mapping[str, Any]) -> list[str]:
+    lines = ["Normalization:"]
+    key_reports = report.get("keys", {})
+    if not key_reports:
+        lines.append("  - none")
+        return lines
+
+    for key_name, key_report in key_reports.items():
+        mean_values = list(key_report["mean"].get("values", []))
+        std_values = list(key_report["std"].get("values", []))
+        lines.append(
+            f"  - {key_name}: mean={_format_float_list(mean_values)} std={_format_float_list(std_values)}"
+        )
+    return lines
+
+
+def _format_startup_preflight_report(report: Mapping[str, Any]) -> str:
+    batch_source = report["batch_source"]
+    model_report = report["model"]
+    component_reports = model_report["components"]
+    lines = [
+        "Startup Preflight:",
+        f"  stage: {report['stage']}",
+        f"  device: {report['device']}",
+        f"  depth_encoder_trainable: {report['depth_encoder_trainable']}",
+        (
+            "  batch_source: "
+            f"split={batch_source['split']} "
+            f"indices={batch_source['indices']} "
+            f"configured_batch_size={batch_source['configured_batch_size']} "
+            f"effective_batch_size={batch_source['effective_batch_size']}"
+        ),
+    ]
+    lines.extend(_format_mapping_shapes("Inputs / obs_dict", report["inputs"]["obs_dict"]))
+    lines.extend(_format_mapping_shapes("Prediction Targets", report["inputs"]["prediction"]))
+    lines.append("Model Components:")
+    lines.append(_format_parameter_summary("full_model", model_report["full"]))
+    lines.append(_format_parameter_summary("depth_encoder", component_reports["depth_encoder"]))
+    lines.append(_format_parameter_summary("contact_encoder", component_reports["contact_encoder"]))
+    lines.append(_format_parameter_summary("action_encoder", component_reports["action_encoder"]))
+    lines.append(
+        _format_parameter_summary(
+            "conditioning_stack",
+            component_reports["conditioning_stack"]["total"],
+        )
+    )
+    lines.append(_format_parameter_summary("flow_model", component_reports["flow_model"]))
+    lines.append(_format_parameter_summary("contact_decoder", component_reports["contact_decoder"]))
+    lines.append(_format_parameter_summary("depth_decoder", component_reports["depth_decoder"]))
+    lines.extend(_format_mapping_shapes("Outputs", report["outputs"]))
+    lines.extend(_format_loss_target_shapes("Loss Targets", report["loss_targets"]))
+    lines.extend(_format_normalization_preflight(report["normalization"]))
+    return "\n".join(lines)
+
+
+def _parameter_summary_from_parameters(parameters: list[torch.nn.Parameter]) -> dict[str, Any]:
+    total_params = int(sum(parameter.numel() for parameter in parameters))
+    trainable_parameters = [parameter for parameter in parameters if parameter.requires_grad]
+    trainable_params = int(sum(parameter.numel() for parameter in trainable_parameters))
+    parameter_bytes = int(sum(parameter.numel() * parameter.element_size() for parameter in parameters))
+    trainable_parameter_bytes = int(
+        sum(parameter.numel() * parameter.element_size() for parameter in trainable_parameters)
+    )
+    mib_denominator = float(1024 * 1024)
+    return {
+        "total_params": total_params,
+        "trainable_params": trainable_params,
+        "parameter_bytes": parameter_bytes,
+        "parameter_mib": float(parameter_bytes / mib_denominator),
+        "trainable_parameter_bytes": trainable_parameter_bytes,
+        "trainable_parameter_mib": float(trainable_parameter_bytes / mib_denominator),
+    }
+
+
+def _module_parameter_summary(module: nn.Module) -> dict[str, Any]:
+    return _parameter_summary_from_parameters(list(module.parameters()))
+
+
+def _combine_parameter_summaries(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    total_params = int(sum(summary["total_params"] for summary in summaries))
+    trainable_params = int(sum(summary["trainable_params"] for summary in summaries))
+    parameter_bytes = int(sum(summary["parameter_bytes"] for summary in summaries))
+    trainable_parameter_bytes = int(sum(summary["trainable_parameter_bytes"] for summary in summaries))
+    mib_denominator = float(1024 * 1024)
+    return {
+        "total_params": total_params,
+        "trainable_params": trainable_params,
+        "parameter_bytes": parameter_bytes,
+        "parameter_mib": float(parameter_bytes / mib_denominator),
+        "trainable_parameter_bytes": trainable_parameter_bytes,
+        "trainable_parameter_mib": float(trainable_parameter_bytes / mib_denominator),
+    }
+
+
+def _build_model_size_report(model: CRWMModel) -> dict[str, Any]:
+    conditioning_components = {
+        "action_token_projection": _module_parameter_summary(model.action_token_projection),
+        "depth_token_projection": _module_parameter_summary(model.depth_token_projection),
+        "contact_token_projection": _module_parameter_summary(model.contact_token_projection),
+        "modality_embeddings": _parameter_summary_from_parameters([model.modality_embeddings]),
+        "temporal_embeddings": _module_parameter_summary(model.temporal_embeddings),
+    }
+    conditioning_total = _combine_parameter_summaries(list(conditioning_components.values()))
+
+    component_reports = {
+        "depth_encoder": _module_parameter_summary(model.depth_encoder),
+        "contact_encoder": _module_parameter_summary(model.contact_encoder),
+        "action_encoder": _module_parameter_summary(model.action_encoder),
+        "conditioning_stack": {
+            "total": conditioning_total,
+            "components": conditioning_components,
+        },
+        "flow_model": _module_parameter_summary(model.flow_model),
+        "contact_decoder": _module_parameter_summary(model.contact_decoder),
+        "depth_decoder": _module_parameter_summary(model.depth_decoder),
+    }
+    full_model = _module_parameter_summary(model)
+    component_summaries = [
+        component_reports["depth_encoder"],
+        component_reports["contact_encoder"],
+        component_reports["action_encoder"],
+        conditioning_total,
+        component_reports["flow_model"],
+        component_reports["contact_decoder"],
+        component_reports["depth_decoder"],
+    ]
+    component_totals = _combine_parameter_summaries(component_summaries)
+    return {
+        "full": full_model,
+        "components": component_reports,
+        "parameter_accounting": {
+            "component_total_params": component_totals["total_params"],
+            "component_trainable_params": component_totals["trainable_params"],
+            "matches_full_model": (
+                component_totals["total_params"] == full_model["total_params"]
+                and component_totals["trainable_params"] == full_model["trainable_params"]
+            ),
+        },
+    }
+
+
+def _build_startup_batch(
+    dataset: MultiModalDataset,
+    *,
+    train_indices: list[int],
+    batch_size: int,
+) -> tuple[dict[str, Any], list[int]]:
+    if not train_indices:
+        raise ValueError("Cannot build a startup batch because the training split is empty.")
+    effective_batch_size = min(max(1, int(batch_size)), len(train_indices))
+    selected_indices = [int(index) for index in train_indices[:effective_batch_size]]
+    batch = dataset.collate_fn([dataset[index] for index in selected_indices])
+    return batch, selected_indices
+
+
+def _first_present_tensor(mapping: Mapping[str, torch.Tensor], candidates: tuple[str, ...], source_name: str) -> torch.Tensor:
+    for key_name in candidates:
+        if key_name in mapping:
+            return mapping[key_name]
+    raise KeyError(f"Missing required key for {source_name}. Tried {list(candidates)}.")
+
+
+def _build_startup_loss_target_report(
+    model: CRWMModel,
+    batch: Mapping[str, Mapping[str, torch.Tensor]],
+    outputs: Mapping[str, torch.Tensor],
+) -> dict[str, Any]:
+    prediction_dict = batch["prediction"]
+    depth_mask_key = f"{model.depth_key}_mask"
+    return {
+        "flow_loss": {
+            "predicted_velocity": _tensor_summary(outputs["predicted_velocity"]),
+            "latent_target": _tensor_summary(outputs["latent_target"]),
+        },
+        "depth_recon_loss": {
+            "predicted_depth_points": _tensor_summary(outputs["predicted_depth_points"]),
+            "future_depth_target": _tensor_summary(prediction_dict[model.depth_key][:, 0, :, :]),
+            "future_depth_target_mask": _tensor_summary(prediction_dict[depth_mask_key][:, 0, :]),
+        },
+        "contact_recon_loss": {
+            "predicted_force_dimension_logits": _tensor_summary(outputs["predicted_force_dimension_logits"]),
+            "target_force_dimension": _tensor_summary(prediction_dict[model.force_dimension_key][:, 0]),
+            "predicted_motion_or_force_axis": _tensor_summary(outputs["predicted_motion_or_force_axis"]),
+            "target_motion_or_force_axis": _tensor_summary(
+                _first_present_tensor(
+                    prediction_dict,
+                    model.motion_or_force_axis_candidates,
+                    source_name="startup prediction motion/force axis",
+                )[:, 0, :]
+            ),
+            "predicted_sensed_force": _tensor_summary(outputs["predicted_sensed_force"]),
+            "target_sensed_force": _tensor_summary(prediction_dict[model.sensed_force_key][:, 0, :]),
+            "predicted_sensed_moment": _tensor_summary(outputs["predicted_sensed_moment"]),
+            "target_sensed_moment": _tensor_summary(prediction_dict[model.sensed_moment_key][:, 0, :]),
+        },
+    }
+
+
+def _build_startup_report(
+    *,
+    model: CRWMModel,
+    dataset: MultiModalDataset,
+    train_indices: list[int],
+    batch_size: int,
+    depth_ema: ModuleEMA,
+    contact_ema: ModuleEMA,
+    device: torch.device,
+    seed: int,
+    depth_encoder_trainable: bool,
+) -> dict[str, Any]:
+    raw_batch, selected_indices = _build_startup_batch(
+        dataset,
+        train_indices=train_indices,
+        batch_size=batch_size,
+    )
+    batch = _move_to_device(raw_batch, device)
+
+    previous_model_training = bool(model.training)
+    previous_depth_ema_training = bool(depth_ema.module.training)
+    previous_contact_ema_training = bool(contact_ema.module.training)
+    cuda_devices = [torch.cuda.current_device()] if device.type == "cuda" else []
+
+    with torch.random.fork_rng(devices=cuda_devices):
+        torch.manual_seed(int(seed))
+        if device.type == "cuda":
+            torch.cuda.manual_seed(int(seed))
+        try:
+            model.eval()
+            depth_ema.module.eval()
+            contact_ema.module.eval()
+            with torch.no_grad():
+                outputs = model(
+                    batch,
+                    ema_depth_encoder=depth_ema.module,
+                    ema_contact_encoder=contact_ema.module,
+                )
+        finally:
+            model.train(previous_model_training)
+            depth_ema.module.train(previous_depth_ema_training)
+            contact_ema.module.train(previous_contact_ema_training)
+
+    return {
+        "stage": "startup_dummy_pass",
+        "device": str(device),
+        "depth_encoder_trainable": bool(depth_encoder_trainable),
+        "batch_source": {
+            "split": "train",
+            "indices": selected_indices,
+            "configured_batch_size": int(batch_size),
+            "effective_batch_size": len(selected_indices),
+        },
+        "inputs": {
+            "obs_dict": _mapping_tensor_summary(batch["obs_dict"]),
+            "prediction": _mapping_tensor_summary(batch["prediction"]),
+        },
+        "normalization": _build_normalization_report(dataset),
+        "model": _build_model_size_report(model),
+        "outputs": _mapping_tensor_summary(outputs),
+        "loss_targets": _build_startup_loss_target_report(model, batch, outputs),
+    }
+
+
+def _replay_captured_startup_streams(stdout_buffer: io.StringIO, stderr_buffer: io.StringIO) -> None:
+    captured_stdout = stdout_buffer.getvalue()
+    captured_stderr = stderr_buffer.getvalue()
+    if captured_stdout:
+        sys.stderr.write(captured_stdout)
+    if captured_stderr:
+        sys.stderr.write(captured_stderr)
+    if captured_stdout or captured_stderr:
+        sys.stderr.flush()
 
 
 def _run_epoch(
@@ -424,6 +797,8 @@ def train(
         universal_contract=contract_path,
         pointcloud_cache_size=int(config.get("pointcloud_cache_size", 4)),
     )
+    val_fraction = float(config.get("val_fraction", 0.2))
+    train_indices, val_indices = _resolve_split_indices(dataset, val_fraction)
     depth_key, scene_points_key = _resolve_depth_and_scene_keys(dataset)
     model_cfg = dict(config.get("model", {}))
     depth_encoder_cfg = dict(model_cfg.get("depth_encoder", {}))
@@ -437,72 +812,102 @@ def train(
         )
 
     num_depth_points = int(model_cfg.get("num_depth_points", _infer_num_depth_points(dataset, depth_key)))
-    model = CRWMModel(
-        depth_key=depth_key,
-        scene_points_key=scene_points_key,
-        num_depth_points=num_depth_points,
-        depth_encoder_config=depth_encoder_cfg,
-        contact_encoder_config=dict(model_cfg.get("contact_encoder", {})),
-        action_encoder_config=dict(model_cfg.get("action_encoder", {})),
-        flow_config=dict(model_cfg.get("flow", {})),
-        decoder_config=dict(model_cfg.get("decoder", {})),
-        loss_weights=dict(model_cfg.get("loss_weights", {})),
-        max_history_steps=int(model_cfg.get("max_history_steps", 16)),
-        action_delta_pos_key=str(model_cfg.get("action_delta_pos_key", "action_delta_pos")),
-        action_delta_rotvec_key=str(model_cfg.get("action_delta_rotvec_key", "action_delta_rotvec")),
-        action_force_magnitude_key=str(model_cfg.get("action_force_magnitude_key", "action_force_magnitude")),
-        force_dimension_key=str(model_cfg.get("force_dimension_key", "force_dimension")),
-        motion_or_force_axis_key=str(model_cfg.get("motion_or_force_axis_key", "motion_or_force_axis")),
-        sensed_force_key=str(model_cfg.get("sensed_force_key", "sensed_force")),
-        sensed_moment_key=str(model_cfg.get("sensed_moment_key", "sensed_moment")),
-    ).to(device)
-
+    batch_size = int(config.get("batch_size", 8))
+    num_workers = int(config.get("num_workers", 0))
     train_loader, val_loader = _build_dataloaders(
         dataset,
-        batch_size=int(config.get("batch_size", 8)),
-        num_workers=int(config.get("num_workers", 0)),
-        val_fraction=float(config.get("val_fraction", 0.2)),
-    )
-
-    optimizer_cfg = dict(config.get("optimizer", {}))
-    optimizer = AdamW(
-        model.parameters(),
-        lr=float(optimizer_cfg.get("lr", 1e-4)),
-        weight_decay=float(optimizer_cfg.get("weight_decay", 1e-4)),
+        batch_size=batch_size,
+        num_workers=num_workers,
+        train_indices=train_indices,
+        val_indices=val_indices,
     )
     epochs = int(config.get("epochs", 50))
-    scheduler_cfg = dict(config.get("scheduler", {}))
-    scheduler = _build_scheduler(
-        optimizer,
-        total_steps=max(1, epochs * len(train_loader)),
-        warmup_steps=int(scheduler_cfg.get("warmup_steps", 0)),
-        min_lr_scale=float(scheduler_cfg.get("min_lr_scale", 0.1)),
-    )
-
-    depth_ema = ModuleEMA(model.depth_encoder, _resolve_ema_config(config.get("depth_encoder_ema")))
-    contact_ema = ModuleEMA(model.contact_encoder, _resolve_ema_config(config.get("contact_encoder_ema")))
-
     use_amp = bool(config.get("amp", False)) and device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp) if device.type == "cuda" else None
     gradient_clip_norm = config.get("gradient_clip_norm")
     gradient_clip_norm = None if gradient_clip_norm is None else float(gradient_clip_norm)
     log_every = int(config.get("log_every", 0))
     depth_encoder_trainable_epochs = int(config.get("depth_encoder_trainable_epochs", 10))
 
+    startup_stdout = io.StringIO()
+    startup_stderr = io.StringIO()
     start_epoch = 0
     global_step = 0
     best_val_loss = float("inf")
-    resume_from = config.get("resume_from")
-    if resume_from:
-        start_epoch, global_step, best_val_loss = _load_checkpoint(
-            resume_from,
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            depth_ema=depth_ema,
-            contact_ema=contact_ema,
-            device=device,
-        )
+    startup_report: dict[str, Any]
+    try:
+        with contextlib.redirect_stdout(startup_stdout), contextlib.redirect_stderr(startup_stderr):
+            model = CRWMModel(
+                depth_key=depth_key,
+                scene_points_key=scene_points_key,
+                num_depth_points=num_depth_points,
+                depth_encoder_config=depth_encoder_cfg,
+                contact_encoder_config=dict(model_cfg.get("contact_encoder", {})),
+                action_encoder_config=dict(model_cfg.get("action_encoder", {})),
+                flow_config=dict(model_cfg.get("flow", {})),
+                decoder_config=dict(model_cfg.get("decoder", {})),
+                loss_weights=dict(model_cfg.get("loss_weights", {})),
+                max_history_steps=int(model_cfg.get("max_history_steps", 16)),
+                action_delta_pos_key=str(model_cfg.get("action_delta_pos_key", "action_delta_pos")),
+                action_delta_rotvec_key=str(model_cfg.get("action_delta_rotvec_key", "action_delta_rotvec")),
+                action_force_magnitude_key=str(model_cfg.get("action_force_magnitude_key", "action_force_magnitude")),
+                force_dimension_key=str(model_cfg.get("force_dimension_key", "force_dimension")),
+                motion_or_force_axis_key=str(model_cfg.get("motion_or_force_axis_key", "motion_or_force_axis")),
+                sensed_force_key=str(model_cfg.get("sensed_force_key", "sensed_force")),
+                sensed_moment_key=str(model_cfg.get("sensed_moment_key", "sensed_moment")),
+            ).to(device)
+
+            optimizer_cfg = dict(config.get("optimizer", {}))
+            optimizer = AdamW(
+                model.parameters(),
+                lr=float(optimizer_cfg.get("lr", 1e-4)),
+                weight_decay=float(optimizer_cfg.get("weight_decay", 1e-4)),
+            )
+            scheduler_cfg = dict(config.get("scheduler", {}))
+            scheduler = _build_scheduler(
+                optimizer,
+                total_steps=max(1, epochs * len(train_loader)),
+                warmup_steps=int(scheduler_cfg.get("warmup_steps", 0)),
+                min_lr_scale=float(scheduler_cfg.get("min_lr_scale", 0.1)),
+            )
+
+            depth_ema = ModuleEMA(model.depth_encoder, _resolve_ema_config(config.get("depth_encoder_ema")))
+            contact_ema = ModuleEMA(model.contact_encoder, _resolve_ema_config(config.get("contact_encoder_ema")))
+
+            resume_from = config.get("resume_from")
+            if resume_from:
+                start_epoch, global_step, best_val_loss = _load_checkpoint(
+                    resume_from,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    depth_ema=depth_ema,
+                    contact_ema=contact_ema,
+                    device=device,
+                )
+
+            initial_epoch = start_epoch + 1
+            initial_depth_encoder_trainable = initial_epoch <= depth_encoder_trainable_epochs
+            _set_module_trainable(model.depth_encoder, initial_depth_encoder_trainable)
+            if not initial_depth_encoder_trainable:
+                model.depth_encoder.eval()
+
+            startup_report = _build_startup_report(
+                model=model,
+                dataset=dataset,
+                train_indices=train_indices,
+                batch_size=batch_size,
+                depth_ema=depth_ema,
+                contact_ema=contact_ema,
+                device=device,
+                seed=seed,
+                depth_encoder_trainable=initial_depth_encoder_trainable,
+            )
+    except Exception:
+        _replay_captured_startup_streams(startup_stdout, startup_stderr)
+        raise
+
+    print(_format_startup_preflight_report(startup_report))
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp) if device.type == "cuda" else None
 
     config_snapshot_path = output_dir / "config_snapshot.yaml"
     with config_snapshot_path.open("w", encoding="utf-8") as handle:

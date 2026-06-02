@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import numpy as np
@@ -200,6 +203,67 @@ def _write_crwm_contract(
         yaml.safe_dump(contract, handle, sort_keys=False)
 
 
+def _make_train_config(
+    *,
+    dataset_path: Path,
+    contract_path: Path,
+    output_dir: Path,
+    normalize_force: bool = False,
+) -> dict[str, object]:
+    return {
+        "dataset_path": str(dataset_path),
+        "universal_contract": str(contract_path),
+        "output_dir": str(output_dir),
+        "device": "cpu",
+        "seed": 7,
+        "epochs": 1,
+        "batch_size": 2,
+        "num_workers": 0,
+        "val_fraction": 0.5,
+        "log_every": 0,
+        "depth_encoder_trainable_epochs": 0,
+        "depth_encoder_ema": {"decay": 0.9, "update_after_step": 0, "update_every": 1},
+        "contact_encoder_ema": {"decay": 0.9, "update_after_step": 0, "update_every": 1},
+        "optimizer": {"lr": 1e-3, "weight_decay": 0.0},
+        "scheduler": {"warmup_steps": 0, "min_lr_scale": 0.5},
+        "model": {
+            "max_history_steps": 4,
+            "depth_encoder": {
+                "type": "dummy",
+                "hidden_dim": 16,
+                "point_feature_dim": 12,
+                "global_latent_dim": 8,
+                "num_blocks": 1,
+            },
+            "contact_encoder": {
+                "hidden_dim": 16,
+                "output_dim": 6,
+                "num_force_dimensions": 4,
+                "force_embedding_dim": 4,
+            },
+            "action_encoder": {
+                "hidden_dim": 16,
+                "output_dim": 5,
+            },
+            "flow": {
+                "model_dim": 24,
+                "num_layers": 2,
+                "num_heads": 4,
+                "mlp_ratio": 2.0,
+            },
+            "decoder": {
+                "depth_hidden_dim": 16,
+                "contact_hidden_dim": 16,
+            },
+            "loss_weights": {
+                "flow": 1.0,
+                "depth_recon": 0.5,
+                "contact_recon": 0.25,
+            },
+        },
+    }
+
+
 class DummyDepthEncoderTests(unittest.TestCase):
     def test_dummy_depth_encoder_ignores_invalid_points(self) -> None:
         encoder = DummyDepthEncoder(hidden_dim=16, point_feature_dim=12, global_latent_dim=8, num_blocks=1)
@@ -355,58 +419,12 @@ class TrainerSmokeTests(unittest.TestCase):
             )
 
             output_dir = Path(tmp_dir) / "run"
-            config = {
-                "dataset_path": str(dataset_path),
-                "universal_contract": str(contract_path),
-                "output_dir": str(output_dir),
-                "device": "cpu",
-                "seed": 7,
-                "epochs": 1,
-                "batch_size": 2,
-                "num_workers": 0,
-                "val_fraction": 0.5,
-                "log_every": 0,
-                "depth_encoder_trainable_epochs": 0,
-                "depth_encoder_ema": {"decay": 0.9, "update_after_step": 0, "update_every": 1},
-                "contact_encoder_ema": {"decay": 0.9, "update_after_step": 0, "update_every": 1},
-                "optimizer": {"lr": 1e-3, "weight_decay": 0.0},
-                "scheduler": {"warmup_steps": 0, "min_lr_scale": 0.5},
-                "model": {
-                    "max_history_steps": 4,
-                    "depth_encoder": {
-                        "type": "dummy",
-                        "hidden_dim": 16,
-                        "point_feature_dim": 12,
-                        "global_latent_dim": 8,
-                        "num_blocks": 1,
-                    },
-                    "contact_encoder": {
-                        "hidden_dim": 16,
-                        "output_dim": 6,
-                        "num_force_dimensions": 4,
-                        "force_embedding_dim": 4,
-                    },
-                    "action_encoder": {
-                        "hidden_dim": 16,
-                        "output_dim": 5,
-                    },
-                    "flow": {
-                        "model_dim": 24,
-                        "num_layers": 2,
-                        "num_heads": 4,
-                        "mlp_ratio": 2.0,
-                    },
-                    "decoder": {
-                        "depth_hidden_dim": 16,
-                        "contact_hidden_dim": 16,
-                    },
-                    "loss_weights": {
-                        "flow": 1.0,
-                        "depth_recon": 0.5,
-                        "contact_recon": 0.25,
-                    },
-                },
-            }
+            config = _make_train_config(
+                dataset_path=dataset_path,
+                contract_path=contract_path,
+                output_dir=output_dir,
+                normalize_force=True,
+            )
 
             metrics = train(config)
             latest_checkpoint = torch.load(output_dir / "latest.pt", map_location="cpu")
@@ -419,6 +437,126 @@ class TrainerSmokeTests(unittest.TestCase):
             self.assertIn("depth_ema_state_dict", latest_checkpoint)
             self.assertIn("contact_ema_state_dict", latest_checkpoint)
             self.assertIn("model_state_dict", latest_checkpoint)
+
+    @unittest.skipUnless(PYARROW_AVAILABLE, "pyarrow not installed")
+    def test_train_prints_startup_report_before_epoch_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dataset_path = Path(tmp_dir) / "dataset"
+            _write_multiepisode_dataset(dataset_path)
+            _write_point_cloud_chunks(dataset_path, [3, 3], num_points=4)
+            _write_scene_points(dataset_path / "scene_points.npy")
+            contract_path = Path(tmp_dir) / "contract.yaml"
+            _write_crwm_contract(contract_path, prediction_window=1)
+            output_dir = Path(tmp_dir) / "run"
+            config = _make_train_config(
+                dataset_path=dataset_path,
+                contract_path=contract_path,
+                output_dir=output_dir,
+            )
+
+            stdout_buffer = io.StringIO()
+            with contextlib.redirect_stdout(stdout_buffer):
+                metrics = train(config)
+
+        output = stdout_buffer.getvalue()
+        emitted_lines = [line for line in output.splitlines() if line.strip()]
+        self.assertGreaterEqual(len(emitted_lines), 2)
+        self.assertEqual(emitted_lines[0], "Startup Preflight:")
+        self.assertIn("  stage: startup_dummy_pass", output)
+        self.assertIn("  device: cpu", output)
+        self.assertIn(
+            "  batch_source: split=train indices=[0, 1] configured_batch_size=2 effective_batch_size=2",
+            output,
+        )
+        self.assertIn("Inputs / obs_dict:", output)
+        self.assertIn("Prediction Targets:", output)
+        self.assertIn("  - camera_01_depth: shape=[2, 2, 4, 3]", output)
+        self.assertIn("  - action_force_magnitude: shape=[2, 2]", output)
+        self.assertIn("Model Components:", output)
+        self.assertIn("  - full_model: total_params=", output)
+        self.assertIn("  - depth_encoder: total_params=", output)
+        self.assertIn("  - conditioning_stack: total_params=", output)
+        self.assertIn("Outputs:", output)
+        self.assertIn("  - predicted_velocity: shape=[2, 14]", output)
+        self.assertIn("Loss Targets:", output)
+        self.assertIn("  flow_loss:", output)
+        self.assertIn("  depth_recon_loss:", output)
+        self.assertIn("  contact_recon_loss:", output)
+        self.assertIn("Normalization:", output)
+        self.assertIn("  - none", output)
+        self.assertNotIn('"stage"', output)
+        self.assertNotIn("preview", output)
+        self.assertNotIn("values", output)
+        self.assertTrue(emitted_lines[-1].startswith("epoch=1 "))
+        self.assertIn("train_loss", metrics)
+
+    @unittest.skipUnless(PYARROW_AVAILABLE, "pyarrow not installed")
+    def test_train_startup_report_includes_normalizer_stats_for_normalized_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dataset_path = Path(tmp_dir) / "dataset"
+            _write_multiepisode_dataset(dataset_path)
+            _write_point_cloud_chunks(dataset_path, [3, 3], num_points=4)
+            _write_scene_points(dataset_path / "scene_points.npy")
+            contract_path = Path(tmp_dir) / "contract.yaml"
+            _write_crwm_contract(
+                contract_path,
+                prediction_window=1,
+                normalize_force=True,
+            )
+            output_dir = Path(tmp_dir) / "run"
+            config = _make_train_config(
+                dataset_path=dataset_path,
+                contract_path=contract_path,
+                output_dir=output_dir,
+                normalize_force=True,
+            )
+
+            stdout_buffer = io.StringIO()
+            with contextlib.redirect_stdout(stdout_buffer):
+                train(config)
+
+        output = stdout_buffer.getvalue()
+        self.assertIn("Normalization:", output)
+        self.assertIn(
+            "  - sensed_force: mean=[2.2500, 1.0000, 0.3333] std=[0.8539, 0.6455, 0.3727]",
+            output,
+        )
+        self.assertIn(
+            "  - sensed_moment: mean=[0.2500, 0.3500, 0.4500] std=[0.1708, 0.1708, 0.1708]",
+            output,
+        )
+        self.assertNotIn("motion_or_force_axis: mean=", output)
+
+    @unittest.skipUnless(PYARROW_AVAILABLE, "pyarrow not installed")
+    def test_train_replays_captured_startup_noise_on_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dataset_path = Path(tmp_dir) / "dataset"
+            _write_multiepisode_dataset(dataset_path)
+            _write_point_cloud_chunks(dataset_path, [3, 3], num_points=4)
+            _write_scene_points(dataset_path / "scene_points.npy")
+            contract_path = Path(tmp_dir) / "contract.yaml"
+            _write_crwm_contract(contract_path, prediction_window=1)
+            output_dir = Path(tmp_dir) / "run"
+            config = _make_train_config(
+                dataset_path=dataset_path,
+                contract_path=contract_path,
+                output_dir=output_dir,
+            )
+
+            stdout_buffer = io.StringIO()
+            stderr_buffer = io.StringIO()
+
+            def _failing_build_depth_encoder(config=None):
+                print("startup noise from depth encoder")
+                raise RuntimeError("synthetic startup failure")
+
+            with mock.patch("training.crwm_model.build_depth_encoder", side_effect=_failing_build_depth_encoder):
+                with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
+                    with self.assertRaisesRegex(RuntimeError, "synthetic startup failure"):
+                        train(config)
+
+        self.assertEqual(stdout_buffer.getvalue(), "")
+        self.assertIn("startup noise from depth encoder", stderr_buffer.getvalue())
 
 
 if __name__ == "__main__":

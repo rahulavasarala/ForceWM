@@ -6,11 +6,19 @@ epochs: 50
 batch_size: 4
 num_workers: 0
 val_fraction: 0.2
+val_every_epochs: 5
 pointcloud_cache_size: 4
 log_every: 10
 depth_encoder_trainable_epochs: 10
+contact_encoder_trainable_epochs: 20
 gradient_clip_norm: 1.0
 amp: true
+
+wandb:
+  enabled: true
+  project: "forcewm-crwm"
+  entity: null
+  run_name: null
 
 optimizer:
   lr: 0.0001

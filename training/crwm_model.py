@@ -829,7 +829,7 @@ class CRWMModel(nn.Module):
         self,
         predictions: Mapping[str, torch.Tensor],
         prediction_dict: Mapping[str, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         force_dimension_target = prediction_dict[self.force_dimension_key][:, 0].to(dtype=torch.long)
         motion_or_force_axis_target = _first_present(
             prediction_dict,
@@ -847,7 +847,16 @@ class CRWMModel(nn.Module):
 
         predicted_labels = predictions["force_dimension_logits"].argmax(dim=-1)
         accuracy = (predicted_labels == force_dimension_target).to(dtype=torch.float32).mean()
-        return total_loss, accuracy
+        return (
+            {
+                "contact_recon_loss": total_loss,
+                "contact_force_dimension_ce": force_dimension_loss,
+                "contact_motion_axis_mse": motion_axis_loss,
+                "contact_sensed_force_mse": sensed_force_loss,
+                "contact_sensed_moment_mse": sensed_moment_loss,
+            },
+            accuracy,
+        )
 
     def forward(
         self,
@@ -910,10 +919,11 @@ class CRWMModel(nn.Module):
         predicted_contact_latent = last_observed_contact + p2_pred
 
         predicted_contact = self.contact_decoder(predicted_contact_latent)
-        contact_recon_loss, force_dimension_accuracy = self._contact_reconstruction_loss(
+        contact_losses, force_dimension_accuracy = self._contact_reconstruction_loss(
             predictions=predicted_contact,
             prediction_dict=prediction_dict,
         )
+        contact_recon_loss = contact_losses["contact_recon_loss"]
 
         predicted_depth_points = self.depth_decoder(torch.cat([predicted_depth_latent, scene_latent], dim=-1))
         future_depth_target = future_depth[:, 0, :, :]
@@ -935,6 +945,10 @@ class CRWMModel(nn.Module):
             "flow_loss": flow_loss,
             "depth_recon_loss": depth_recon_loss,
             "contact_recon_loss": contact_recon_loss,
+            "contact_force_dimension_ce": contact_losses["contact_force_dimension_ce"],
+            "contact_motion_axis_mse": contact_losses["contact_motion_axis_mse"],
+            "contact_sensed_force_mse": contact_losses["contact_sensed_force_mse"],
+            "contact_sensed_moment_mse": contact_losses["contact_sensed_moment_mse"],
             "force_dimension_accuracy": force_dimension_accuracy,
             "predicted_velocity": predicted_velocity,
             "latent_target": latent_target,

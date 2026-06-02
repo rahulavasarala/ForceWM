@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -220,8 +221,16 @@ def _make_train_config(
         "batch_size": 2,
         "num_workers": 0,
         "val_fraction": 0.5,
+        "val_every_epochs": 1,
         "log_every": 0,
         "depth_encoder_trainable_epochs": 0,
+        "contact_encoder_trainable_epochs": 0,
+        "wandb": {
+            "enabled": False,
+            "project": "forcewm-test",
+            "entity": None,
+            "run_name": None,
+        },
         "depth_encoder_ema": {"decay": 0.9, "update_after_step": 0, "update_every": 1},
         "contact_encoder_ema": {"decay": 0.9, "update_after_step": 0, "update_every": 1},
         "optimizer": {"lr": 1e-3, "weight_decay": 0.0},
@@ -328,6 +337,19 @@ class CRWMModelTests(unittest.TestCase):
         self.assertEqual(tuple(outputs["latent_target"].shape), (2, 14))
         self.assertEqual(tuple(outputs["predicted_depth_points"].shape), (2, 4, 3))
         self.assertEqual(tuple(outputs["predicted_force_dimension_logits"].shape), (2, 4))
+        self.assertIn("contact_force_dimension_ce", outputs)
+        self.assertIn("contact_motion_axis_mse", outputs)
+        self.assertIn("contact_sensed_force_mse", outputs)
+        self.assertIn("contact_sensed_moment_mse", outputs)
+        self.assertTrue(
+            torch.allclose(
+                outputs["contact_recon_loss"],
+                outputs["contact_force_dimension_ce"]
+                + outputs["contact_motion_axis_mse"]
+                + outputs["contact_sensed_force_mse"]
+                + outputs["contact_sensed_moment_mse"],
+            )
+        )
 
     def test_crwm_forward_allows_missing_scene_points(self) -> None:
         model = CRWMModel(
@@ -464,6 +486,8 @@ class TrainerSmokeTests(unittest.TestCase):
         self.assertEqual(emitted_lines[0], "Startup Preflight:")
         self.assertIn("  stage: startup_dummy_pass", output)
         self.assertIn("  device: cpu", output)
+        self.assertIn("  depth_encoder_trainable: False", output)
+        self.assertIn("  contact_encoder_trainable: False", output)
         self.assertIn(
             "  batch_source: split=train indices=[0, 1] configured_batch_size=2 effective_batch_size=2",
             output,
@@ -488,6 +512,8 @@ class TrainerSmokeTests(unittest.TestCase):
         self.assertNotIn("preview", output)
         self.assertNotIn("values", output)
         self.assertTrue(emitted_lines[-1].startswith("epoch=1 "))
+        self.assertIn("val_ran=1", emitted_lines[-1])
+        self.assertIn("contact_encoder_trainable=0", emitted_lines[-1])
         self.assertIn("train_loss", metrics)
 
     @unittest.skipUnless(PYARROW_AVAILABLE, "pyarrow not installed")
@@ -526,6 +552,144 @@ class TrainerSmokeTests(unittest.TestCase):
             output,
         )
         self.assertNotIn("motion_or_force_axis: mean=", output)
+
+    @unittest.skipUnless(PYARROW_AVAILABLE, "pyarrow not installed")
+    def test_train_freezes_contact_encoder_after_configured_epochs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dataset_path = Path(tmp_dir) / "dataset"
+            _write_multiepisode_dataset(dataset_path)
+            _write_point_cloud_chunks(dataset_path, [3, 3], num_points=4)
+            _write_scene_points(dataset_path / "scene_points.npy")
+            contract_path = Path(tmp_dir) / "contract.yaml"
+            _write_crwm_contract(contract_path, prediction_window=1)
+            output_dir = Path(tmp_dir) / "run"
+            config = _make_train_config(
+                dataset_path=dataset_path,
+                contract_path=contract_path,
+                output_dir=output_dir,
+            )
+            config["epochs"] = 2
+            config["depth_encoder_trainable_epochs"] = 1
+            config["contact_encoder_trainable_epochs"] = 1
+
+            stdout_buffer = io.StringIO()
+            with contextlib.redirect_stdout(stdout_buffer):
+                train(config)
+
+        epoch_lines = [
+            line for line in stdout_buffer.getvalue().splitlines() if line.startswith("epoch=")
+        ]
+        self.assertEqual(len(epoch_lines), 2)
+        self.assertIn("epoch=1 depth_encoder_trainable=1 contact_encoder_trainable=1", epoch_lines[0])
+        self.assertIn("epoch=2 depth_encoder_trainable=0 contact_encoder_trainable=0", epoch_lines[1])
+
+    @unittest.skipUnless(PYARROW_AVAILABLE, "pyarrow not installed")
+    def test_train_skips_validation_until_configured_epoch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dataset_path = Path(tmp_dir) / "dataset"
+            _write_multiepisode_dataset(dataset_path)
+            _write_point_cloud_chunks(dataset_path, [3, 3], num_points=4)
+            _write_scene_points(dataset_path / "scene_points.npy")
+            contract_path = Path(tmp_dir) / "contract.yaml"
+            _write_crwm_contract(contract_path, prediction_window=1)
+            output_dir = Path(tmp_dir) / "run"
+            config = _make_train_config(
+                dataset_path=dataset_path,
+                contract_path=contract_path,
+                output_dir=output_dir,
+            )
+            config["epochs"] = 2
+            config["val_every_epochs"] = 2
+
+            epoch_metrics: list[dict[str, float]] = []
+
+            def _collect_epoch(epoch: int, metrics: dict[str, float], output_dir: Path) -> None:
+                _ = epoch, output_dir
+                epoch_metrics.append(dict(metrics))
+
+            stdout_buffer = io.StringIO()
+            with contextlib.redirect_stdout(stdout_buffer):
+                metrics = train(config, on_epoch_end=_collect_epoch)
+            best_checkpoint_exists = (output_dir / "best.pt").exists()
+
+        output = stdout_buffer.getvalue()
+        epoch_lines = [line for line in output.splitlines() if line.startswith("epoch=")]
+        self.assertEqual(len(epoch_lines), 2)
+        self.assertIn("epoch=1", epoch_lines[0])
+        self.assertIn("val_ran=0", epoch_lines[0])
+        self.assertIn("val_loss=nan", epoch_lines[0])
+        self.assertIn("epoch=2", epoch_lines[1])
+        self.assertIn("val_ran=1", epoch_lines[1])
+        self.assertEqual(len(epoch_metrics), 2)
+        self.assertEqual(epoch_metrics[0]["val_ran"], 0.0)
+        self.assertNotIn("val_loss", epoch_metrics[0])
+        self.assertEqual(epoch_metrics[1]["val_ran"], 1.0)
+        self.assertIn("val_loss", epoch_metrics[1])
+        self.assertEqual(metrics["val_ran"], 1.0)
+        self.assertIn("val_loss", metrics)
+        self.assertTrue(best_checkpoint_exists)
+
+    @unittest.skipUnless(PYARROW_AVAILABLE, "pyarrow not installed")
+    def test_train_logs_wandb_metrics_when_enabled(self) -> None:
+        class _FakeWandb:
+            def __init__(self) -> None:
+                self.init_kwargs: dict[str, object] | None = None
+                self.log_calls: list[tuple[dict[str, float], int | None]] = []
+                self.finish_calls = 0
+
+            def init(self, **kwargs):
+                self.init_kwargs = kwargs
+                return object()
+
+            def log(self, metrics, step=None):
+                self.log_calls.append((dict(metrics), step))
+
+            def finish(self):
+                self.finish_calls += 1
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dataset_path = Path(tmp_dir) / "dataset"
+            _write_multiepisode_dataset(dataset_path)
+            _write_point_cloud_chunks(dataset_path, [3, 3], num_points=4)
+            _write_scene_points(dataset_path / "scene_points.npy")
+            contract_path = Path(tmp_dir) / "contract.yaml"
+            _write_crwm_contract(contract_path, prediction_window=1)
+            output_dir = Path(tmp_dir) / "run"
+            config = _make_train_config(
+                dataset_path=dataset_path,
+                contract_path=contract_path,
+                output_dir=output_dir,
+            )
+            config["wandb"] = {
+                "enabled": True,
+                "project": "forcewm-test",
+                "entity": "forcewm",
+                "run_name": "unit-test-run",
+            }
+
+            fake_wandb = _FakeWandb()
+            with mock.patch.dict(sys.modules, {"wandb": fake_wandb}):
+                train(config)
+
+        self.assertIsNotNone(fake_wandb.init_kwargs)
+        assert fake_wandb.init_kwargs is not None
+        self.assertEqual(fake_wandb.init_kwargs["project"], "forcewm-test")
+        self.assertEqual(fake_wandb.init_kwargs["entity"], "forcewm")
+        self.assertEqual(fake_wandb.init_kwargs["name"], "unit-test-run")
+        self.assertEqual(fake_wandb.finish_calls, 1)
+        step_logs = [metrics for metrics, step in fake_wandb.log_calls if step is not None and "train_step/loss" in metrics]
+        self.assertGreaterEqual(len(step_logs), 1)
+        self.assertIn("train_step/contact_force_dimension_ce", step_logs[0])
+        self.assertIn("train_step/contact_motion_axis_mse", step_logs[0])
+        self.assertIn("train_step/contact_sensed_force_mse", step_logs[0])
+        self.assertIn("train_step/contact_sensed_moment_mse", step_logs[0])
+        self.assertIn("trainer/global_step", step_logs[0])
+        self.assertIn("trainer/epoch", step_logs[0])
+        self.assertIn("trainer/lr", step_logs[0])
+        epoch_logs = [metrics for metrics, _ in fake_wandb.log_calls if "train_epoch/loss" in metrics]
+        self.assertEqual(len(epoch_logs), 1)
+        self.assertIn("val/loss", epoch_logs[0])
+        self.assertIn("trainer/val_ran", epoch_logs[0])
 
     @unittest.skipUnless(PYARROW_AVAILABLE, "pyarrow not installed")
     def test_train_replays_captured_startup_noise_on_failure(self) -> None:

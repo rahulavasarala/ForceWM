@@ -25,6 +25,7 @@ REMOTE_CONTRACT_PATH = "/tmp/forcewm_universal_contract.yaml"
 DATASET_VOLUME_NAME = os.environ.get("FORCEWM_MODAL_DATASET_VOLUME", "forcewm-datasets")
 OUTPUT_VOLUME_NAME = os.environ.get("FORCEWM_MODAL_OUTPUT_VOLUME", "forcewm-training-runs")
 CACHE_VOLUME_NAME = os.environ.get("FORCEWM_MODAL_CACHE_VOLUME", "concerto-smoketest-cache")
+WANDB_SECRET_NAME = os.environ.get("FORCEWM_MODAL_WANDB_SECRET", "wandb")
 
 
 def _load_yaml(path: str | Path) -> dict[str, Any]:
@@ -60,6 +61,17 @@ def _resolve_remote_resume_path(resume_from: str | None, output_container_path: 
     return str(PurePosixPath(output_container_path) / Path(cleaned).name)
 
 
+def _wandb_enabled(config: dict[str, Any]) -> bool:
+    wandb_cfg = config.get("wandb", {})
+    if not isinstance(wandb_cfg, dict):
+        return False
+    return bool(wandb_cfg.get("enabled", False))
+
+
+def _select_remote_runner(config: dict[str, Any]):
+    return run_training_wandb if _wandb_enabled(config) else run_training
+
+
 image = (
     modal.Image.from_registry(
         f"nvidia/cuda:{CUDA_BASE_IMAGE}",
@@ -81,7 +93,7 @@ image = (
         ),
         (
             "python -m pip install "
-            "numpy==1.26.4 pyyaml pyarrow scipy timm tqdm "
+            "numpy==1.26.4 pyyaml pyarrow scipy timm tqdm wandb "
             "huggingface_hub natsort addict einops termcolor"
         ),
         (
@@ -106,18 +118,10 @@ app = modal.App(APP_NAME, image=image)
 dataset_volume = modal.Volume.from_name(DATASET_VOLUME_NAME, create_if_missing=True)
 output_volume = modal.Volume.from_name(OUTPUT_VOLUME_NAME, create_if_missing=True)
 cache_volume = modal.Volume.from_name(CACHE_VOLUME_NAME, create_if_missing=True)
+wandb_secret = modal.Secret.from_name(WANDB_SECRET_NAME, required_keys=["WANDB_API_KEY"])
 
 
-@app.function(
-    gpu=GPU_TYPE,
-    timeout=60 * 60 * 24,
-    volumes={
-        REMOTE_DATASET_MOUNT: dataset_volume,
-        REMOTE_OUTPUT_MOUNT: output_volume,
-        REMOTE_CACHE_MOUNT: cache_volume,
-    },
-)
-def run_training(config: dict[str, Any], contract_payload: dict[str, Any]) -> dict[str, float]:
+def _run_training_impl(config: dict[str, Any], contract_payload: dict[str, Any]) -> dict[str, float]:
     import sys
 
     sys.path.insert(0, "/root")
@@ -141,6 +145,33 @@ def run_training(config: dict[str, Any], contract_payload: dict[str, Any]) -> di
     cache_volume.commit()
     print(json.dumps(metrics, indent=2, sort_keys=True))
     return metrics
+
+
+@app.function(
+    gpu=GPU_TYPE,
+    timeout=60 * 60 * 24,
+    volumes={
+        REMOTE_DATASET_MOUNT: dataset_volume,
+        REMOTE_OUTPUT_MOUNT: output_volume,
+        REMOTE_CACHE_MOUNT: cache_volume,
+    },
+)
+def run_training(config: dict[str, Any], contract_payload: dict[str, Any]) -> dict[str, float]:
+    return _run_training_impl(config, contract_payload)
+
+
+@app.function(
+    gpu=GPU_TYPE,
+    timeout=60 * 60 * 24,
+    volumes={
+        REMOTE_DATASET_MOUNT: dataset_volume,
+        REMOTE_OUTPUT_MOUNT: output_volume,
+        REMOTE_CACHE_MOUNT: cache_volume,
+    },
+    secrets=[wandb_secret],
+)
+def run_training_wandb(config: dict[str, Any], contract_payload: dict[str, Any]) -> dict[str, float]:
+    return _run_training_impl(config, contract_payload)
 
 
 @app.local_entrypoint()
@@ -183,5 +214,6 @@ def main(
     else:
         remote_config["resume_from"] = resolved_resume_path
 
-    result = run_training.remote(remote_config, rewritten_contract)
+    remote_runner = _select_remote_runner(remote_config)
+    result = remote_runner.remote(remote_config, rewritten_contract)
     print(json.dumps(result, indent=2, sort_keys=True))

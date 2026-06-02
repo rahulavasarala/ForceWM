@@ -211,6 +211,14 @@ class EMAConfig:
     update_every: int = 1
 
 
+@dataclass
+class WandbConfig:
+    enabled: bool = False
+    project: str = ""
+    entity: str | None = None
+    run_name: str | None = None
+
+
 class ModuleEMA:
     def __init__(self, module: nn.Module, config: EMAConfig) -> None:
         self.module = copy.deepcopy(module).eval()
@@ -248,6 +256,64 @@ def _resolve_ema_config(config: Mapping[str, Any] | None = None) -> EMAConfig:
         decay=float(config.get("decay", 0.999)),
         update_after_step=int(config.get("update_after_step", 0)),
         update_every=int(config.get("update_every", 1)),
+    )
+
+
+class WandbLogger:
+    def __init__(
+        self,
+        *,
+        config: WandbConfig,
+        run_config: Mapping[str, Any],
+        output_dir: Path,
+    ) -> None:
+        self.enabled = bool(config.enabled)
+        self._wandb: Any | None = None
+        if not self.enabled:
+            return
+
+        project = str(config.project).strip()
+        if not project:
+            raise ValueError("`wandb.project` is required when `wandb.enabled` is true.")
+
+        try:
+            import wandb
+        except ImportError as exc:
+            raise ImportError(
+                "W&B logging is enabled but the `wandb` package is not installed in this environment."
+            ) from exc
+
+        run_name = str(config.run_name).strip() if config.run_name is not None else output_dir.name
+        entity = str(config.entity).strip() if config.entity is not None else ""
+        self._wandb = wandb
+        wandb.init(
+            project=project,
+            entity=entity or None,
+            name=run_name or output_dir.name,
+            config=copy.deepcopy(dict(run_config)),
+            dir=str(output_dir),
+        )
+
+    def log(self, metrics: Mapping[str, float], *, step: int | None = None) -> None:
+        if not self.enabled or self._wandb is None:
+            return
+        self._wandb.log(dict(metrics), step=step)
+
+    def finish(self) -> None:
+        if not self.enabled or self._wandb is None:
+            return
+        self._wandb.finish()
+
+
+def _resolve_wandb_config(config: Mapping[str, Any] | None) -> WandbConfig:
+    config = dict(config or {})
+    entity = config.get("entity")
+    run_name = config.get("run_name")
+    return WandbConfig(
+        enabled=bool(config.get("enabled", False)),
+        project=str(config.get("project", "")),
+        entity=None if entity in {None, ""} else str(entity),
+        run_name=None if run_name in {None, ""} else str(run_name),
     )
 
 
@@ -383,6 +449,7 @@ def _format_startup_preflight_report(report: Mapping[str, Any]) -> str:
         f"  stage: {report['stage']}",
         f"  device: {report['device']}",
         f"  depth_encoder_trainable: {report['depth_encoder_trainable']}",
+        f"  contact_encoder_trainable: {report['contact_encoder_trainable']}",
         (
             "  batch_source: "
             f"split={batch_source['split']} "
@@ -567,6 +634,7 @@ def _build_startup_report(
     device: torch.device,
     seed: int,
     depth_encoder_trainable: bool,
+    contact_encoder_trainable: bool,
 ) -> dict[str, Any]:
     raw_batch, selected_indices = _build_startup_batch(
         dataset,
@@ -603,6 +671,7 @@ def _build_startup_report(
         "stage": "startup_dummy_pass",
         "device": str(device),
         "depth_encoder_trainable": bool(depth_encoder_trainable),
+        "contact_encoder_trainable": bool(contact_encoder_trainable),
         "batch_source": {
             "split": "train",
             "indices": selected_indices,
@@ -631,6 +700,10 @@ def _replay_captured_startup_streams(stdout_buffer: io.StringIO, stderr_buffer: 
         sys.stderr.flush()
 
 
+def _current_learning_rate(optimizer: torch.optim.Optimizer) -> float:
+    return float(optimizer.param_groups[0]["lr"])
+
+
 def _run_epoch(
     *,
     model: CRWMModel,
@@ -646,12 +719,15 @@ def _run_epoch(
     global_step: int,
     training: bool,
     log_every: int,
+    on_train_step: Callable[[int, dict[str, float]], None] | None = None,
 ) -> tuple[dict[str, float], int]:
     metric_rows: list[dict[str, float]] = []
     if training:
         model.train()
         if not any(parameter.requires_grad for parameter in model.depth_encoder.parameters()):
             model.depth_encoder.eval()
+        if not any(parameter.requires_grad for parameter in model.contact_encoder.parameters()):
+            model.contact_encoder.eval()
         depth_ema.module.eval()
         contact_ema.module.eval()
     else:
@@ -697,9 +773,15 @@ def _run_epoch(
             "flow_loss": float(outputs["flow_loss"].detach().cpu().item()),
             "depth_recon_loss": float(outputs["depth_recon_loss"].detach().cpu().item()),
             "contact_recon_loss": float(outputs["contact_recon_loss"].detach().cpu().item()),
+            "contact_force_dimension_ce": float(outputs["contact_force_dimension_ce"].detach().cpu().item()),
+            "contact_motion_axis_mse": float(outputs["contact_motion_axis_mse"].detach().cpu().item()),
+            "contact_sensed_force_mse": float(outputs["contact_sensed_force_mse"].detach().cpu().item()),
+            "contact_sensed_moment_mse": float(outputs["contact_sensed_moment_mse"].detach().cpu().item()),
             "force_dimension_accuracy": float(outputs["force_dimension_accuracy"].detach().cpu().item()),
         }
         metric_rows.append(metric_row)
+        if training and on_train_step is not None:
+            on_train_step(global_step, metric_row)
 
         if log_every > 0 and step_index % log_every == 0:
             phase = "train" if training else "val"
@@ -709,6 +791,10 @@ def _run_epoch(
                 f"flow={metric_row['flow_loss']:.4f} "
                 f"depth={metric_row['depth_recon_loss']:.4f} "
                 f"contact={metric_row['contact_recon_loss']:.4f} "
+                f"contact_ce={metric_row['contact_force_dimension_ce']:.4f} "
+                f"contact_axis={metric_row['contact_motion_axis_mse']:.4f} "
+                f"contact_force={metric_row['contact_sensed_force_mse']:.4f} "
+                f"contact_moment={metric_row['contact_sensed_moment_mse']:.4f} "
                 f"force_acc={metric_row['force_dimension_accuracy']:.4f}"
             )
 
@@ -826,7 +912,12 @@ def train(
     gradient_clip_norm = config.get("gradient_clip_norm")
     gradient_clip_norm = None if gradient_clip_norm is None else float(gradient_clip_norm)
     log_every = int(config.get("log_every", 0))
+    val_every_epochs = int(config.get("val_every_epochs", 1))
+    if val_every_epochs <= 0:
+        raise ValueError(f"`val_every_epochs` must be positive, got `{val_every_epochs}`.")
     depth_encoder_trainable_epochs = int(config.get("depth_encoder_trainable_epochs", 10))
+    contact_encoder_trainable_epochs = int(config.get("contact_encoder_trainable_epochs", 10))
+    wandb_config = _resolve_wandb_config(config.get("wandb"))
 
     startup_stdout = io.StringIO()
     startup_stderr = io.StringIO()
@@ -887,9 +978,13 @@ def train(
 
             initial_epoch = start_epoch + 1
             initial_depth_encoder_trainable = initial_epoch <= depth_encoder_trainable_epochs
+            initial_contact_encoder_trainable = initial_epoch <= contact_encoder_trainable_epochs
             _set_module_trainable(model.depth_encoder, initial_depth_encoder_trainable)
+            _set_module_trainable(model.contact_encoder, initial_contact_encoder_trainable)
             if not initial_depth_encoder_trainable:
                 model.depth_encoder.eval()
+            if not initial_contact_encoder_trainable:
+                model.contact_encoder.eval()
 
             startup_report = _build_startup_report(
                 model=model,
@@ -901,6 +996,7 @@ def train(
                 device=device,
                 seed=seed,
                 depth_encoder_trainable=initial_depth_encoder_trainable,
+                contact_encoder_trainable=initial_contact_encoder_trainable,
             )
     except Exception:
         _replay_captured_startup_streams(startup_stdout, startup_stderr)
@@ -916,74 +1012,113 @@ def train(
     latest_checkpoint_path = output_dir / "latest.pt"
     best_checkpoint_path = output_dir / "best.pt"
     final_metrics: dict[str, float] = {}
+    wandb_logger = WandbLogger(config=wandb_config, run_config=config, output_dir=output_dir)
+    try:
+        for epoch_index in range(start_epoch, epochs):
+            current_epoch = epoch_index + 1
+            depth_encoder_trainable = current_epoch <= depth_encoder_trainable_epochs
+            contact_encoder_trainable = current_epoch <= contact_encoder_trainable_epochs
+            val_ran = current_epoch % val_every_epochs == 0
+            _set_module_trainable(model.depth_encoder, depth_encoder_trainable)
+            _set_module_trainable(model.contact_encoder, contact_encoder_trainable)
+            if not depth_encoder_trainable:
+                model.depth_encoder.eval()
+            if not contact_encoder_trainable:
+                model.contact_encoder.eval()
 
-    for epoch_index in range(start_epoch, epochs):
-        current_epoch = epoch_index + 1
-        depth_encoder_trainable = current_epoch <= depth_encoder_trainable_epochs
-        _set_module_trainable(model.depth_encoder, depth_encoder_trainable)
-        if not depth_encoder_trainable:
-            model.depth_encoder.eval()
+            def _log_train_step(step: int, metrics: dict[str, float]) -> None:
+                wandb_logger.log(
+                    {
+                        "train_step/loss": metrics["loss"],
+                        "train_step/flow_loss": metrics["flow_loss"],
+                        "train_step/depth_recon_loss": metrics["depth_recon_loss"],
+                        "train_step/contact_recon_loss": metrics["contact_recon_loss"],
+                        "train_step/contact_force_dimension_ce": metrics["contact_force_dimension_ce"],
+                        "train_step/contact_motion_axis_mse": metrics["contact_motion_axis_mse"],
+                        "train_step/contact_sensed_force_mse": metrics["contact_sensed_force_mse"],
+                        "train_step/contact_sensed_moment_mse": metrics["contact_sensed_moment_mse"],
+                        "train_step/force_dimension_accuracy": metrics["force_dimension_accuracy"],
+                        "trainer/epoch": float(current_epoch),
+                        "trainer/global_step": float(step),
+                        "trainer/lr": _current_learning_rate(optimizer),
+                        "trainer/depth_encoder_trainable": float(int(depth_encoder_trainable)),
+                        "trainer/contact_encoder_trainable": float(int(contact_encoder_trainable)),
+                    },
+                    step=step,
+                )
 
-        train_metrics, global_step = _run_epoch(
-            model=model,
-            data_loader=train_loader,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            depth_ema=depth_ema,
-            contact_ema=contact_ema,
-            device=device,
-            use_amp=use_amp,
-            scaler=scaler,
-            gradient_clip_norm=gradient_clip_norm,
-            global_step=global_step,
-            training=True,
-            log_every=log_every,
-        )
-        val_metrics, global_step = _run_epoch(
-            model=model,
-            data_loader=val_loader,
-            optimizer=None,
-            scheduler=None,
-            depth_ema=depth_ema,
-            contact_ema=contact_ema,
-            device=device,
-            use_amp=False,
-            scaler=None,
-            gradient_clip_norm=None,
-            global_step=global_step,
-            training=False,
-            log_every=0,
-        )
+            train_metrics, global_step = _run_epoch(
+                model=model,
+                data_loader=train_loader,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                depth_ema=depth_ema,
+                contact_ema=contact_ema,
+                device=device,
+                use_amp=use_amp,
+                scaler=scaler,
+                gradient_clip_norm=gradient_clip_norm,
+                global_step=global_step,
+                training=True,
+                log_every=log_every,
+                on_train_step=_log_train_step,
+            )
 
-        final_metrics = {f"train_{key}": value for key, value in train_metrics.items()}
-        final_metrics.update({f"val_{key}": value for key, value in val_metrics.items()})
-        print(
-            f"epoch={current_epoch} "
-            f"depth_encoder_trainable={int(depth_encoder_trainable)} "
-            f"train_loss={train_metrics.get('loss', float('nan')):.4f} "
-            f"val_loss={val_metrics.get('loss', float('nan')):.4f} "
-            f"train_force_acc={train_metrics.get('force_dimension_accuracy', float('nan')):.4f} "
-            f"val_force_acc={val_metrics.get('force_dimension_accuracy', float('nan')):.4f}"
-        )
+            val_metrics: dict[str, float] = {}
+            if val_ran:
+                val_metrics, global_step = _run_epoch(
+                    model=model,
+                    data_loader=val_loader,
+                    optimizer=None,
+                    scheduler=None,
+                    depth_ema=depth_ema,
+                    contact_ema=contact_ema,
+                    device=device,
+                    use_amp=False,
+                    scaler=None,
+                    gradient_clip_norm=None,
+                    global_step=global_step,
+                    training=False,
+                    log_every=0,
+                )
 
-        _save_checkpoint(
-            latest_checkpoint_path,
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            depth_ema=depth_ema,
-            contact_ema=contact_ema,
-            epoch=current_epoch,
-            global_step=global_step,
-            best_val_loss=best_val_loss,
-            config=config,
-        )
+            final_metrics = {f"train_{key}": value for key, value in train_metrics.items()}
+            final_metrics["val_ran"] = float(int(val_ran))
+            final_metrics["global_step"] = float(global_step)
+            final_metrics["lr"] = _current_learning_rate(optimizer)
+            if val_ran:
+                final_metrics.update({f"val_{key}": value for key, value in val_metrics.items()})
 
-        current_val_loss = float(val_metrics.get("loss", float("inf")))
-        if current_val_loss < best_val_loss:
-            best_val_loss = current_val_loss
+            wandb_epoch_metrics: dict[str, float] = {
+                f"train_epoch/{key}": value for key, value in train_metrics.items()
+            }
+            wandb_epoch_metrics.update(
+                {
+                    "trainer/epoch": float(current_epoch),
+                    "trainer/global_step": float(global_step),
+                    "trainer/lr": _current_learning_rate(optimizer),
+                    "trainer/val_ran": float(int(val_ran)),
+                }
+            )
+            if val_ran:
+                wandb_epoch_metrics.update({f"val/{key}": value for key, value in val_metrics.items()})
+            wandb_logger.log(wandb_epoch_metrics, step=global_step)
+
+            val_loss = val_metrics.get("loss", float("nan"))
+            val_force_acc = val_metrics.get("force_dimension_accuracy", float("nan"))
+            print(
+                f"epoch={current_epoch} "
+                f"depth_encoder_trainable={int(depth_encoder_trainable)} "
+                f"contact_encoder_trainable={int(contact_encoder_trainable)} "
+                f"val_ran={int(val_ran)} "
+                f"train_loss={train_metrics.get('loss', float('nan')):.4f} "
+                f"val_loss={val_loss:.4f} "
+                f"train_force_acc={train_metrics.get('force_dimension_accuracy', float('nan')):.4f} "
+                f"val_force_acc={val_force_acc:.4f}"
+            )
+
             _save_checkpoint(
-                best_checkpoint_path,
+                latest_checkpoint_path,
                 model=model,
                 optimizer=optimizer,
                 scheduler=scheduler,
@@ -994,8 +1129,27 @@ def train(
                 best_val_loss=best_val_loss,
                 config=config,
             )
-        if on_epoch_end is not None:
-            on_epoch_end(current_epoch, final_metrics, output_dir)
+
+            if val_ran:
+                current_val_loss = float(val_metrics.get("loss", float("inf")))
+                if current_val_loss < best_val_loss:
+                    best_val_loss = current_val_loss
+                    _save_checkpoint(
+                        best_checkpoint_path,
+                        model=model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        depth_ema=depth_ema,
+                        contact_ema=contact_ema,
+                        epoch=current_epoch,
+                        global_step=global_step,
+                        best_val_loss=best_val_loss,
+                        config=config,
+                    )
+            if on_epoch_end is not None:
+                on_epoch_end(current_epoch, final_metrics, output_dir)
+    finally:
+        wandb_logger.finish()
 
     return final_metrics
 

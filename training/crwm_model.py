@@ -65,6 +65,19 @@ def _first_present(mapping: Mapping[str, torch.Tensor], candidates: tuple[str, .
     raise KeyError(f"Missing required key for {source_name}. Tried {list(candidates)}.")
 
 
+def _randn_like_shape(
+    shape: tuple[int, ...],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    # MPS currently expects CPU-backed RNG state, so sample there then move.
+    if device.type == "mps":
+        return torch.randn(shape, dtype=dtype, generator=generator).to(device)
+    return torch.randn(shape, device=device, dtype=dtype, generator=generator)
+
+
 @dataclass
 class DepthEncoderOutput:
     global_latent: torch.Tensor
@@ -733,6 +746,42 @@ class CRWMModel(nn.Module):
             "contact_recon": float(weights.get("contact_recon", 1.0)),
         }
 
+    def _build_inference_context(
+        self,
+        obs_dict: Mapping[str, torch.Tensor],
+        *,
+        scene_depth_encoder: DepthEncoderBase | None = None,
+    ) -> dict[str, torch.Tensor]:
+        observed_depth = obs_dict[self.depth_key]
+        observed_depth_mask = obs_dict[f"{self.depth_key}{POINT_CLOUD_MASK_SUFFIX}"]
+        scene_points = obs_dict[self.scene_points_key]
+        scene_points_mask = obs_dict[f"{self.scene_points_key}{POINT_CLOUD_MASK_SUFFIX}"]
+
+        observed_depth_latents = self._encode_depth_sequence(self.depth_encoder, observed_depth, observed_depth_mask)
+        observed_contact_latents = self._encode_contact_sequence(self.contact_encoder, obs_dict)
+        action_latents = self._encode_action_sequence(obs_dict)
+
+        resolved_scene_encoder = scene_depth_encoder or self.depth_encoder
+        with torch.no_grad():
+            scene_depth_latents = self._encode_depth_sequence(
+                resolved_scene_encoder,
+                scene_points,
+                scene_points_mask,
+            )
+
+        scene_latent = scene_depth_latents.global_latent[:, 0, :]
+        condition_tokens = self._build_condition_tokens(
+            action_latents=action_latents,
+            depth_latents=observed_depth_latents.global_latent,
+            contact_latents=observed_contact_latents,
+            scene_latent=scene_latent,
+        )
+        return {
+            "condition_tokens": condition_tokens,
+            "last_observed_depth": observed_depth_latents.global_latent[:, -1, :],
+            "last_observed_contact": observed_contact_latents[:, -1, :],
+        }
+
     def _encode_depth_sequence(
         self,
         encoder: DepthEncoderBase,
@@ -825,6 +874,106 @@ class CRWMModel(nn.Module):
     def _split_predicted_latent(self, predicted_velocity: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return predicted_velocity.split([self.depth_latent_dim, self.contact_latent_dim], dim=-1)
 
+    def _decode_predicted_state(
+        self,
+        predicted_state: torch.Tensor,
+        *,
+        last_observed_depth: torch.Tensor,
+        last_observed_contact: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        predicted_depth_delta, predicted_contact_delta = self._split_predicted_latent(predicted_state)
+        predicted_depth_latent = last_observed_depth + predicted_depth_delta
+        predicted_contact_latent = last_observed_contact + predicted_contact_delta
+        predicted_contact = self.contact_decoder(predicted_contact_latent)
+        predicted_force_dimension = predicted_contact["force_dimension_logits"].argmax(dim=-1)
+        return {
+            "predicted_state": predicted_state,
+            "predicted_depth_latent": predicted_depth_latent,
+            "predicted_contact_latent": predicted_contact_latent,
+            "predicted_depth_points": self.depth_decoder(predicted_depth_latent),
+            "predicted_force_dimension": predicted_force_dimension,
+            "predicted_force_dimension_logits": predicted_contact["force_dimension_logits"],
+            "predicted_motion_or_force_axis": predicted_contact["motion_or_force_axis"],
+            "predicted_sensed_force": predicted_contact["sensed_force"],
+            "predicted_sensed_moment": predicted_contact["sensed_moment"],
+        }
+
+    def _integrate_flow_ode(
+        self,
+        *,
+        condition_tokens: torch.Tensor,
+        initial_state: torch.Tensor,
+        sampling_steps: int,
+        solver: str,
+    ) -> torch.Tensor:
+        if sampling_steps <= 0:
+            raise ValueError(f"`sampling_steps` must be positive, got {sampling_steps}.")
+
+        solver_name = str(solver).strip().lower()
+        if solver_name not in {"euler", "heun"}:
+            raise ValueError(f"Unsupported solver `{solver}`. Expected `euler` or `heun`.")
+
+        state = initial_state
+        step_size = 1.0 / float(sampling_steps)
+        batch_size = int(initial_state.shape[0])
+        for step_index in range(sampling_steps):
+            current_t = step_index * step_size
+            timestep = torch.full(
+                (batch_size,),
+                float(current_t),
+                device=state.device,
+                dtype=state.dtype,
+            )
+            velocity = self.flow_model(state, timestep, condition_tokens)
+            if solver_name == "euler":
+                state = state + step_size * velocity
+                continue
+
+            predicted_state = state + step_size * velocity
+            next_t = min(1.0, current_t + step_size)
+            next_timestep = torch.full(
+                (batch_size,),
+                float(next_t),
+                device=state.device,
+                dtype=state.dtype,
+            )
+            next_velocity = self.flow_model(predicted_state, next_timestep, condition_tokens)
+            state = state + 0.5 * step_size * (velocity + next_velocity)
+
+        return state
+
+    def sample_one_step(
+        self,
+        obs_dict: Mapping[str, torch.Tensor],
+        *,
+        ema_depth_encoder: DepthEncoderBase | None = None,
+        generator: torch.Generator | None = None,
+        sampling_steps: int = 32,
+        solver: str = "heun",
+    ) -> dict[str, torch.Tensor]:
+        context = self._build_inference_context(
+            obs_dict,
+            scene_depth_encoder=ema_depth_encoder,
+        )
+        last_observed_depth = context["last_observed_depth"]
+        initial_state = _randn_like_shape(
+            (int(last_observed_depth.shape[0]), self.latent_dim),
+            device=last_observed_depth.device,
+            dtype=last_observed_depth.dtype,
+            generator=generator,
+        )
+        predicted_state = self._integrate_flow_ode(
+            condition_tokens=context["condition_tokens"],
+            initial_state=initial_state,
+            sampling_steps=int(sampling_steps),
+            solver=solver,
+        )
+        return self._decode_predicted_state(
+            predicted_state,
+            last_observed_depth=context["last_observed_depth"],
+            last_observed_contact=context["last_observed_contact"],
+        )
+
     def _depth_reconstruction_loss(
         self,
         predicted_points: torch.Tensor,
@@ -886,32 +1035,18 @@ class CRWMModel(nn.Module):
         ema_depth_encoder = ema_depth_encoder or self.depth_encoder
         ema_contact_encoder = ema_contact_encoder or self.contact_encoder
 
-        observed_depth = obs_dict[self.depth_key]
-        observed_depth_mask = obs_dict[f"{self.depth_key}{POINT_CLOUD_MASK_SUFFIX}"]
         future_depth = prediction_dict[self.depth_key]
         future_depth_mask = prediction_dict[f"{self.depth_key}{POINT_CLOUD_MASK_SUFFIX}"]
 
-        observed_depth_latents = self._encode_depth_sequence(self.depth_encoder, observed_depth, observed_depth_mask)
         with torch.no_grad():
             target_depth_latents = self._encode_depth_sequence(ema_depth_encoder, future_depth, future_depth_mask)
-            scene_points = obs_dict[self.scene_points_key]
-            scene_points_mask = obs_dict[f"{self.scene_points_key}{POINT_CLOUD_MASK_SUFFIX}"]
-            scene_depth_latents = self._encode_depth_sequence(ema_depth_encoder, scene_points, scene_points_mask)
+        context = self._build_inference_context(obs_dict, scene_depth_encoder=ema_depth_encoder)
 
-        observed_contact_latents = self._encode_contact_sequence(self.contact_encoder, obs_dict)
         with torch.no_grad():
             target_contact_latents = self._encode_contact_sequence(ema_contact_encoder, prediction_dict)
-        action_latents = self._encode_action_sequence(obs_dict)
-        scene_latent = scene_depth_latents.global_latent[:, 0, :]
-        condition_tokens = self._build_condition_tokens(
-            action_latents=action_latents,
-            depth_latents=observed_depth_latents.global_latent,
-            contact_latents=observed_contact_latents,
-            scene_latent=scene_latent,
-        )
-
-        last_observed_depth = observed_depth_latents.global_latent[:, -1, :]
-        last_observed_contact = observed_contact_latents[:, -1, :]
+        condition_tokens = context["condition_tokens"]
+        last_observed_depth = context["last_observed_depth"]
+        last_observed_contact = context["last_observed_contact"]
         future_depth_latent = target_depth_latents.global_latent[:, 0, :]
         future_contact_latent = target_contact_latents[:, 0, :]
 
@@ -927,18 +1062,24 @@ class CRWMModel(nn.Module):
         predicted_velocity = self.flow_model(x_t, timesteps, condition_tokens)
         flow_loss = F.mse_loss(predicted_velocity, target_velocity)
 
-        p1_pred, p2_pred = self._split_predicted_latent(predicted_velocity)
-        predicted_depth_latent = last_observed_depth + p1_pred
-        predicted_contact_latent = last_observed_contact + p2_pred
-
-        predicted_contact = self.contact_decoder(predicted_contact_latent)
+        decoded_prediction = self._decode_predicted_state(
+            predicted_velocity,
+            last_observed_depth=last_observed_depth,
+            last_observed_contact=last_observed_contact,
+        )
+        predicted_contact = {
+            "force_dimension_logits": decoded_prediction["predicted_force_dimension_logits"],
+            "motion_or_force_axis": decoded_prediction["predicted_motion_or_force_axis"],
+            "sensed_force": decoded_prediction["predicted_sensed_force"],
+            "sensed_moment": decoded_prediction["predicted_sensed_moment"],
+        }
         contact_losses, force_dimension_accuracy = self._contact_reconstruction_loss(
             predictions=predicted_contact,
             prediction_dict=prediction_dict,
         )
         contact_recon_loss = contact_losses["contact_recon_loss"]
 
-        predicted_depth_points = self.depth_decoder(predicted_depth_latent)
+        predicted_depth_points = decoded_prediction["predicted_depth_points"]
         future_depth_target = future_depth[:, 0, :, :]
         future_depth_target_mask = future_depth_mask[:, 0, :]
         depth_recon_loss = self._depth_reconstruction_loss(
@@ -966,7 +1107,8 @@ class CRWMModel(nn.Module):
             "predicted_velocity": predicted_velocity,
             "latent_target": latent_target,
             "predicted_depth_points": predicted_depth_points,
-            "predicted_contact_latent": predicted_contact_latent,
+            "predicted_contact_latent": decoded_prediction["predicted_contact_latent"],
+            "predicted_depth_latent": decoded_prediction["predicted_depth_latent"],
             "predicted_force_dimension_logits": predicted_contact["force_dimension_logits"],
             "predicted_motion_or_force_axis": predicted_contact["motion_or_force_axis"],
             "predicted_sensed_force": predicted_contact["sensed_force"],

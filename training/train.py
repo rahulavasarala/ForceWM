@@ -1009,6 +1009,9 @@ def train(
     config_snapshot_path = output_dir / "config_snapshot.yaml"
     with config_snapshot_path.open("w", encoding="utf-8") as handle:
         yaml.safe_dump(dict(config), handle, sort_keys=False)
+    contract_snapshot_path = output_dir / "contract_snapshot.yaml"
+    with contract_snapshot_path.open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(contract, handle, sort_keys=False)
 
     latest_checkpoint_path = output_dir / "latest.pt"
     best_checkpoint_path = output_dir / "best.pt"

@@ -559,6 +559,7 @@ class TrainerSmokeTests(unittest.TestCase):
             self.assertTrue((output_dir / "latest.pt").exists())
             self.assertTrue((output_dir / "best.pt").exists())
             self.assertTrue((output_dir / "config_snapshot.yaml").exists())
+            self.assertTrue((output_dir / "contract_snapshot.yaml").exists())
             self.assertIn("train_loss", metrics)
             self.assertIn("val_loss", metrics)
             self.assertIn("depth_ema_state_dict", latest_checkpoint)

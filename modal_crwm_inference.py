@@ -10,7 +10,7 @@ import modal
 import yaml
 
 
-APP_NAME = "forcewm-crwm-train"
+APP_NAME = "forcewm-crwm-inference"
 GPU_TYPE = "H100"
 PYTHON_VERSION = "3.10"
 CUDA_BASE_IMAGE = "12.4.1-devel-ubuntu22.04"
@@ -25,7 +25,8 @@ REMOTE_CONTRACT_PATH = "/tmp/forcewm_universal_contract.yaml"
 DATASET_VOLUME_NAME = os.environ.get("FORCEWM_MODAL_DATASET_VOLUME", "forcewm-datasets")
 OUTPUT_VOLUME_NAME = os.environ.get("FORCEWM_MODAL_OUTPUT_VOLUME", "forcewm-training-runs")
 CACHE_VOLUME_NAME = os.environ.get("FORCEWM_MODAL_CACHE_VOLUME", "concerto-smoketest-cache")
-WANDB_SECRET_NAME = os.environ.get("FORCEWM_MODAL_WANDB_SECRET", "wandb")
+DEFAULT_CHECKPOINT_NAME = "best.pt"
+DEFAULT_ARTIFACT_TEMPLATE = "one_step_predictions_{split}.npy"
 
 
 def _load_yaml(path: str | Path) -> dict[str, Any]:
@@ -46,39 +47,22 @@ def _container_path(mount_root: str, subdir: str) -> str:
     return str(PurePosixPath(mount_root) / subdir)
 
 
-def _volume_path(subdir: str) -> str:
-    return str(PurePosixPath("/") / subdir)
+def _resolve_artifact_name(artifact_name: str | None, split: str) -> str:
+    cleaned = str(artifact_name or "").strip()
+    if cleaned:
+        return cleaned if cleaned.endswith(".npy") else f"{cleaned}.npy"
+    return DEFAULT_ARTIFACT_TEMPLATE.format(split=str(split).strip().lower())
 
 
-def _resolve_remote_resume_path(resume_from: str | None, output_container_path: str) -> str | None:
-    if resume_from is None:
-        return None
-    cleaned = str(resume_from).strip()
-    if not cleaned:
-        return None
-    if cleaned.startswith(REMOTE_OUTPUT_MOUNT):
-        return cleaned
-    return str(PurePosixPath(output_container_path) / Path(cleaned).name)
-
-
-def _wandb_enabled(config: dict[str, Any]) -> bool:
-    wandb_cfg = config.get("wandb", {})
-    if not isinstance(wandb_cfg, dict):
-        return False
-    return bool(wandb_cfg.get("enabled", False))
-
-
-def _select_remote_runner(config: dict[str, Any]):
-    return run_training_wandb if _wandb_enabled(config) else run_training
-
-
-def _invoke_remote_runner(
-    remote_runner: Any,
-    config: dict[str, Any],
-    contract_payload: dict[str, Any],
-) -> dict[str, float]:
-    function_call = remote_runner.spawn(config, contract_payload)
-    return function_call.get()
+def _to_output_volume_path(remote_output_path: str) -> str:
+    output_prefix = f"{REMOTE_OUTPUT_MOUNT}/"
+    if remote_output_path.startswith(output_prefix):
+        return remote_output_path[len(output_prefix) :]
+    path = PurePosixPath(remote_output_path)
+    parts = path.parts
+    if len(parts) >= 5 and parts[1] == "__modal" and parts[2] == "volumes":
+        return str(PurePosixPath(*parts[4:]))
+    return str(path.as_posix()).lstrip("/")
 
 
 image = (
@@ -127,14 +111,39 @@ app = modal.App(APP_NAME, image=image)
 dataset_volume = modal.Volume.from_name(DATASET_VOLUME_NAME, create_if_missing=True)
 output_volume = modal.Volume.from_name(OUTPUT_VOLUME_NAME, create_if_missing=True)
 cache_volume = modal.Volume.from_name(CACHE_VOLUME_NAME, create_if_missing=True)
-wandb_secret = modal.Secret.from_name(WANDB_SECRET_NAME, required_keys=["WANDB_API_KEY"])
 
 
-def _run_training_impl(config: dict[str, Any], contract_payload: dict[str, Any]) -> dict[str, float]:
+def _download_output_artifact(remote_output_path: str, local_path: Path) -> Path:
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    volume_path = _to_output_volume_path(remote_output_path)
+    data = b"".join(output_volume.read_file(volume_path))
+    local_path.write_bytes(data)
+    return local_path
+
+
+@app.function(
+    gpu=GPU_TYPE,
+    timeout=60 * 60 * 24,
+    volumes={
+        REMOTE_DATASET_MOUNT: dataset_volume,
+        REMOTE_OUTPUT_MOUNT: output_volume,
+        REMOTE_CACHE_MOUNT: cache_volume,
+    },
+)
+def run_inference(
+    config: dict[str, Any],
+    contract_payload: dict[str, Any],
+    *,
+    split: str,
+    seed: int,
+    sampling_steps: int,
+    artifact_name: str | None = None,
+    checkpoint_name: str = DEFAULT_CHECKPOINT_NAME,
+) -> dict[str, Any]:
     import sys
 
     sys.path.insert(0, "/root")
-    from training.train import train
+    from training.inference import export_predictions
 
     contract_path = Path(REMOTE_CONTRACT_PATH)
     contract_path.write_text(yaml.safe_dump(contract_payload, sort_keys=False), encoding="utf-8")
@@ -143,54 +152,46 @@ def _run_training_impl(config: dict[str, Any], contract_payload: dict[str, Any])
     remote_config["universal_contract"] = str(contract_path)
     remote_config["device"] = "cuda"
 
-    def _commit_epoch(epoch: int, metrics: dict[str, float], output_dir: Path) -> None:
-        summary = {"epoch": int(epoch), "output_dir": str(output_dir), **metrics}
-        print(json.dumps(summary, sort_keys=True))
-        output_volume.commit()
-        cache_volume.commit()
+    remote_output_dir = PurePosixPath(str(remote_config["output_dir"]))
+    resolved_artifact_name = _resolve_artifact_name(artifact_name, split)
+    artifact_path = remote_output_dir / resolved_artifact_name
+    checkpoint_path = remote_output_dir / str(checkpoint_name).strip()
 
-    metrics = train(remote_config, on_epoch_end=_commit_epoch)
+    artifact = export_predictions(
+        remote_config,
+        split=split,
+        checkpoint_path=checkpoint_path,
+        artifact_path=artifact_path,
+        seed=int(seed),
+        sampling_steps=int(sampling_steps),
+        device_name="cuda",
+        show_progress=True,
+    )
+    summary = {
+        "artifact_path": str(artifact_path),
+        "split": artifact["metadata"]["split"],
+        "episodes": len(artifact["episodes"]),
+        "rows": int(len(artifact["metadata"]["selected_indices"])),
+        "checkpoint_path": str(checkpoint_path),
+    }
     output_volume.commit()
     cache_volume.commit()
-    print(json.dumps(metrics, indent=2, sort_keys=True))
-    return metrics
-
-
-@app.function(
-    gpu=GPU_TYPE,
-    timeout=60 * 60 * 24,
-    volumes={
-        REMOTE_DATASET_MOUNT: dataset_volume,
-        REMOTE_OUTPUT_MOUNT: output_volume,
-        REMOTE_CACHE_MOUNT: cache_volume,
-    },
-)
-def run_training(config: dict[str, Any], contract_payload: dict[str, Any]) -> dict[str, float]:
-    return _run_training_impl(config, contract_payload)
-
-
-@app.function(
-    gpu=GPU_TYPE,
-    timeout=60 * 60 * 24,
-    volumes={
-        REMOTE_DATASET_MOUNT: dataset_volume,
-        REMOTE_OUTPUT_MOUNT: output_volume,
-        REMOTE_CACHE_MOUNT: cache_volume,
-    },
-    secrets=[wandb_secret],
-)
-def run_training_wandb(config: dict[str, Any], contract_payload: dict[str, Any]) -> dict[str, float]:
-    return _run_training_impl(config, contract_payload)
+    print(json.dumps(summary, sort_keys=True))
+    return summary
 
 
 @app.local_entrypoint()
 def main(
     config: str,
-    sync_dataset: bool = False,
-    force_sync: bool = False,
+    split: str = "val",
+    seed: int = 42,
+    sampling_steps: int = 32,
+    run_subdir: str = "",
     dataset_subdir: str = "",
-    output_subdir: str = "",
-    resume_from: str = "",
+    artifact_name: str = "",
+    checkpoint_name: str = DEFAULT_CHECKPOINT_NAME,
+    download_artifact: bool = False,
+    local_artifact_path: str = "",
 ):
     config_path = Path(config).expanduser().resolve()
     config_payload = _load_yaml(config_path)
@@ -199,30 +200,33 @@ def main(
     dataset_local_path = Path(config_payload["dataset_path"]).expanduser().resolve()
     dataset_subdir = _normalize_subdir(dataset_subdir, default=dataset_local_path.name)
     default_output_name = Path(str(config_payload.get("output_dir", "training_runs/crwm"))).name
-    output_subdir = _normalize_subdir(output_subdir, default=default_output_name)
+    run_subdir = _normalize_subdir(run_subdir, default=default_output_name)
 
     dataset_container_path = _container_path(REMOTE_DATASET_MOUNT, dataset_subdir)
-    output_container_path = _container_path(REMOTE_OUTPUT_MOUNT, output_subdir)
-    rewritten_contract = copy.deepcopy(contract_payload)
-
-    if sync_dataset:
-        with dataset_volume.batch_upload(force=force_sync) as batch:
-            batch.put_directory(str(dataset_local_path), _volume_path(dataset_subdir))
-
+    output_container_path = _container_path(REMOTE_OUTPUT_MOUNT, run_subdir)
     remote_config = copy.deepcopy(config_payload)
     remote_config["dataset_path"] = dataset_container_path
     remote_config["output_dir"] = output_container_path
     remote_config["device"] = "cuda"
 
-    resolved_resume_path = _resolve_remote_resume_path(
-        resume_from if resume_from else remote_config.get("resume_from"),
-        output_container_path,
+    resolved_artifact_name = _resolve_artifact_name(artifact_name, split)
+    function_call = run_inference.spawn(
+        remote_config,
+        contract_payload,
+        split=split,
+        seed=int(seed),
+        sampling_steps=int(sampling_steps),
+        artifact_name=resolved_artifact_name,
+        checkpoint_name=checkpoint_name,
     )
-    if resolved_resume_path is None:
-        remote_config.pop("resume_from", None)
-    else:
-        remote_config["resume_from"] = resolved_resume_path
+    result = function_call.get()
 
-    remote_runner = _select_remote_runner(remote_config)
-    result = _invoke_remote_runner(remote_runner, remote_config, rewritten_contract)
+    if download_artifact:
+        if local_artifact_path:
+            local_path = Path(local_artifact_path).expanduser().resolve()
+        else:
+            local_path = Path.cwd() / resolved_artifact_name
+        downloaded_path = _download_output_artifact(str(result["artifact_path"]), local_path)
+        result["downloaded_to"] = str(downloaded_path)
+
     print(json.dumps(result, indent=2, sort_keys=True))

@@ -1,6 +1,6 @@
 dataset_path: "data_storage/dpth_v9_pruned"
 universal_contract: "universal_contract.yaml"
-output_dir: "training_runs/crwm_dpth_v9_concerto_small"
+output_dir: "training_runs/crwm_dpth_v9_concerto_small_direct_loss"
 seed: 42
 epochs: 50
 batch_size: 64

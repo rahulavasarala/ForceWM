@@ -135,8 +135,6 @@ def run_inference(
     contract_payload: dict[str, Any],
     *,
     split: str,
-    seed: int,
-    sampling_steps: int,
     artifact_name: str | None = None,
     checkpoint_name: str = DEFAULT_CHECKPOINT_NAME,
 ) -> dict[str, Any]:
@@ -162,8 +160,6 @@ def run_inference(
         split=split,
         checkpoint_path=checkpoint_path,
         artifact_path=artifact_path,
-        seed=int(seed),
-        sampling_steps=int(sampling_steps),
         device_name="cuda",
         show_progress=True,
     )
@@ -184,8 +180,6 @@ def run_inference(
 def main(
     config: str,
     split: str = "val",
-    seed: int = 42,
-    sampling_steps: int = 32,
     run_subdir: str = "",
     dataset_subdir: str = "",
     artifact_name: str = "",
@@ -214,8 +208,6 @@ def main(
         remote_config,
         contract_payload,
         split=split,
-        seed=int(seed),
-        sampling_steps=int(sampling_steps),
         artifact_name=resolved_artifact_name,
         checkpoint_name=checkpoint_name,
     )

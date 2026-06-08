@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextlib
-import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -34,22 +33,6 @@ def _masked_mean(features: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return weighted.sum(dim=1) / denom
 
 
-def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    return x * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-
-
-def _sinusoidal_timestep_embedding(timesteps: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
-    half = dim // 2
-    freqs = torch.exp(
-        -math.log(max_period) * torch.arange(half, device=timesteps.device, dtype=torch.float32) / max(half, 1)
-    )
-    args = timesteps.to(dtype=torch.float32).unsqueeze(-1) * freqs.unsqueeze(0)
-    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-    if dim % 2:
-        embedding = F.pad(embedding, (0, 1))
-    return embedding
-
-
 def _infer_scalar_feature(value: torch.Tensor) -> torch.Tensor:
     if value.ndim == 2:
         return value.unsqueeze(-1)
@@ -63,19 +46,6 @@ def _first_present(mapping: Mapping[str, torch.Tensor], candidates: tuple[str, .
         if key_name in mapping:
             return mapping[key_name]
     raise KeyError(f"Missing required key for {source_name}. Tried {list(candidates)}.")
-
-
-def _randn_like_shape(
-    shape: tuple[int, ...],
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-    generator: torch.Generator | None = None,
-) -> torch.Tensor:
-    # MPS currently expects CPU-backed RNG state, so sample there then move.
-    if device.type == "mps":
-        return torch.randn(shape, dtype=dtype, generator=generator).to(device)
-    return torch.randn(shape, device=device, dtype=dtype, generator=generator)
 
 
 @dataclass
@@ -499,32 +469,17 @@ class ActionEncoder(nn.Module):
         return self.mlp(features)
 
 
-class TimestepEmbedder(nn.Module):
-    def __init__(self, model_dim: int, hidden_dim: int | None = None) -> None:
-        super().__init__()
-        hidden_dim = int(hidden_dim or model_dim * 4)
-        self.model_dim = int(model_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(self.model_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, self.model_dim),
-        )
-
-    def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
-        return self.mlp(_sinusoidal_timestep_embedding(timesteps, self.model_dim))
-
-
-class DiTBlock(nn.Module):
+class TransformerBlock(nn.Module):
     def __init__(self, model_dim: int, num_heads: int, mlp_ratio: float = 4.0, dropout: float = 0.0) -> None:
         super().__init__()
-        self.norm1 = nn.LayerNorm(model_dim, elementwise_affine=False)
+        self.norm1 = nn.LayerNorm(model_dim)
         self.attn = nn.MultiheadAttention(
             embed_dim=model_dim,
             num_heads=num_heads,
             dropout=dropout,
             batch_first=True,
         )
-        self.norm2 = nn.LayerNorm(model_dim, elementwise_affine=False)
+        self.norm2 = nn.LayerNorm(model_dim)
         mlp_hidden_dim = int(model_dim * mlp_ratio)
         self.mlp = nn.Sequential(
             nn.Linear(model_dim, mlp_hidden_dim),
@@ -532,36 +487,13 @@ class DiTBlock(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(mlp_hidden_dim, model_dim),
         )
-        self.ada_ln = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(model_dim, model_dim * 6),
-        )
 
-    def forward(self, x: torch.Tensor, time_embedding: torch.Tensor) -> torch.Tensor:
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.ada_ln(time_embedding).chunk(6, dim=-1)
-        attn_input = _modulate(self.norm1(x), shift_msa, scale_msa)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        attn_input = self.norm1(x)
         attn_output, _ = self.attn(attn_input, attn_input, attn_input, need_weights=False)
-        x = x + gate_msa.unsqueeze(1) * attn_output
-        mlp_input = _modulate(self.norm2(x), shift_mlp, scale_mlp)
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(mlp_input)
+        x = x + attn_output
+        x = x + self.mlp(self.norm2(x))
         return x
-
-
-class FinalLayer(nn.Module):
-    def __init__(self, model_dim: int, output_dim: int) -> None:
-        super().__init__()
-        self.norm = nn.LayerNorm(model_dim, elementwise_affine=False)
-        self.ada_ln = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(model_dim, model_dim * 2),
-        )
-        self.projection = nn.Linear(model_dim, output_dim)
-
-    def forward(self, x: torch.Tensor, time_embedding: torch.Tensor) -> torch.Tensor:
-        shift, scale = self.ada_ln(time_embedding).chunk(2, dim=-1)
-        x = self.norm(x)
-        x = x * (1.0 + scale) + shift
-        return self.projection(x)
 
 
 class LatentFlowTransformer(nn.Module):
@@ -576,12 +508,12 @@ class LatentFlowTransformer(nn.Module):
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
-        self.input_projection = nn.Linear(latent_dim, model_dim)
-        self.time_embedder = TimestepEmbedder(model_dim=model_dim)
+        self.model_dim = int(model_dim)
+        self.query_token = nn.Parameter(torch.empty(1, 1, self.model_dim))
         self.blocks = nn.ModuleList(
             [
-                DiTBlock(
-                    model_dim=model_dim,
+                TransformerBlock(
+                    model_dim=self.model_dim,
                     num_heads=num_heads,
                     mlp_ratio=mlp_ratio,
                     dropout=dropout,
@@ -589,15 +521,22 @@ class LatentFlowTransformer(nn.Module):
                 for _ in range(max(1, int(num_layers)))
             ]
         )
-        self.final_layer = FinalLayer(model_dim=model_dim, output_dim=latent_dim)
+        self.final_norm = nn.LayerNorm(self.model_dim)
+        self.output_projection = nn.Linear(self.model_dim, latent_dim)
+        nn.init.normal_(self.query_token, mean=0.0, std=0.02)
 
-    def forward(self, x_t: torch.Tensor, timesteps: torch.Tensor, condition_tokens: torch.Tensor) -> torch.Tensor:
-        state_token = self.input_projection(x_t).unsqueeze(1)
-        sequence = torch.cat([state_token, condition_tokens], dim=1)
-        time_embedding = self.time_embedder(timesteps)
+    def forward(self, condition_tokens: torch.Tensor) -> torch.Tensor:
+        if condition_tokens.ndim != 3:
+            raise ValueError(
+                "Condition tokens must have shape (B, T, D) for direct latent-delta prediction, "
+                f"got {tuple(condition_tokens.shape)}."
+            )
+        batch_size = int(condition_tokens.shape[0])
+        query_token = self.query_token.expand(batch_size, -1, -1)
+        sequence = torch.cat([query_token, condition_tokens], dim=1)
         for block in self.blocks:
-            sequence = block(sequence, time_embedding)
-        return self.final_layer(sequence[:, 0, :], time_embedding)
+            sequence = block(sequence)
+        return self.output_projection(self.final_norm(sequence[:, 0, :]))
 
 
 class ContactPatchDecoder(nn.Module):
@@ -871,23 +810,23 @@ class CRWMModel(nn.Module):
         scene_token = scene_token + self.modality_embeddings[3].view(1, 1, self.model_dim)
         return torch.cat([history_tokens, scene_token], dim=1)
 
-    def _split_predicted_latent(self, predicted_velocity: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return predicted_velocity.split([self.depth_latent_dim, self.contact_latent_dim], dim=-1)
+    def _split_predicted_latent(self, predicted_delta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return predicted_delta.split([self.depth_latent_dim, self.contact_latent_dim], dim=-1)
 
-    def _decode_predicted_state(
+    def _decode_predicted_delta(
         self,
-        predicted_state: torch.Tensor,
+        predicted_delta: torch.Tensor,
         *,
         last_observed_depth: torch.Tensor,
         last_observed_contact: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        predicted_depth_delta, predicted_contact_delta = self._split_predicted_latent(predicted_state)
+        predicted_depth_delta, predicted_contact_delta = self._split_predicted_latent(predicted_delta)
         predicted_depth_latent = last_observed_depth + predicted_depth_delta
         predicted_contact_latent = last_observed_contact + predicted_contact_delta
         predicted_contact = self.contact_decoder(predicted_contact_latent)
         predicted_force_dimension = predicted_contact["force_dimension_logits"].argmax(dim=-1)
         return {
-            "predicted_state": predicted_state,
+            "predicted_delta": predicted_delta,
             "predicted_depth_latent": predicted_depth_latent,
             "predicted_contact_latent": predicted_contact_latent,
             "predicted_depth_points": self.depth_decoder(predicted_depth_latent),
@@ -898,78 +837,19 @@ class CRWMModel(nn.Module):
             "predicted_sensed_moment": predicted_contact["sensed_moment"],
         }
 
-    def _integrate_flow_ode(
-        self,
-        *,
-        condition_tokens: torch.Tensor,
-        initial_state: torch.Tensor,
-        sampling_steps: int,
-        solver: str,
-    ) -> torch.Tensor:
-        if sampling_steps <= 0:
-            raise ValueError(f"`sampling_steps` must be positive, got {sampling_steps}.")
-
-        solver_name = str(solver).strip().lower()
-        if solver_name not in {"euler", "heun"}:
-            raise ValueError(f"Unsupported solver `{solver}`. Expected `euler` or `heun`.")
-
-        state = initial_state
-        step_size = 1.0 / float(sampling_steps)
-        batch_size = int(initial_state.shape[0])
-        for step_index in range(sampling_steps):
-            current_t = step_index * step_size
-            timestep = torch.full(
-                (batch_size,),
-                float(current_t),
-                device=state.device,
-                dtype=state.dtype,
-            )
-            velocity = self.flow_model(state, timestep, condition_tokens)
-            if solver_name == "euler":
-                state = state + step_size * velocity
-                continue
-
-            predicted_state = state + step_size * velocity
-            next_t = min(1.0, current_t + step_size)
-            next_timestep = torch.full(
-                (batch_size,),
-                float(next_t),
-                device=state.device,
-                dtype=state.dtype,
-            )
-            next_velocity = self.flow_model(predicted_state, next_timestep, condition_tokens)
-            state = state + 0.5 * step_size * (velocity + next_velocity)
-
-        return state
-
     def sample_one_step(
         self,
         obs_dict: Mapping[str, torch.Tensor],
         *,
         ema_depth_encoder: DepthEncoderBase | None = None,
-        generator: torch.Generator | None = None,
-        sampling_steps: int = 32,
-        solver: str = "heun",
     ) -> dict[str, torch.Tensor]:
         context = self._build_inference_context(
             obs_dict,
             scene_depth_encoder=ema_depth_encoder,
         )
-        last_observed_depth = context["last_observed_depth"]
-        initial_state = _randn_like_shape(
-            (int(last_observed_depth.shape[0]), self.latent_dim),
-            device=last_observed_depth.device,
-            dtype=last_observed_depth.dtype,
-            generator=generator,
-        )
-        predicted_state = self._integrate_flow_ode(
-            condition_tokens=context["condition_tokens"],
-            initial_state=initial_state,
-            sampling_steps=int(sampling_steps),
-            solver=solver,
-        )
-        return self._decode_predicted_state(
-            predicted_state,
+        predicted_delta = self.flow_model(context["condition_tokens"])
+        return self._decode_predicted_delta(
+            predicted_delta,
             last_observed_depth=context["last_observed_depth"],
             last_observed_contact=context["last_observed_contact"],
         )
@@ -1022,6 +902,30 @@ class CRWMModel(nn.Module):
             accuracy,
         )
 
+    def _ee_position_mse(
+        self,
+        predicted_points: torch.Tensor,
+        target_points: torch.Tensor,
+        target_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if tuple(predicted_points.shape) != tuple(target_points.shape):
+            raise ValueError(
+                f"Predicted EE points must match target shape. "
+                f"Got predicted={tuple(predicted_points.shape)} target={tuple(target_points.shape)}."
+            )
+        mask = _as_bool_mask(target_mask)
+        if mask.ndim != 2 or tuple(mask.shape) != tuple(predicted_points.shape[:2]):
+            raise ValueError(
+                f"Target mask for EE metric must have shape {tuple(predicted_points.shape[:2])}, got {tuple(mask.shape)}."
+            )
+
+        ee_mask = mask[:, 0]
+        if not bool(ee_mask.any().item()):
+            raise ValueError("Cannot compute `ee_position_mse` because the end-effector point is masked out for all rows.")
+
+        ee_squared_error = (predicted_points[:, 0, :] - target_points[:, 0, :].to(dtype=torch.float32)).pow(2).mean(dim=-1)
+        return ee_squared_error.masked_select(ee_mask).mean()
+
     def forward(
         self,
         batch: Mapping[str, Mapping[str, torch.Tensor]],
@@ -1054,16 +958,11 @@ class CRWMModel(nn.Module):
         p2_target = future_contact_latent - last_observed_contact
         latent_target = torch.cat([p1_target, p2_target], dim=-1)
 
-        x0 = torch.randn_like(latent_target)
-        timesteps = torch.rand(latent_target.shape[0], device=latent_target.device, dtype=latent_target.dtype)
-        x_t = (1.0 - timesteps.unsqueeze(-1)) * x0 + timesteps.unsqueeze(-1) * latent_target
-        target_velocity = latent_target - x0
+        predicted_delta = self.flow_model(condition_tokens)
+        latent_delta_loss = F.mse_loss(predicted_delta, latent_target)
 
-        predicted_velocity = self.flow_model(x_t, timesteps, condition_tokens)
-        flow_loss = F.mse_loss(predicted_velocity, target_velocity)
-
-        decoded_prediction = self._decode_predicted_state(
-            predicted_velocity,
+        decoded_prediction = self._decode_predicted_delta(
+            predicted_delta,
             last_observed_depth=last_observed_depth,
             last_observed_contact=last_observed_contact,
         )
@@ -1087,16 +986,21 @@ class CRWMModel(nn.Module):
             target_points=future_depth_target,
             target_mask=future_depth_target_mask,
         )
+        ee_position_mse = self._ee_position_mse(
+            predicted_points=predicted_depth_points,
+            target_points=future_depth_target,
+            target_mask=future_depth_target_mask,
+        )
 
         total_loss = (
-            self.loss_weights["flow"] * flow_loss
+            self.loss_weights["flow"] * latent_delta_loss
             + self.loss_weights["depth_recon"] * depth_recon_loss
             + self.loss_weights["contact_recon"] * contact_recon_loss
         )
 
         return {
             "loss": total_loss,
-            "flow_loss": flow_loss,
+            "latent_delta_loss": latent_delta_loss,
             "depth_recon_loss": depth_recon_loss,
             "contact_recon_loss": contact_recon_loss,
             "contact_force_dimension_ce": contact_losses["contact_force_dimension_ce"],
@@ -1104,7 +1008,8 @@ class CRWMModel(nn.Module):
             "contact_sensed_force_mse": contact_losses["contact_sensed_force_mse"],
             "contact_sensed_moment_mse": contact_losses["contact_sensed_moment_mse"],
             "force_dimension_accuracy": force_dimension_accuracy,
-            "predicted_velocity": predicted_velocity,
+            "ee_position_mse": ee_position_mse,
+            "predicted_delta": predicted_delta,
             "latent_target": latent_target,
             "predicted_depth_points": predicted_depth_points,
             "predicted_contact_latent": decoded_prediction["predicted_contact_latent"],

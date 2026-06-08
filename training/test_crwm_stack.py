@@ -342,10 +342,12 @@ class CRWMModelTests(unittest.TestCase):
         outputs = model(batch)
 
         self.assertTrue(torch.isfinite(outputs["loss"]))
-        self.assertEqual(tuple(outputs["predicted_velocity"].shape), (2, 14))
+        self.assertEqual(tuple(outputs["predicted_delta"].shape), (2, 14))
         self.assertEqual(tuple(outputs["latent_target"].shape), (2, 14))
         self.assertEqual(tuple(outputs["predicted_depth_points"].shape), (2, 4, 3))
         self.assertEqual(tuple(outputs["predicted_force_dimension_logits"].shape), (2, 4))
+        self.assertTrue(torch.isfinite(outputs["latent_delta_loss"]))
+        self.assertTrue(torch.isfinite(outputs["ee_position_mse"]))
         self.assertEqual(model.depth_decoder.decoder[0].in_features, model.depth_latent_dim)
         self.assertEqual(tuple(model.modality_embeddings.shape), (4, model.model_dim))
         self.assertIn("contact_force_dimension_ce", outputs)
@@ -418,15 +420,14 @@ class CRWMModelTests(unittest.TestCase):
                 self.latent_dim = int(latent_dim)
                 self.last_condition_tokens: torch.Tensor | None = None
 
-            def forward(
-                self,
-                x_t: torch.Tensor,
-                timesteps: torch.Tensor,
-                condition_tokens: torch.Tensor,
-            ) -> torch.Tensor:
-                _ = timesteps
+            def forward(self, condition_tokens: torch.Tensor) -> torch.Tensor:
                 self.last_condition_tokens = condition_tokens.detach().clone()
-                return torch.zeros_like(x_t)
+                return torch.zeros(
+                    condition_tokens.shape[0],
+                    self.latent_dim,
+                    dtype=condition_tokens.dtype,
+                    device=condition_tokens.device,
+                )
 
         class _RecordingDepthDecoder(torch.nn.Module):
             def __init__(self, num_points: int) -> None:
@@ -451,6 +452,38 @@ class CRWMModelTests(unittest.TestCase):
         assert recording_depth_decoder.last_input is not None
         self.assertEqual(tuple(recording_flow_model.last_condition_tokens.shape), (2, 7, model.model_dim))
         self.assertEqual(tuple(recording_depth_decoder.last_input.shape), (2, model.depth_latent_dim))
+
+    def test_ee_position_mse_uses_only_first_depth_point_and_mask(self) -> None:
+        model = CRWMModel(
+            depth_key="camera_01_depth",
+            scene_points_key="scene_points",
+            num_depth_points=4,
+            depth_encoder_config={"type": "dummy", "hidden_dim": 16, "point_feature_dim": 12, "global_latent_dim": 8, "num_blocks": 1},
+            contact_encoder_config={"hidden_dim": 16, "output_dim": 6, "num_force_dimensions": 4, "force_embedding_dim": 4},
+            action_encoder_config={"hidden_dim": 16, "output_dim": 5},
+            flow_config={"model_dim": 24, "num_layers": 2, "num_heads": 4, "mlp_ratio": 2.0},
+            decoder_config={"depth_hidden_dim": 16, "contact_hidden_dim": 16},
+            max_history_steps=4,
+        )
+        predicted_points = torch.tensor(
+            [
+                [[1.0, 2.0, 3.0], [99.0, 99.0, 99.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+                [[7.0, 8.0, 9.0], [55.0, 55.0, 55.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            ],
+            dtype=torch.float32,
+        )
+        target_points = torch.zeros_like(predicted_points)
+        target_mask = torch.tensor(
+            [
+                [True, True, True, True],
+                [False, True, True, True],
+            ],
+            dtype=torch.bool,
+        )
+
+        ee_position_mse = model._ee_position_mse(predicted_points, target_points, target_mask)
+
+        self.assertAlmostEqual(float(ee_position_mse.item()), (1.0**2 + 2.0**2 + 3.0**2) / 3.0, places=6)
 
     def test_model_size_report_counts_scene_conditioning_components(self) -> None:
         model = CRWMModel(
@@ -607,9 +640,9 @@ class TrainerSmokeTests(unittest.TestCase):
         self.assertIn("  - depth_encoder: total_params=", output)
         self.assertIn("  - conditioning_stack: total_params=", output)
         self.assertIn("Outputs:", output)
-        self.assertIn("  - predicted_velocity: shape=[2, 14]", output)
+        self.assertIn("  - predicted_delta: shape=[2, 14]", output)
         self.assertIn("Loss Targets:", output)
-        self.assertIn("  flow_loss:", output)
+        self.assertIn("  latent_delta_loss:", output)
         self.assertIn("  depth_recon_loss:", output)
         self.assertIn("  contact_recon_loss:", output)
         self.assertIn("Normalization:", output)
@@ -620,6 +653,7 @@ class TrainerSmokeTests(unittest.TestCase):
         self.assertTrue(emitted_lines[-1].startswith("epoch=1 "))
         self.assertIn("val_ran=1", emitted_lines[-1])
         self.assertIn("contact_encoder_trainable=0", emitted_lines[-1])
+        self.assertIn("train_ee_mse=", emitted_lines[-1])
         self.assertIn("train_loss", metrics)
 
     @unittest.skipUnless(PYARROW_AVAILABLE, "pyarrow not installed")

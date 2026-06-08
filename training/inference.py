@@ -42,11 +42,9 @@ else:
 
 
 DEFAULT_EXPORT_SPLIT = "val"
-DEFAULT_EXPORT_SEED = 42
-DEFAULT_SAMPLING_STEPS = 32
-DEFAULT_SOLVER = "heun"
 DEFAULT_ARTIFACT_NAME_TEMPLATE = "one_step_predictions_{split}.npy"
-ARTIFACT_VERSION = 1
+ARTIFACT_VERSION = 2
+PREDICTOR_TYPE = "direct_latent_delta"
 SUPPORTED_SPLITS = frozenset({"train", "val", "all"})
 
 
@@ -227,9 +225,6 @@ def export_predictions(
     split: str = DEFAULT_EXPORT_SPLIT,
     checkpoint_path: str | Path | None = None,
     artifact_path: str | Path | None = None,
-    seed: int = DEFAULT_EXPORT_SEED,
-    sampling_steps: int = DEFAULT_SAMPLING_STEPS,
-    solver: str = DEFAULT_SOLVER,
     batch_size: int | None = None,
     device_name: str | None = None,
     show_progress: bool = False,
@@ -259,12 +254,6 @@ def export_predictions(
         else (runtime.output_dir / DEFAULT_ARTIFACT_NAME_TEMPLATE.format(split=split_name)).resolve()
     )
     resolved_artifact_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if runtime.device.type == "cuda":
-        generator = torch.Generator(device="cuda")
-    else:
-        generator = torch.Generator()
-    generator.manual_seed(int(seed))
 
     episodes: list[dict[str, Any]] = []
     active_episode_index: int | None = None
@@ -307,9 +296,6 @@ def export_predictions(
             predictions = runtime.model.sample_one_step(
                 batch["obs_dict"],
                 ema_depth_encoder=runtime.depth_ema.module,
-                generator=generator,
-                sampling_steps=int(sampling_steps),
-                solver=solver,
             )
 
             prediction_dict = raw_batch["prediction"]
@@ -395,9 +381,7 @@ def export_predictions(
         "artifact_version": ARTIFACT_VERSION,
         "metadata": {
             "split": split_name,
-            "seed": int(seed),
-            "sampling_steps": int(sampling_steps),
-            "solver": str(solver),
+            "predictor_type": PREDICTOR_TYPE,
             "batch_size": int(resolved_batch_size),
             "dataset_path": str(runtime.dataset_path),
             "contract_path": str(runtime.contract_path),
@@ -437,7 +421,7 @@ def load_prediction_artifact(path: str | Path) -> dict[str, Any]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Export one-step CRWM predictions for a dataset split.")
+    parser = argparse.ArgumentParser(description="Export deterministic one-step CRWM predictions for a dataset split.")
     parser.add_argument("--config", required=True, type=str, help="Path to the CRWM training config YAML.")
     parser.add_argument(
         "--split",
@@ -457,21 +441,12 @@ def main() -> None:
         type=str,
         help="Optional output `.npy` path. Defaults to `<output_dir>/one_step_predictions_<split>.npy`.",
     )
-    parser.add_argument("--seed", default=DEFAULT_EXPORT_SEED, type=int, help="Sampling RNG seed.")
-    parser.add_argument(
-        "--sampling-steps",
-        default=DEFAULT_SAMPLING_STEPS,
-        type=int,
-        help="Number of ODE integration steps for one-step sampling.",
-    )
     args = parser.parse_args()
     artifact = export_predictions(
         _load_yaml(args.config),
         split=args.split,
         checkpoint_path=args.checkpoint_path,
         artifact_path=args.artifact_path,
-        seed=args.seed,
-        sampling_steps=args.sampling_steps,
         show_progress=True,
     )
     print(yaml.safe_dump({"artifact_path": artifact["artifact_path"]}, sort_keys=False).strip())

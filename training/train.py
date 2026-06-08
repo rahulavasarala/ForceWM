@@ -596,8 +596,8 @@ def _build_startup_loss_target_report(
     prediction_dict = batch["prediction"]
     depth_mask_key = f"{model.depth_key}_mask"
     return {
-        "flow_loss": {
-            "predicted_velocity": _tensor_summary(outputs["predicted_velocity"]),
+        "latent_delta_loss": {
+            "predicted_delta": _tensor_summary(outputs["predicted_delta"]),
             "latent_target": _tensor_summary(outputs["latent_target"]),
         },
         "depth_recon_loss": {
@@ -771,7 +771,7 @@ def _run_epoch(
 
         metric_row = {
             "loss": float(outputs["loss"].detach().cpu().item()),
-            "flow_loss": float(outputs["flow_loss"].detach().cpu().item()),
+            "latent_delta_loss": float(outputs["latent_delta_loss"].detach().cpu().item()),
             "depth_recon_loss": float(outputs["depth_recon_loss"].detach().cpu().item()),
             "contact_recon_loss": float(outputs["contact_recon_loss"].detach().cpu().item()),
             "contact_force_dimension_ce": float(outputs["contact_force_dimension_ce"].detach().cpu().item()),
@@ -779,6 +779,7 @@ def _run_epoch(
             "contact_sensed_force_mse": float(outputs["contact_sensed_force_mse"].detach().cpu().item()),
             "contact_sensed_moment_mse": float(outputs["contact_sensed_moment_mse"].detach().cpu().item()),
             "force_dimension_accuracy": float(outputs["force_dimension_accuracy"].detach().cpu().item()),
+            "ee_position_mse": float(outputs["ee_position_mse"].detach().cpu().item()),
         }
         metric_rows.append(metric_row)
         if training and on_train_step is not None:
@@ -789,14 +790,15 @@ def _run_epoch(
             print(
                 f"[{phase}] step={step_index} "
                 f"loss={metric_row['loss']:.4f} "
-                f"flow={metric_row['flow_loss']:.4f} "
+                f"delta={metric_row['latent_delta_loss']:.4f} "
                 f"depth={metric_row['depth_recon_loss']:.4f} "
                 f"contact={metric_row['contact_recon_loss']:.4f} "
                 f"contact_ce={metric_row['contact_force_dimension_ce']:.4f} "
                 f"contact_axis={metric_row['contact_motion_axis_mse']:.4f} "
                 f"contact_force={metric_row['contact_sensed_force_mse']:.4f} "
                 f"contact_moment={metric_row['contact_sensed_moment_mse']:.4f} "
-                f"force_acc={metric_row['force_dimension_accuracy']:.4f}"
+                f"force_acc={metric_row['force_dimension_accuracy']:.4f} "
+                f"ee_mse={metric_row['ee_position_mse']:.4f}"
             )
 
     return _aggregate_metrics(metric_rows), global_step
@@ -1034,7 +1036,7 @@ def train(
                 wandb_logger.log(
                     {
                         "train_step/loss": metrics["loss"],
-                        "train_step/flow_loss": metrics["flow_loss"],
+                        "train_step/latent_delta_loss": metrics["latent_delta_loss"],
                         "train_step/depth_recon_loss": metrics["depth_recon_loss"],
                         "train_step/contact_recon_loss": metrics["contact_recon_loss"],
                         "train_step/contact_force_dimension_ce": metrics["contact_force_dimension_ce"],
@@ -1042,6 +1044,7 @@ def train(
                         "train_step/contact_sensed_force_mse": metrics["contact_sensed_force_mse"],
                         "train_step/contact_sensed_moment_mse": metrics["contact_sensed_moment_mse"],
                         "train_step/force_dimension_accuracy": metrics["force_dimension_accuracy"],
+                        "train_step/ee_position_mse": metrics["ee_position_mse"],
                         "trainer/epoch": float(current_epoch),
                         "trainer/global_step": float(step),
                         "trainer/lr": _current_learning_rate(optimizer),
@@ -1110,6 +1113,8 @@ def train(
 
             val_loss = val_metrics.get("loss", float("nan"))
             val_force_acc = val_metrics.get("force_dimension_accuracy", float("nan"))
+            train_ee_position_mse = train_metrics.get("ee_position_mse", float("nan"))
+            val_ee_position_mse = val_metrics.get("ee_position_mse", float("nan"))
             print(
                 f"epoch={current_epoch} "
                 f"depth_encoder_trainable={int(depth_encoder_trainable)} "
@@ -1117,6 +1122,8 @@ def train(
                 f"val_ran={int(val_ran)} "
                 f"train_loss={train_metrics.get('loss', float('nan')):.4f} "
                 f"val_loss={val_loss:.4f} "
+                f"train_ee_mse={train_ee_position_mse:.4f} "
+                f"val_ee_mse={val_ee_position_mse:.4f} "
                 f"train_force_acc={train_metrics.get('force_dimension_accuracy', float('nan')):.4f} "
                 f"val_force_acc={val_force_acc:.4f}"
             )
